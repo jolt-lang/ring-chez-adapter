@@ -8,7 +8,7 @@ handlers.
 
 ```clojure
 ;; deps.edn
-yogthos/ring-janet-adapter {:git/url "https://github.com/yogthos/ring-janet-adapter"
+jolt-lang/ring-janet-adapter {:git/url "https://github.com/yogthos/ring-janet-adapter"
                             :git/sha "..."}
 janet/spork-http {:jpm/module "spork/http" :jpm/install "spork"}
 ```
