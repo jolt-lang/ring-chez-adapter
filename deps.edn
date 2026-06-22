@@ -1,12 +1,8 @@
 {:paths ["src"]
 
- ;; The adapter has no Clojure dependencies — it maps Ring SPEC maps to and
- ;; from spork/http tables over jolt's janet.* bridge. spork/http itself is
- ;; the one requirement:
- :deps {janet/spork-http {:jpm/module "spork/http"
-                          :jpm/install "spork"}}
-
+ ;; No external deps: the server is bound directly over jolt.ffi (BSD sockets);
+ ;; the test drives it with jolt's built-in HTTP client.
  :aliases {:test {:extra-paths ["test"]
                   :main-opts ["-m" "ring-janet.adapter-test"]}}
 
- :tasks {test "jolt-deps -M:test"}}
+ :tasks {test "joltc -M:test"}}

@@ -1,0 +1,18 @@
+name: tests
+on: [push, pull_request]
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Chez Scheme
+        run: |
+          sudo apt-get update && sudo apt-get install -y chezscheme curl
+          if ! command -v chez >/dev/null 2>&1; then
+            printf '#!/bin/sh\nexec scheme "$@"\n' | sudo tee /usr/local/bin/chez >/dev/null
+            sudo chmod +x /usr/local/bin/chez
+          fi
+      - name: Get jolt
+        run: git clone --depth 1 --recurse-submodules https://github.com/jolt-lang/jolt.git "$HOME/jolt"
+      - name: Test
+        run: JOLT_PWD="$PWD" "$HOME/jolt/bin/joltc" -M:test
