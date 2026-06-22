@@ -10,7 +10,8 @@
   (:require [clojure.string :as str]
             [jolt.ffi :as ffi]))
 
-(ffi/load-library)                                   ; process symbols (libc sockets)
+;; The libc/socket symbols are declared in deps.edn (:jolt/native :process) and
+;; loaded by jolt before this namespace is required, so the bindings resolve.
 
 ;; accept/recv/send may block — :blocking emits them collect-safe so a parked
 ;; accept thread never pins the garbage collector.

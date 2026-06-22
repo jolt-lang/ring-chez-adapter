@@ -1,7 +1,12 @@
 {:paths ["src"]
 
- ;; No external deps: the server is bound directly over jolt.ffi (BSD sockets);
- ;; the test drives it with jolt's built-in HTTP client.
+ ;; The server binds BSD sockets (socket/bind/listen/accept/recv/send) directly
+ ;; over jolt.ffi. Those live in the C standard library, reached through the
+ ;; running process's own symbols — declared here as :process so jolt loads them
+ ;; before the namespace is required. No external Clojure deps; the test drives
+ ;; the server with jolt's built-in HTTP client.
+ :jolt/native [{:name "libc (POSIX sockets)" :process true}]
+
  :aliases {:test {:extra-paths ["test"]
                   :main-opts ["-m" "ring-chez.adapter-test"]}}
 
