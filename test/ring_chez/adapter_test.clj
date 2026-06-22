@@ -1,5 +1,5 @@
-(ns ring-janet.adapter-test
-  (:require [ring-janet.adapter :as adapter]
+(ns ring-chez.adapter-test
+  (:require [ring-chez.adapter :as adapter]
             [jolt.http-client :as http]
             [clojure.string :as str]))
 
