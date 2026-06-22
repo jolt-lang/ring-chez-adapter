@@ -29,7 +29,8 @@
     (Thread/sleep 250)
     (try
       (let [r    (http/get "http://127.0.0.1:8399/")
-            r404 (http/get "http://127.0.0.1:8399/nope")
+            ;; clj-http-lite throws on 4xx/5xx unless :throw-exceptions false
+            r404 (http/get "http://127.0.0.1:8399/nope" {:throw-exceptions false})
             rq   (http/get "http://127.0.0.1:8399/echo?a=1&b=2")]
         (check "GET / status 200" 200 (:status r))
         (check-has "GET / body" "hello get" (:body r))
