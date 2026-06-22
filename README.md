@@ -5,7 +5,7 @@ A minimal Ring HTTP/1.1 server for [jolt](https://github.com/jolt-lang/jolt)
 jolt built-in, no JVM — and runs synchronous Ring 1.x handlers on loopback.
 
 ```clojure
-(require '[ring-janet.adapter :as adapter])
+(require '[ring-chez.adapter :as adapter])
 (def server (adapter/run-server (fn [req] {:status 200 :body "hi"}) {:port 3000}))
 ;; ... later ...
 (adapter/stop-server server)

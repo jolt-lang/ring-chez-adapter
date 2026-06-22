@@ -3,6 +3,6 @@
  ;; No external deps: the server is bound directly over jolt.ffi (BSD sockets);
  ;; the test drives it with jolt's built-in HTTP client.
  :aliases {:test {:extra-paths ["test"]
-                  :main-opts ["-m" "ring-janet.adapter-test"]}}
+                  :main-opts ["-m" "ring-chez.adapter-test"]}}
 
  :tasks {test "joltc -M:test"}}

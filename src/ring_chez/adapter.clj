@@ -1,9 +1,9 @@
-(ns ring-janet.adapter
+(ns ring-chez.adapter
   "A Ring adapter for jolt: a minimal HTTP/1.1 server over BSD sockets, bound
   directly through jolt.ffi (no jolt built-in, no JVM). Synchronous Ring 1.x
   handlers. Serves loopback (127.0.0.1).
 
-      (require '[ring-janet.adapter :as adapter])
+      (require '[ring-chez.adapter :as adapter])
       (def server (adapter/run-server my-handler {:port 3000}))
       ;; ... later ...
       (adapter/stop-server server)"
