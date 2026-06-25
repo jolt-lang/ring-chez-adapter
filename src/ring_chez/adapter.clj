@@ -124,7 +124,12 @@
    403 "Forbidden" 404 "Not Found" 405 "Method Not Allowed" 500 "Internal Server Error"})
 
 (defn- body->string [b]
-  (cond (nil? b) "" (string? b) b (or (seq? b) (vector? b)) (apply str b) :else (str b)))
+  (cond (nil? b) ""
+        (string? b) b
+        (or (seq? b) (vector? b)) (apply str b)
+        ;; a File / InputStream / Reader body (ring's resource + file responses):
+        ;; read its contents rather than printing the object.
+        :else (try (slurp b) (catch Throwable _ (str b)))))
 
 (defn- response->string [resp]
   (let [status (or (:status resp) 200)

@@ -6,6 +6,13 @@
  ;; before the namespace is required.
  :jolt/native [{:name "libc (POSIX sockets)" :process true}]
 
+ ;; jolt-crypto (AES/HMAC/SecureRandom over OpenSSL) rides along so an app that
+ ;; wraps its handler with ring-defaults — whose session + CSRF middleware needs
+ ;; javax.crypto — just has to (require 'jolt.crypto); no separate dep. It's not
+ ;; required here, so a plain adapter server doesn't pull in OpenSSL.
+ :deps {jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/jolt-crypto"
+                               :git/sha "0adae49db6064180374ffdcfc72b5b9ac01888cd"}}
+
  ;; The test drives the server with the jolt-lang/http-client library (jolt no
  ;; longer ships a built-in HTTP client).
  :aliases {:test {:extra-paths ["test"]
