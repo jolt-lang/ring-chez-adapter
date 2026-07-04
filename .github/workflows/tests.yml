@@ -5,14 +5,16 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-      - name: Install Chez Scheme
+      - name: Install joltc
         run: |
-          sudo apt-get update && sudo apt-get install -y chezscheme curl
-          if ! command -v chez >/dev/null 2>&1; then
-            printf '#!/bin/sh\nexec scheme "$@"\n' | sudo tee /usr/local/bin/chez >/dev/null
-            sudo chmod +x /usr/local/bin/chez
-          fi
-      - name: Get jolt
-        run: git clone --depth 1 --recurse-submodules https://github.com/jolt-lang/jolt.git "$HOME/jolt"
+          set -euo pipefail
+          sudo apt-get update
+          sudo apt-get install -y liblz4-1 zlib1g libtinfo6 libssl3 curl
+          url=$(curl -fsSL https://api.github.com/repos/jolt-lang/jolt/releases/latest \
+                | jq -r '.assets[] | select(.name | test("x86_64-linux\\.tar\\.gz$")) | .browser_download_url')
+          mkdir -p "$HOME/.jolt"
+          curl -fsSL "$url" | tar xz -C "$HOME/.jolt" --strip-components=1
+          chmod +x "$HOME/.jolt/joltc"
+          echo "$HOME/.jolt" >> "$GITHUB_PATH"
       - name: Test
-        run: JOLT_PWD="$PWD" "$HOME/jolt/bin/joltc" -M:test
+        run: JOLT_PWD="$PWD" joltc -M:test
