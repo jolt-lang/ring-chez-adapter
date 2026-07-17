@@ -134,13 +134,22 @@
 (defn- response->string [resp]
   (let [status (or (:status resp) 200)
         body (body->string (:body resp))
+        ;; Content-Length is the body's octet count. ring-defaults'
+        ;; wrap-content-length already sets it (as UTF-8 bytes); honor that
+        ;; and only compute when absent, so we never stamp a second, conflicting
+        ;; Content-Length. Connection: close also delimits the response.
+        len (or (->> (:headers resp)
+                     (some (fn [[k v]]
+                             (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))]
+                               (when (= kn "content-length") v)))))
+                (alength (.getBytes body "UTF-8")))
         sb (StringBuilder.)]
     (.append sb (str "HTTP/1.1 " status " " (get status-text status "OK") "\r\n"))
     (doseq [[k v] (:headers resp)]
-      (.append sb (str (if (keyword? k) (name k) (str k)) ": " v "\r\n")))
-    ;; Content-Length is the body length; Connection: close also delimits the
-    ;; response so the client reads to EOF regardless.
-    (.append sb (str "Content-Length: " (count body) "\r\n"))
+      (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))]
+        (when (not= kn "content-length")
+          (.append sb (str (if (keyword? k) (name k) (str k)) ": " v "\r\n")))))
+    (.append sb (str "Content-Length: " len "\r\n"))
     (.append sb "Connection: close\r\n\r\n")
     (.append sb body)
     (.toString sb)))
