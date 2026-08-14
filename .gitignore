@@ -1,2 +1,10 @@
 jpm_tree/
 .cpcache/
+.jolt/
+.clj-kondo/
+.lsp/
+PLAN.md
+.nrepl-port
+.clj-kondo/
+.cache/
+.lsp/
