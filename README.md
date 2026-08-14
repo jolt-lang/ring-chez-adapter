@@ -16,8 +16,19 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
 `run-server` takes an opts map:
 
 - `:port` (default 3000)
+- `:strategy` (default `:threads`) — concurrency backend for connections:
+  - `:threads` — fixed worker pool, one worker thread per busy connection
+    (`:worker-threads`, default core count); idle keep-alive connections
+    occupy a worker each until they time out
+  - `:fibers` — one core.async go block per connection, parked on a single
+    shared `poll(2)` io-poller thread; idle keep-alive connections pin no
+    thread, so thousands can sit open without extra threads. Blocking work —
+    the Ring handler and websocket sessions — still runs on threads, but only
+    while actually computing; `:keep-alive-timeout-ms` bounds each parked read.
+    Anything other than `:threads`/`:fibers` throws.
 - `:worker-threads` (default: core count) — each worker runs one connection
   loop; when all are busy the acceptor parks and the kernel backlog queues
+  (`:threads` strategy only)
 - `:keep-alive-timeout-ms` (default 30000) — idle keep-alive connections are
   dropped via `SO_RCVTIMEO`
 - `:max-request-bytes` (default 1048576) — headers + body combined; over the

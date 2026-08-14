@@ -596,6 +596,101 @@
         (check "cap: normal request passes" 200 (:status r)))
       (finally (adapter/stop-server server)))))
 
+;; --- fiber strategy (:strategy :fibers) --------------------------------------
+;; Connections are served by core.async go blocks that park on a shared
+;; poll(2) poller thread instead of pinning pool threads.
+
+(defn test-fiber-basic []
+  (let [server (adapter/run-server handler {:port 8420 :strategy :fibers})]
+    (Thread/sleep 250)
+    (try
+      (let [r (http/get "http://127.0.0.1:8420/")]
+        (check "fiber: GET / status" 200 (:status r))
+        (check "fiber: GET / body" "hello get" (:body r)))
+      (let [r (http/get "http://127.0.0.1:8420/echo?q=hi&ua=1")]
+        (check-has "fiber: query string reaches handler" "q=hi" (:body r)))
+      (finally (adapter/stop-server server)))))
+
+(defn test-fiber-idle-connections-do-not-pin []
+  ;; Two idle keep-alive connections must not stop a third request from being
+  ;; served promptly. Under :threads with 2 workers the two idle conns pin both
+  ;; workers in recv until the 8s keep-alive timeout and the third stalls.
+  (let [server (adapter/run-server handler {:port 8421 :strategy :fibers
+                                            :worker-threads 2
+                                            :keep-alive-timeout-ms 8000})]
+    (Thread/sleep 250)
+    (try
+      (let [idle1 (client-connect 8421)
+            idle2 (client-connect 8421)]
+        (client-send idle1 "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "fiber: idle conn 1 served" "200" (client-recv idle1))
+        (client-send idle2 "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "fiber: idle conn 2 served" "200" (client-recv idle2))
+        ;; both conns now idle keep-alive; a third must still get a fast answer
+        (let [fd (client-connect 8421 2500)]
+          (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+          (let [r (client-recv fd)]
+            (check "fiber: 3rd request served despite 2 idle conns" true (some? r))
+            (check-has "fiber: 3rd request 200" "200" (or r "")))
+          (client-close fd))
+        (client-close idle1)
+        (client-close idle2))
+      (finally (adapter/stop-server server)))))
+
+(defn test-fiber-keep-alive-and-pipelining []
+  (let [server (adapter/run-server handler {:port 8422 :strategy :fibers})]
+    (Thread/sleep 250)
+    (try
+      ;; two sequential requests on one connection
+      (let [fd (client-connect 8422 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "fiber ka: first response" "hello get" (client-recv fd))
+        (client-send fd "GET /echo?q=2 HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "fiber ka: second response" "q=2" (client-recv fd))
+        (client-close fd))
+      ;; two pipelined requests in a single write
+      (let [fd (client-connect 8422 3000)]
+        (client-send fd (str "GET / HTTP/1.1\r\nHost: t\r\n\r\n"
+                             "GET /echo?q=p HTTP/1.1\r\nHost: t\r\n\r\n"))
+        (let [r (client-recv-until fd "q=p")]
+          (check-has "fiber pipe: first answered" "hello get" r)
+          (check-has "fiber pipe: second answered" "q=p" r))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-fiber-streaming []
+  (let [server (adapter/run-server handler {:port 8423 :strategy :fibers})]
+    (Thread/sleep 250)
+    (try
+      (let [r (http/get "http://127.0.0.1:8423/stream")]
+        (check "fiber stream: status" 200 (:status r))
+        (check "fiber stream: body" "foobarbaz" (:body r))
+        (check-has "fiber stream: chunked framing"
+                   "transfer-encoding" (->> (:headers r) (map str/lower-case) (apply str))))
+      (finally (adapter/stop-server server)))))
+
+(defn test-fiber-idle-timeout []
+  ;; an idle keep-alive conn is closed by the server after the timeout
+  (let [server (adapter/run-server handler {:port 8424 :strategy :fibers
+                                            :keep-alive-timeout-ms 400})]
+    (Thread/sleep 250)
+    (try
+      (let [fd (client-connect 8424 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "fiber timeout: first response ok" "200" (client-recv fd))
+        (check "fiber timeout: server closed idle conn" "" (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-bad-strategy-throws []
+  (try
+    (let [server (adapter/run-server handler {:port 8425 :strategy :magic})]
+      (adapter/stop-server server)
+      (check "bad strategy: run-server throws" :threw :did-not-throw))
+    (catch Throwable t
+      (check "bad strategy: run-server throws" :threw :threw)
+      (check-has "bad strategy: message names :strategy" ":strategy" (ex-message t)))))
+
 (defn -main [& _]
   (println "ring adapter over jolt.ffi sockets")
 
@@ -647,6 +742,14 @@
 
   ;; --- Phase 6 ---
   (test-max-request-size)
+
+  ;; --- concurrency strategies ---
+  (test-fiber-basic)
+  (test-fiber-idle-connections-do-not-pin)
+  (test-fiber-keep-alive-and-pipelining)
+  (test-fiber-streaming)
+  (test-fiber-idle-timeout)
+  (test-bad-strategy-throws)
 
   (if (zero? @failures)
     (println "all passed")
