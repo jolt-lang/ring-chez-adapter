@@ -596,6 +596,81 @@
         (check "cap: normal request passes" 200 (:status r)))
       (finally (adapter/stop-server server)))))
 
+;; --- Phase 7: no stall under pressure ----------------------------------------
+
+(defn test-worker-survives-bad-chunk []
+  ;; a channel body yielding a non-string chunk throws inside the worker; the
+  ;; worker must catch it, close the conn, and keep serving instead of dying
+  ;; (a dead worker shrinks the pool permanently and starves later conns)
+  (let [bad-body (fn [] (doto (a/chan 1) (a/put! :boom)))
+        server (adapter/run-server
+                (fn [req]
+                  (if (= "/bad" (:uri req))
+                    {:status 200 :headers {"Content-Type" "text/plain"} :body (bad-body)}
+                    {:status 200 :headers {"Content-Type" "text/plain"} :body "ok"}))
+                {:port 8426 :worker-threads 1})]
+    (Thread/sleep 250)
+    (try
+      (let [fd (client-connect 8426 3000)]
+        (client-send fd "GET /bad HTTP/1.1\r\nHost: t\r\n\r\n")
+        (client-recv fd)                       ; head or "" — the point is survival
+        (client-close fd))
+      (let [fd (client-connect 8426 4000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [r (client-recv fd)]
+          (check "survival: worker alive after bad chunk" true (some? r))
+          (check-has "survival: still serves 200" "200" (or r "")))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-keep-alive-fairness []
+  ;; more keep-alive connections than workers: every connection must still be
+  ;; answered. Without pressure-retirement the first conns pin all workers
+  ;; idle and the rest starve until the client times out (the ab -k -c 100 stall)
+  (let [server (adapter/run-server handler {:port 8427 :worker-threads 2
+                                            :keep-alive-timeout-ms 60000})]
+    (Thread/sleep 250)
+    (try
+      (let [fds (mapv (fn [_] (client-connect 8427 5000)) (range 5))]
+        (Thread/sleep 600)                     ; let the acceptor hand off / park
+        (doseq [fd fds]
+          (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n"))
+        (doseq [[i fd] (map-indexed vector fds)]
+          (let [r (client-recv fd)]
+            (check (str "fairness: conn " i " answered") true (some? r))
+            (check-has (str "fairness: conn " i " 200") "200" (or r ""))))
+        (doseq [fd fds] (client-close fd)))
+      (finally (adapter/stop-server server)))))
+
+(defn test-pipelined-under-pressure []
+  ;; the regression the claim-time/leftover fix addresses: while other
+  ;; connections queue for the pool, a pipelined batch on a claimed
+  ;; connection must never be split by a retirement close — responses 1..n-1
+  ;; carry buffered leftover and must keep the connection alive
+  (let [server (adapter/run-server handler {:port 8428 :worker-threads 2
+                                            :keep-alive-timeout-ms 60000})]
+    (Thread/sleep 250)
+    (try
+      (let [claimed (mapv (fn [_] (client-connect 8428 5000)) (range 2))
+            queued  (mapv (fn [_] (client-connect 8428 5000)) (range 3))]
+        (Thread/sleep 600)                     ; 2 claimed, 1 pending, 2 backlogged
+        (client-send (first claimed)
+                     (str "GET /echo?q=1 HTTP/1.1\r\nHost: t\r\n\r\n"
+                          "GET /echo?q=2 HTTP/1.1\r\nHost: t\r\n\r\n"
+                          "GET /echo?q=3 HTTP/1.1\r\nHost: t\r\n\r\n"))
+        (let [r (client-recv-until (first claimed) "q=3")]
+          (check-has "pipeline+pressure: 1st answered" "q=1" r)
+          (check-has "pipeline+pressure: 2nd answered" "q=2" r)
+          (check-has "pipeline+pressure: 3rd answered (not split by close)" "q=3" r))
+        (client-close (first claimed))
+        (client-close (second claimed))
+        ;; the queued connections must still all be served (fairness outcome)
+        (doseq [fd queued]
+          (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+          (check-has "pipeline+pressure: queued conn answered" "200" (client-recv fd)))
+        (doseq [fd queued] (client-close fd)))
+      (finally (adapter/stop-server server)))))
+
 ;; --- fiber strategy (:strategy :fibers) --------------------------------------
 ;; Connections are served by core.async go blocks that park on a shared
 ;; poll(2) poller thread instead of pinning pool threads.
@@ -756,6 +831,9 @@
 
   ;; --- Phase 6 ---
   (test-max-request-size)
+  (test-worker-survives-bad-chunk)
+  (test-keep-alive-fairness)
+  (test-pipelined-under-pressure)
 
   ;; --- concurrency strategies ---
   (test-rebind-same-port-after-stop)

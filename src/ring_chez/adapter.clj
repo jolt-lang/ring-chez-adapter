@@ -181,15 +181,18 @@
 ;; read one complete request from conn; acc carries unconsumed bytes from a
 ;; previous read (pipelined requests). recv! abstracts the blocking read:
 ;; the threads strategy passes plain c-recv, the fiber strategy passes a
-;; poller-parking variant. Returns {:text t :leftover s} when a full request
-;; (headers + Content-Length body) is available, :closed when the peer went
-;; away (or recv timed out) before sending anything, :bad on EOF/timeout
-;; mid-request.
+;; poller-parking variant. idle-recv! handles the first read of the next
+;; request on an idle keep-alive connection — under the threads strategy it
+;; waits in poll(2) slices so a queued connection can retire the idle one
+;; promptly instead of waiting out the full keep-alive timeout. Returns
+;; {:text t :leftover s} when a full request (headers + Content-Length body)
+;; is available, :closed when the peer went away (or recv timed out) before
+;; sending anything, :bad on EOF/timeout mid-request.
 (defn- read-request
   "Reads one request (head + content-length body). Accumulation is capped at
   max-bytes — a client that never terminates (or ships an oversized request)
   gets :too-big instead of exhausting memory."
-  [conn acc max-bytes recv!]
+  [conn acc max-bytes recv! idle-recv!]
   (let [buf (ffi/alloc bufsize)]
     (try
       (loop [acc acc]
@@ -206,7 +209,7 @@
                     :bad)))))
           (if (> (count acc) max-bytes)
             :headers-too-big              ; headers never ended -> 431
-            (let [n (recv! conn buf)]
+            (let [n ((if (str/blank? acc) idle-recv! recv!) conn buf)]
               (cond
                 (pos? n) (recur (str acc (ffi/read-bytes buf n)))
                 (str/blank? acc) :closed
@@ -478,49 +481,72 @@
 
 (defn- connection-loop [conn handler port ka-ms ws-handler max-bytes io]
   (set-rcvtimeo! conn ka-ms)
-  (loop [acc ""]
-    (let [r (read-request conn acc max-bytes (:recv! io))]
-      (cond
-        (= :bad r) (send-all conn (response->string
-                                    {:status 400 :headers {"Content-Type" "text/plain"}
-                                     :body "Bad Request"} false))
-        (= :too-big r) (send-all conn (response->string
-                                       {:status 413 :headers {"Content-Type" "text/plain"
-                                                              "Connection" "close"}
-                                        :body "Payload Too Large"} false))
-        (= :headers-too-big r) (send-all conn (response->string
-                                               {:status 431 :headers {"Content-Type" "text/plain"
-                                                                      "Connection" "close"}
-                                                :body "Request Header Fields Too Large"} false))
-        (map? r)
-        (let [{:keys [request error]} (request->ring (:text r) port)]
-          (cond
-            error (send-all conn (response->string error false))
-            (and ws-handler (upgrade-request? request))
-            ;; websocket takeover: 101, then the session owns the fd until it
-            ;; returns; the connection is not reused afterwards
-            (when (send-all conn (str "HTTP/1.1 101 Switching Protocols\r\n"
-                                      "Upgrade: websocket\r\n"
-                                      "Connection: Upgrade\r\n"
-                                      "Sec-WebSocket-Accept: "
-                                      (ws/accept-token (get-in request [:headers "sec-websocket-key"]))
-                                      "\r\n\r\n"))
-              ((:run! io) #(try (ws-handler (ws/make-session conn))
-                                (catch Throwable _ nil))))
-            :else
-            (let [resp ((:run! io) #(try (handler request)
-                                         (catch Throwable _
-                                           {:status 500 :headers {"Content-Type" "text/plain"}
-                                            :body "Internal Server Error"})))]
-              (when (send-response conn request resp (:take! io))
-                (recur (:leftover r))))))
-        :else nil))))
+  (let [recv!      (:recv! io)
+        idle-recv! (or (:idle-recv! io) recv!)]
+    (loop [acc ""]
+      (let [r (read-request conn acc max-bytes recv! idle-recv!)]
+        (cond
+          (= :bad r) (send-all conn (response->string
+                                      {:status 400 :headers {"Content-Type" "text/plain"}
+                                       :body "Bad Request"} false))
+          (= :too-big r) (send-all conn (response->string
+                                         {:status 413 :headers {"Content-Type" "text/plain"
+                                                                "Connection" "close"}
+                                          :body "Payload Too Large"} false))
+          (= :headers-too-big r) (send-all conn (response->string
+                                                 {:status 431 :headers {"Content-Type" "text/plain"
+                                                                        "Connection" "close"}
+                                                  :body "Request Header Fields Too Large"} false))
+          (map? r)
+          (let [{:keys [request error]} (request->ring (:text r) port)]
+            (cond
+              error (send-all conn (response->string error false))
+              (and ws-handler (upgrade-request? request))
+              ;; websocket takeover: 101, then the session owns the fd until it
+              ;; returns; the connection is not reused afterwards
+              (when (send-all conn (str "HTTP/1.1 101 Switching Protocols\r\n"
+                                        "Upgrade: websocket\r\n"
+                                        "Connection: Upgrade\r\n"
+                                        "Sec-WebSocket-Accept: "
+                                        (ws/accept-token (get-in request [:headers "sec-websocket-key"]))
+                                        "\r\n\r\n"))
+                ((:run! io) #(try (ws-handler (ws/make-session conn))
+                                  (catch Throwable _ nil))))
+              :else
+              (let [resp ((:run! io) #(try (handler request)
+                                           (catch Throwable _
+                                             {:status 500 :headers {"Content-Type" "text/plain"}
+                                              :body "Internal Server Error"})))
+                    ;; retire under accept pressure: another connection is
+                    ;; waiting for this worker, so decline keep-alive and free
+                    ;; it instead of parking on an idle conn while others
+                    ;; starve. Only when no pipelined request is already
+                    ;; buffered — serving that costs no park.
+                    resp (if (and (io :under-pressure?) ((io :under-pressure?))
+                                  (keep-alive? request)
+                                  (str/blank? (:leftover r)))
+                           (update resp :headers #(assoc (or % {}) "Connection" "close"))
+                           resp)]
+                (when (send-response conn request resp (:take! io))
+                  (recur (:leftover r))))))
+          :else nil)))))
 
-(defn- worker [handler port ka-ms ws-handler max-bytes work]
+(defn- worker [handler port ka-ms ws-handler max-bytes io work]
   (loop []
     (when-let [conn (async/<!! work)]
-      (connection-loop conn handler port ka-ms ws-handler max-bytes threads-io)
-      (c-close conn)
+      ;; claim at take-time: pending then counts only conns accepted but not
+      ;; yet claimed — decrementing in the acceptor after >!! leaves a window
+      ;; where a claimed conn still reads as pressure and over-retires
+      ((io :claim!))
+      (try
+        (connection-loop conn handler port ka-ms ws-handler max-bytes io)
+        ;; an escaping throwable must not kill the worker: a dead worker
+        ;; shrinks the pool permanently and starves later connections
+        (catch Throwable _)
+        ;; shutdown before close: on Linux close() alone does not deliver
+        ;; FIN to the peer holding a blocked recv (same family as 791d5c4)
+        (finally (c-shutdown conn 2)
+                 (c-close conn)))
       (recur))))
 
 (defn- fiber-serve
@@ -554,6 +580,11 @@
                            handlers and websocket sessions still run on
                            threads, but only while actually working.
     :worker-threads        worker pool size (threads strategy)
+                            (default = available processors); slow or idle
+                            keep-alive connections occupy a worker each,
+                            but under accept pressure keep-alive is declined
+                            (Connection: close) so queued connections never
+                            starve
     :keep-alive-timeout-ms idle keep-alive timeout (default 30000)
     :max-request-bytes     request cap (default 1048576; 413/431 beyond)
     :ws-handler            fn of a ring-chez.websocket Session, run when a
@@ -574,9 +605,40 @@
         (let [poller (start-poller!)]
           (future (serve-loop fd running? (partial fiber-serve poller handler port ka-ms ws-handler max-bytes)))
           {:socket fd :port port :running running? :poller poller})
-        (let [work (async/chan)]   ; unbuffered: acceptor parks when all workers busy;
-          (dotimes [_ n] (async/thread (worker handler port ka-ms ws-handler max-bytes work)))
-          (future (serve-loop fd running? #(async/>!! work %)))
+        (let [work (async/chan)   ; unbuffered: acceptor parks when all workers busy
+              pending (atom 0)    ; conns accepted but not yet claimed by a worker
+               io (assoc threads-io
+                         :under-pressure? #(pos? @pending)
+                         :claim! #(swap! pending dec)
+                         ;; idle keep-alive first read: wait in poll(2) slices
+                         ;; instead of parking a full ka-timeout recv. Enforces
+                         ;; the ka deadline itself (poll has no timeout), and
+                         ;; under accept pressure retires a connection only
+                         ;; after a grace period of quiet — never instantly,
+                         ;; or a client mid-reuse would race a reset. Returns
+                         ;; the recv contract (n>0 data, 0 closed/retire).
+                         :idle-recv! (fn [conn buf]
+                                       (let [pfds (ffi/alloc 8)]
+                                         (ffi/write pfds :int 0 conn)
+                                         (ffi/write pfds :uint8 4 POLLIN)
+                                         (try
+                                           (let [deadline (+ (System/currentTimeMillis) ka-ms)
+                                                 grace    (+ (System/currentTimeMillis) 2000)]
+                                             (loop []
+                                               (let [rc  (c-poll pfds 1 250)
+                                                     now (System/currentTimeMillis)]
+                                                 (cond
+                                                   (pos? rc) (c-recv conn buf bufsize 0)
+                                                   (neg? rc) 0
+                                                   (>= now deadline) 0
+                                                   (and (>= now grace) (pos? @pending)) 0
+                                                   :else (recur)))))
+                                           (finally (ffi/free pfds))))))]
+          (dotimes [_ n] (async/thread (worker handler port ka-ms ws-handler max-bytes io work)))
+          (future (serve-loop fd running?
+                              (fn [conn]
+                                (swap! pending inc)
+                                (async/>!! work conn))))
           {:socket fd :port port :running running? :work work})))))
 
 (defn stop-server
