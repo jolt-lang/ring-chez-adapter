@@ -4,3 +4,7 @@ jpm_tree/
 .clj-kondo/
 .lsp/
 PLAN.md
+.nrepl-port
+.clj-kondo/
+.cache/
+.lsp/

@@ -1,0 +1,13 @@
+{:paths ["src"]
+ :deps
+ {luminus/ring-undertow-adapter {:mvn/version "1.5.2"}
+  ring/ring-core {:mvn/version "1.15.5"}
+  ring/ring-defaults {:mvn/version "0.7.1"}}
+ :aliases
+ {:run {:main-opts ["-m" "bench.server"]}
+  :test {:extra-paths ["test"]
+         :extra-deps {io.github.cognitect-labs/test-runner
+                      {:git/url "https://github.com/cognitect-labs/test-runner.git"
+                       :git/tag "v0.5.1"
+                       :git/sha "dfb30dd6605cb6c0efc275e1df1736f6e90d4d73"}}
+         :main-opts ["-m" "cognitect.test-runner"]}}}
