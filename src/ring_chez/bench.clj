@@ -20,7 +20,7 @@
 (defn -main [& _]
   (let [port (Long/parseLong (or (System/getenv "PORT") "8081"))
         strategy (keyword (or (System/getenv "STRATEGY") "threads"))
-        workers (when-let [w (System/getenv "WORKERS")]
+        workers (when-let [w (some-> (System/getenv "WORKERS") not-empty)]
                   (Long/parseLong w))]
     (println "listening on 127.0.0.1:" port "strategy:" strategy "workers:" workers)
     (adapter/run-server app (merge {:port port :strategy strategy}
