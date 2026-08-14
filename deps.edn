@@ -15,10 +15,11 @@
 
  ;; The test drives the server with the jolt-lang/http-client library (jolt no
  ;; longer ships a built-in HTTP client).
- :aliases {:test {:extra-paths ["test"]
-                  :extra-deps {jolt-lang/http-client
-                               {:git/url "https://github.com/jolt-lang/http-client"
+  :aliases {:test {:extra-paths ["test"]
+                   :extra-deps {jolt-lang/http-client
+                                {:git/url "https://github.com/jolt-lang/http-client"
                                 :git/sha "af407efe3006febcb561bc1ac6a393c6bad6f41c"}}
-                  :main-opts ["-m" "ring-chez.adapter-test"]}}
+                   :main-opts ["-m" "ring-chez.adapter-test"]}
+           :bench {:main-opts ["-m" "ring-chez.bench"]}}
 
  :tasks {test "jolt -M:test"}}
