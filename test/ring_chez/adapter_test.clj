@@ -600,6 +600,20 @@
 ;; Connections are served by core.async go blocks that park on a shared
 ;; poll(2) poller thread instead of pinning pool threads.
 
+(defn test-rebind-same-port-after-stop []
+  ;; stop-server must release the port immediately: close() alone does not wake
+  ;; the acceptor parked in accept() on Linux, so the listen socket (and its
+  ;; port binding) survives the syscall and the rebind fails with EADDRINUSE.
+  (let [s1 (adapter/run-server handler {:port 8423})]
+    (Thread/sleep 100)
+    (adapter/stop-server s1))
+  (let [server (adapter/run-server handler {:port 8423})]
+    (try
+      (let [r (http/get "http://127.0.0.1:8423/")]
+        (check "rebind: same port serves right after stop" 200 (:status r)))
+      (finally
+        (adapter/stop-server server)))))
+
 (defn test-fiber-basic []
   (let [server (adapter/run-server handler {:port 8420 :strategy :fibers})]
     (Thread/sleep 250)
@@ -744,6 +758,7 @@
   (test-max-request-size)
 
   ;; --- concurrency strategies ---
+  (test-rebind-same-port-after-stop)
   (test-fiber-basic)
   (test-fiber-idle-connections-do-not-pin)
   (test-fiber-keep-alive-and-pipelining)

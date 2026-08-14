@@ -22,6 +22,7 @@
 (ffi/defcfn c-listen     "listen"     [:int :int] :int)
 (ffi/defcfn c-setsockopt "setsockopt" [:int :int :int :pointer :int] :int)
 (ffi/defcfn c-close      "close"      [:int] :int)
+(ffi/defcfn c-shutdown   "shutdown"   [:int :int] :int)
 (ffi/defcfn c-accept     "accept"     [:int :pointer :pointer] :int :blocking)
 (ffi/defcfn c-recv       "recv"       [:int :pointer :size_t :int] :ssize_t :blocking)
 (ffi/defcfn c-send       "send"       [:int :pointer :size_t :int] :ssize_t :blocking)
@@ -428,8 +429,10 @@
       (and (send-all conn (response->string resp keep?)) keep?))))
 
 ;; --- the accept loop --------------------------------------------------------
-;; Clean shutdown: stop-server closes the listen fd (which unblocks accept) and
-;; clears `running?`; the loop then exits instead of spinning on the dead fd.
+;; Clean shutdown: stop-server shutdown()s the listen fd (SHUT_RDWR), which
+;; wakes the acceptor parked in accept() on both Linux and macOS (close()
+;; alone does NOT wake it on Linux), then closes it; the loop sees `running?`
+;; false and exits instead of spinning on the dead fd.
 (defn- serve-loop [listen-fd running? serve!]
   (loop []
     (let [conn (c-accept listen-fd ffi/null ffi/null)]
@@ -530,7 +533,13 @@
       (connection-loop conn handler port ka-ms ws-handler max-bytes
                        (fiber-io poller conn ka-ms))
       (catch Throwable _ nil)
-      (finally (c-close conn)))))
+      ;; shutdown before close: on Linux close() alone does not deliver FIN
+      ;; to the peer (some reference inside the jolt ffi layer holds the OS
+      ;; socket open, plausibly the poller registration on this fd); the
+      ;; peer's blocked recv never sees EOF. shutdown() forces FIN at the
+      ;; socket level regardless. macOS delivers FIN on close() either way.
+      (finally (c-shutdown conn 2)
+               (c-close conn)))))
 
 (defn run-server
   "Start the server; return a handle {:socket :port :running}. opts:
@@ -572,11 +581,15 @@
 
 (defn stop-server
   "Stop the server: unblock + exit the accept loop and close the listen socket.
-  Fiber strategy: the poller is stopped too, releasing every parked fiber."
+  Fiber strategy: the poller is stopped too, releasing every parked fiber.
+  shutdown(SHUT_RDWR) before close() is required on Linux: close() alone
+  leaves the acceptor parked in accept() holding the port binding, so
+  rebinding the same port fails with EADDRINUSE."
   [server]
   (reset! (:running server) false)
   (if-let [poller (:poller server)]
     (stop-poller! poller)
     (async/close! (:work server)))
+  (c-shutdown (:socket server) 2)        ; SHUT_RDWR: wake parked accept()
   (c-close (:socket server))
   nil)
