@@ -21,13 +21,16 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
 - `:keep-alive-timeout-ms` (default 30000) — idle keep-alive connections are
   dropped via `SO_RCVTIMEO`
 - `:max-request-bytes` (default 1048576) — headers + body combined; over the
-  cap the server answers 413 and closes instead of buffering without bound
+  cap the server answers 431 (run-on headers) or 413 (oversized body) and
+  closes instead of buffering without bound
 - `:ws-handler` — fn of a websocket session, run when an upgrade request
   arrives (below)
 
 Keep-alive is HTTP/1.1 default, HTTP/1.0 opt-in via `Connection: keep-alive`;
 pipelined requests are handled via leftover carry. `204`/`304`/`HEAD` responses
-never frame a body.
+never frame a body. Malformed requests get `400`, unknown HTTP versions `505`,
+and a handler-supplied `Connection: close` header is honored (the connection
+closes after that response).
 
 ## Streaming responses
 
