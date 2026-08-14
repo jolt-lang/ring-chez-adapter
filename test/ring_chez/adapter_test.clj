@@ -237,7 +237,105 @@
         (sse/send! ch {:data "bye"})
         (a/close! ch))
       (sse/event-response ch))
+    (= uri "/teapot") {:status 418 :headers {"Content-Type" "text/plain"} :body "teapot"}
+    (= uri "/close-hdr") {:status 200 :headers {"Content-Type" "text/plain"
+                                                "Connection" "close"}
+                          :body "bye"}
+    (= uri "/multi-hdr") {:status 200 :headers {"Content-Type" "text/plain"
+                                                "Set-Cookie" ["a=1" "b=2"]}
+                          :body "x"}
     :else           {:status 404 :headers {"Content-Type" "text/plain"} :body "not found"}))
+
+;; --- Protocol correctness (adopted from capra) --------------------------------
+
+(defn test-status-reasons []
+  (let [server (adapter/run-server handler {:port 8415 :worker-threads 1})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8415 3000)]
+        (client-send fd "GET /teapot HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "reason: 418 reason phrase" "418 I'm a teapot" (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-connection-header-list []
+  ;; Connection is a comma list, case-insensitive: "Keep-Alive, Close" means close
+  (let [server (adapter/run-server handler {:port 8416 :worker-threads 1})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8416 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\nConnection: Keep-Alive, Close\r\n\r\n")
+        (let [r (client-recv fd)]
+          (check-has "conn-list: response served" "200 OK" r)
+          (check-has "conn-list: close honored" "connection: close" (str/lower-case r))
+          (check "conn-list: server closed conn" "" (client-recv fd)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-handler-connection-close []
+  ;; a handler that sets Connection: close must win: single header, conn closes
+  (let [server (adapter/run-server handler {:port 8417 :worker-threads 1})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8417 3000)]
+        (client-send fd "GET /close-hdr HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [r (client-recv fd)]
+          (check-has "hdr-close: response served" "200 OK" r)
+          (check "hdr-close: exactly one Connection header" 1
+                 (count (re-seq #"(?im)^Connection:" r)))
+          (check-has "hdr-close: it says close" "connection: close" (str/lower-case r))
+          (check "hdr-close: server closed conn" "" (client-recv fd)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-vector-header-values []
+  ;; vector header values emit one header line per element
+  (let [server (adapter/run-server handler {:port 8418 :worker-threads 1})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8418 3000)]
+        (client-send fd "GET /multi-hdr HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [r (client-recv fd)]
+          (check-has "vec-hdr: first line" "Set-Cookie: a=1" r)
+          (check-has "vec-hdr: second line" "Set-Cookie: b=2" r))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-bad-request-lines []
+  ;; malformed start line / bad header line / missing Host / bad version
+  (let [server (adapter/run-server handler {:port 8419 :worker-threads 1})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8419 3000)]
+        (client-send fd "GETONLY\r\n\r\n")
+        (check-has "bad: garbage start line -> 400" " 400 Bad Request" (client-recv fd))
+        (client-close fd))
+      (let [fd (client-connect 8419 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\nnocolon\r\n\r\n")
+        (check-has "bad: header without colon -> 400" " 400 Bad Request" (client-recv fd))
+        (client-close fd))
+      (let [fd (client-connect 8419 3000)]
+        (client-send fd "GET / HTTP/1.1\r\n\r\n")
+        (check-has "bad: missing Host on 1.1 -> 400" " 400 Bad Request" (client-recv fd))
+        (client-close fd))
+      (let [fd (client-connect 8419 3000)]
+        (client-send fd "GET / HTTP/9.9\r\nHost: t\r\n\r\n")
+        (check-has "bad: unknown version -> 505" " 505 " (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-header-cap-is-431 []
+  ;; header-only overflow is 431 Request Header Fields Too Large, not 413
+  (let [server (adapter/run-server handler {:port 8420 :worker-threads 1
+                                            :max-request-bytes 1000})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8420 2000)]
+        (client-send fd (str "GET / HTTP/1.1\r\nHost: t\r\nX-Big: "
+                             (apply str (repeat 3000 "a")) "\r\n"))
+        (check-has "431: run-on headers -> 431" "431" (client-recv-until fd "\r\n\r\n"))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
 
 ;; --- Phase 1: worker pool ----------------------------------------------------
 
@@ -478,12 +576,12 @@
                                             :max-request-bytes 1000})]
     (try
       (Thread/sleep 250)
-      ;; run-on headers (no \r\n\r\n within cap) -> 413, connection closed
+      ;; run-on headers (no \r\n\r\n within cap) -> 431, connection closed
       (let [fd (client-connect 8414 2000)]
         (client-send fd (str "GET / HTTP/1.1\r\nHost: t\r\nX-Big: "
                              (apply str (repeat 3000 "a")) "\r\n"))
         (let [r (client-recv-until fd "\r\n\r\n")]
-          (check-has "cap: 413 for run-on headers" "413" r)
+          (check-has "cap: 431 for run-on headers" "431" r)
           (check-has "cap: connection closed" "close" (str/lower-case r)))
         (client-close fd))
       ;; declared body larger than cap -> 413 without reading the body
@@ -515,6 +613,14 @@
       (let [r (http/get "http://127.0.0.1:8399/echo?q=hi&ua=1")]
         (check-has "query string reaches handler" "q=hi" (:body r)))
       (finally (adapter/stop-server server))))
+
+  ;; --- Protocol correctness (adopted from capra) ---
+  (test-status-reasons)
+  (test-connection-header-list)
+  (test-handler-connection-close)
+  (test-vector-header-values)
+  (test-bad-request-lines)
+  (test-header-cap-is-431)
 
   ;; --- Phase 1 ---
   (test-concurrent-slow-requests)

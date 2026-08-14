@@ -106,13 +106,13 @@
               {:text (subs acc 0 (+ hdr-end 4 cl))
                :leftover (subs acc (+ hdr-end 4 cl))}
               (if (> (+ (count acc) cl) max-bytes)
-                :too-big
+                :too-big                    ; body exceeds the cap -> 413
                 (let [n (c-recv conn buf bufsize 0)]
                   (if (pos? n)
                     (recur (str acc (ffi/read-bytes buf n)))
                     :bad)))))
           (if (> (count acc) max-bytes)
-            :too-big
+            :headers-too-big              ; headers never ended -> 431
             (let [n (c-recv conn buf bufsize 0)]
               (cond
                 (pos? n) (recur (str acc (ffi/read-bytes buf n)))
@@ -121,39 +121,77 @@
       (finally (ffi/free buf)))))
 
 ;; --- request -> Ring map ----------------------------------------------------
-(defn- request->ring [text port]
+(defn- request->ring
+  "Parse raw request text into {:request ring-map}, or {:error response} when
+  the request is malformed (400) or speaks an unsupported HTTP version (505).
+  HTTP/1.1 requests must carry a Host header (RFC 7230 §5.4)."
+  [text port]
   (let [blank (str/index-of text "\r\n\r\n")
         head (if blank (subs text 0 blank) text)
         body (if blank (subs text (+ blank 4)) "")
         lines (str/split head #"\r\n")
-        parts (str/split (or (first lines) "GET / HTTP/1.1") #" ")
-        method (or (first parts) "GET")
-        target (or (second parts) "/")
-        proto  (or (nth parts 2 "HTTP/1.1") "HTTP/1.1")
-        qi (str/index-of target "?")
-        [uri qs] (if qi [(subs target 0 qi) (subs target (inc qi))] [target nil])
+        parts (str/split (or (first lines) "") #" ")
         headers (reduce (fn [m line]
                           (let [i (str/index-of line ":")]
                             (if (and i (pos? i))
                               (assoc m (str/lower-case (str/trim (subs line 0 i))) (str/trim (subs line (inc i))))
                               m)))
-                        {} (rest lines))]
-    {:server-port    port
-     :server-name    "127.0.0.1"
-     :remote-addr    "127.0.0.1"
-     :uri            uri
-     :query-string   qs
-     :scheme         :http
-      :request-method (keyword (str/lower-case method))
-      :protocol       proto
-     :headers        headers
-     :body           (when (pos? (count body)) (java.io.StringReader. body))}))
+                        {} (rest lines))
+        bad (fn [status msg] {:error {:status status
+                                       :headers {"Content-Type" "text/plain"}
+                                       :body msg}})]
+    (cond
+      (not= 3 (count parts))
+      (bad 400 "Bad Request")
+
+      (not (every? (fn [line] (let [i (str/index-of line ":")] (and i (pos? i))))
+                   (rest lines)))
+      (bad 400 "Bad Request")
+
+      (not (contains? #{"HTTP/1.1" "HTTP/1.0"} (nth parts 2)))
+      (bad 505 "HTTP Version Not Supported")
+
+      (and (= "HTTP/1.1" (nth parts 2)) (not (contains? headers "host")))
+      (bad 400 "Bad Request")
+
+      :else
+      (let [target (second parts)
+            qi (str/index-of target "?")
+            [uri qs] (if qi [(subs target 0 qi) (subs target (inc qi))] [target nil])]
+        {:request {:server-port    port
+                   :server-name    "127.0.0.1"
+                   :remote-addr    "127.0.0.1"
+                   :uri            uri
+                   :query-string   qs
+                   :scheme         :http
+                   :request-method (keyword (str/lower-case (first parts)))
+                   :protocol       (nth parts 2)
+                   :headers        headers
+                   :body           (when (pos? (count body)) (java.io.StringReader. body))}}))))
 
 ;; --- Ring response -> the response string -----------------------------------
 (def ^:private status-text
-  {200 "OK" 201 "Created" 204 "No Content" 301 "Moved Permanently" 302 "Found"
-   303 "See Other" 304 "Not Modified" 400 "Bad Request" 401 "Unauthorized"
-   403 "Forbidden" 404 "Not Found" 405 "Method Not Allowed" 500 "Internal Server Error"})
+  {100 "Continue" 101 "Switching Protocols" 102 "Processing" 103 "Early Hints"
+   200 "OK" 201 "Created" 202 "Accepted" 203 "Non-Authoritative Information"
+   204 "No Content" 205 "Reset Content" 206 "Partial Content" 207 "Multi-Status"
+   208 "Already Reported" 226 "IM Used"
+   300 "Multiple Choices" 301 "Moved Permanently" 302 "Found" 303 "See Other"
+   304 "Not Modified" 305 "Use Proxy" 307 "Temporary Redirect" 308 "Permanent Redirect"
+   400 "Bad Request" 401 "Unauthorized" 402 "Payment Required" 403 "Forbidden"
+   404 "Not Found" 405 "Method Not Allowed" 406 "Not Acceptable"
+   407 "Proxy Authentication Required" 408 "Request Timeout" 409 "Conflict"
+   410 "Gone" 411 "Length Required" 412 "Precondition Failed"
+   413 "Content Too Large" 414 "URI Too Long" 415 "Unsupported Media Type"
+   416 "Range Not Satisfiable" 417 "Expectation Failed" 418 "I'm a teapot"
+   421 "Misdirected Request" 422 "Unprocessable Content" 423 "Locked"
+   424 "Failed Dependency" 425 "Too Early" 426 "Upgrade Required"
+   428 "Precondition Required" 429 "Too Many Requests"
+   431 "Request Header Fields Too Large" 451 "Unavailable For Legal Reasons"
+   500 "Internal Server Error" 501 "Not Implemented" 502 "Bad Gateway"
+   503 "Service Unavailable" 504 "Gateway Timeout"
+   505 "HTTP Version Not Supported" 506 "Variant Also Negotiates"
+   507 "Insufficient Storage" 508 "Loop Detected" 510 "Not Extended"
+   511 "Network Authentication Required"})
 
 (defn- body->string [b]
   (cond (nil? b) ""
@@ -169,14 +207,21 @@
   [resp keep-alive? framing]
   (let [status (or (:status resp) 200)
         sb (StringBuilder.)]
-    (.append sb (str "HTTP/1.1 " status " " (get status-text status "OK") "\r\n"))
+    (.append sb (str "HTTP/1.1 " status " " (get status-text status "Unknown") "\r\n"))
     (doseq [[k v] (:headers resp)]
-      (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))]
+      (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))
+            emit (fn [v] (.append sb (str (if (keyword? k) (name k) (str k)) ": " v "\r\n")))]
         (when (and (not= kn "content-length") (not= kn "transfer-encoding"))
-          (.append sb (str (if (keyword? k) (name k) (str k)) ": " v "\r\n")))))
+          ;; vector values emit one header line per element
+          (if (vector? v) (doseq [vv v] (emit vv)) (emit v)))))
     (cond (number? framing) (.append sb (str "Content-Length: " framing "\r\n"))
           (= :chunked framing) (.append sb "Transfer-Encoding: chunked\r\n"))
-    (.append sb (str "Connection: " (if keep-alive? "keep-alive" "close") "\r\n\r\n"))
+    ;; the handler's own Connection header (if any) was emitted above; only add
+    ;; ours when it did not set one
+    (when-not (some #(= "connection" (str/lower-case (if (keyword? (key %)) (name (key %)) (str (key %)))))
+                    (:headers resp))
+      (.append sb (str "Connection: " (if keep-alive? "keep-alive" "close") "\r\n")))
+    (.append sb "\r\n")
     (.toString sb)))
 
 (defn- response->string
@@ -194,11 +239,30 @@
                  (alength (.getBytes body "UTF-8")))]
      (str (head->string resp keep-alive? len) body))))
 
+;; Connection headers are comma-separated token lists, case-insensitive
+;; (RFC 7230 §6.1): "Keep-Alive, Close" means close.
+(defn- header-tokens [v]
+  (map str/trim (str/split (or v "") #",")))
+
+(defn- conn-token? [tok v]
+  (some #(= tok (str/lower-case %)) (header-tokens v)))
+
 (defn- keep-alive? [req]
   (let [c (get-in req [:headers "connection"])]
     (if (= "HTTP/1.0" (:protocol req))
-      (= "keep-alive" c)
-      (not= "close" c))))
+      (conn-token? "keep-alive" c)
+      (not (conn-token? "close" c)))))
+
+(defn- response-conn-close?
+  "True when the handler's own response headers ask to close."
+  [resp]
+  (->> (:headers resp)
+       (some (fn [[k v]]
+               (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))]
+                 (when (= kn "connection")
+                   (if (vector? v)
+                     (some #(conn-token? "close" %) v)
+                     (conn-token? "close" v))))))))
 
 (defn- send-all
   "Write s to conn; false when the peer is gone (caller closes)."
@@ -239,7 +303,7 @@
 (defn- send-response
   "Send resp for req on conn. Returns true when the connection may be reused."
   [conn req resp]
-  (let [keep?     (keep-alive? req)
+  (let [keep?     (and (keep-alive? req) (not (response-conn-close? resp)))
         status    (or (:status resp) 200)
         bodyless? (or (contains? #{100 101 204 304} status)
                       (= :head (:request-method req)))
@@ -305,24 +369,31 @@
                                        {:status 413 :headers {"Content-Type" "text/plain"
                                                               "Connection" "close"}
                                         :body "Payload Too Large"} false))
+        (= :headers-too-big r) (send-all conn (response->string
+                                               {:status 431 :headers {"Content-Type" "text/plain"
+                                                                      "Connection" "close"}
+                                                :body "Request Header Fields Too Large"} false))
         (map? r)
-        (let [req (request->ring (:text r) port)]
-          (if (and ws-handler (upgrade-request? req))
+        (let [{:keys [request error]} (request->ring (:text r) port)]
+          (cond
+            error (send-all conn (response->string error false))
+            (and ws-handler (upgrade-request? request))
             ;; websocket takeover: 101, then the session owns the fd until it
             ;; returns; the connection is not reused afterwards
             (when (send-all conn (str "HTTP/1.1 101 Switching Protocols\r\n"
                                       "Upgrade: websocket\r\n"
                                       "Connection: Upgrade\r\n"
                                       "Sec-WebSocket-Accept: "
-                                      (ws/accept-token (get-in req [:headers "sec-websocket-key"]))
+                                      (ws/accept-token (get-in request [:headers "sec-websocket-key"]))
                                       "\r\n\r\n"))
               (try (ws-handler (ws/make-session conn))
                    (catch Throwable _ nil)))
-            (let [resp (try (handler req)
+            :else
+            (let [resp (try (handler request)
                             (catch Throwable _
                               {:status 500 :headers {"Content-Type" "text/plain"}
                                :body "Internal Server Error"}))]
-              (when (send-response conn req resp)
+              (when (send-response conn request resp)
                 (recur (:leftover r))))))
         :else nil))))
 
