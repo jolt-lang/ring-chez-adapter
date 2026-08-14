@@ -1,2 +1,4 @@
 jpm_tree/
 .cpcache/
+.clj-kondo/
+.lsp/
