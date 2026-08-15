@@ -11,6 +11,21 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
 (adapter/stop-server server)
 ```
 
+## Install
+
+Add the git dependency to `deps.edn`:
+
+```clojure
+{:deps
+ {jolt-lang/ring-chez-adapter
+  {:git/url "https://github.com/jolt-lang/ring-chez-adapter"
+   :git/tag "v0.3.0"
+   :git/sha "9739fbdcc326f0c95e0ebedb7b4ed9fcdec47070"}}}
+```
+
+Requires the `jolt` binary (Clojure on Chez Scheme, no JVM); the adapter
+binds BSD sockets through `jolt.ffi`, so there is nothing else to install.
+
 ## Options
 
 `run-server` takes an opts map:
