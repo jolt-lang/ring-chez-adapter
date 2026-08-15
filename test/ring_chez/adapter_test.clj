@@ -1078,6 +1078,78 @@
       (check "guard-throw: on-failure saw guard throw" {:g 1} @seen)
       (finally (adapter/stop-server server)))))
 
+;; --- RFC-0005: write timeout ----------------------------------------------------
+
+(defn- client-connect-tiny-rcvbuf [port rcvtimeo-ms]
+  ;; SO_RCVBUF 2048 before connect: this peer stops draining almost
+  ;; immediately, so the server's send blocks once buffers fill
+  (let [fd (t-socket 2 1 0)
+        so-rcvbuf (if t-macos? 0x1002 8)
+        v (ffi/alloc 4)]
+    (ffi/write v :int 0 2048)
+    (t-setsockopt fd t-sol-socket so-rcvbuf v 4)
+    (ffi/free v)
+    (t-set-rcvtimeo! fd rcvtimeo-ms)
+    (let [sa (t-sockaddr port)]
+      (when (neg? (t-connect fd sa 16))
+        (t-close fd) (ffi/free sa) (throw (ex-info "connect() failed" {})))
+      (ffi/free sa))
+    fd))
+
+(defn- drain-until-eof [fd]
+  ;; accumulate until the server closes (recv 0) or a read timeout
+  (let [buf (ffi/alloc 65536)]
+    (try
+      (loop [acc ""]
+        (let [n (t-recv fd buf 65536 0)]
+          (cond (pos? n) (recur (str acc (ffi/read-bytes buf n)))
+                (zero? n) acc
+                :else (if (pos? (count acc)) acc ""))))
+      (finally (ffi/free buf)))))
+
+(defn test-write-timeout-cuts-stalled-peer []
+  ;; 16MB: bigger than any autotuned send buffer, so the send genuinely
+  ;; blocks once the peer stops draining
+  (let [big (apply str (repeat 16777216 "a"))
+        server (adapter/run-server
+                 (fn [req] (if (= "/big" (:uri req))
+                             {:status 200 :body big}
+                             {:status 200 :body "q=free"}))
+                 {:port 8442 :worker-threads 1 :write-timeout-ms 300})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect-tiny-rcvbuf 8442 8000)]
+        (client-send fd "GET /big HTTP/1.1\r\nHost: t\r\n\r\n")
+        ;; stall — never read while the body is coming: the tiny rcvbuf and
+        ;; the server sndbuf fill, the blocking send times out at ~300ms,
+        ;; and the server abandons the response and closes
+        (Thread/sleep 1000)
+        (let [r (drain-until-eof fd)]
+          (check "write-timeout: body truncated" true (< (count r) 16777216))
+          (check "write-timeout: some bytes delivered first" true (pos? (count r))))
+        (client-close fd))
+      ;; the worker is free again: a fresh request is served promptly
+      (let [fd (client-connect 8442 3000)
+            _ (client-send fd "GET /echo?q=free HTTP/1.1\r\nHost: t\r\n\r\n")]
+        (check-has "write-timeout: worker freed after cut" "q=free" (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-write-timeout-zero-disables []
+  (let [big (apply str (repeat 262144 "b"))
+        server (adapter/run-server (fn [_] {:status 200 :body big})
+                 {:port 8443 :worker-threads 1 :write-timeout-ms 0})]
+    (try
+      (Thread/sleep 250)
+      ;; Connection: close -> the server closes after the last byte, so
+      ;; drain-until-eof returns without waiting out a read timeout
+      (let [fd (client-connect 8443 8000)
+            _ (client-send fd "GET /big HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            r (drain-until-eof fd)]
+        (check "write-timeout off: full body delivered" true (<= 262144 (count r)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
 (defn -main [& _]
   (println "ring adapter over jolt.ffi sockets")
 
@@ -1153,6 +1225,8 @@
   (test-ws-guard-rejects-with-response)
   (test-ws-guard-nil-is-403)
   (test-ws-guard-throw-is-request-failure)
+  (test-write-timeout-cuts-stalled-peer)
+  (test-write-timeout-zero-disables)
 
   (if (zero? @failures)
     (println "all passed")

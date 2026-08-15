@@ -51,6 +51,9 @@
 (def ^:private sol-socket  (if macos? 0xffff 1))
 (def ^:private so-reuse    (if macos? 4 2))
 (def ^:private so-rcvtimeo (if macos? 0x1006 20))
+;; darwin keeps the sockopt block contiguous: SO_SNDBUF 0x1001 ... SO_SNDTIMEO
+;; 0x1005, SO_RCVTIMEO 0x1006 (0x2005 is nothing — setsockopt ENOPROTOOPTs)
+(def ^:private so-sndtimeo (if macos? 0x1005 21))
 
 ;; struct timeval { time_t tv_sec; suseconds_t tv_usec; } — 8 + (4 macOS | 8 Linux)
 (defn- set-rcvtimeo! [fd ms]
@@ -62,6 +65,22 @@
       (ffi/write tv :uint64 8 (rem ms 1000)))
     (c-setsockopt fd sol-socket so-rcvtimeo tv 16)
     (ffi/free tv)))
+
+;; Igropyr default-write-timeout-ms: a peer that stops draining must not pin
+;; the worker forever. SO_SNDTIMEO bounds each blocking send; a timed-out
+;; send returns EAGAIN, which send-all already treats as peer-gone (abandon
+;; the response and close). 0 disables. Fiber-strategy sockets are
+;; O_NONBLOCK, where sends park in wait-write! under the ka sweeper instead.
+(defn- set-sndtimeo! [fd ms]
+  (when (pos? ms)
+    (let [tv (ffi/alloc 16)]
+      (dotimes [i 16] (ffi/write tv :uint8 i 0))
+      (ffi/write tv :uint64 0 (quot ms 1000))
+      (if macos?
+        (ffi/write tv :uint 8 (rem ms 1000))
+        (ffi/write tv :uint64 8 (rem ms 1000)))
+      (c-setsockopt fd sol-socket so-sndtimeo tv 16)
+      (ffi/free tv))))
 
 (def ^:private f-getfl 3)
 (def ^:private f-setfl 4)
@@ -502,8 +521,9 @@
         :else {:status 403 :headers {"Content-Type" "text/plain"}
                :body "Forbidden"}))))
 
-(defn- connection-loop [conn handler port ka-ms ws-handler ws-guard on-failure max-bytes io deadline]
+(defn- connection-loop [conn handler port ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io deadline]
   (set-rcvtimeo! conn ka-ms)
+  (set-sndtimeo! conn write-timeout-ms)
   (let [recv!      (:recv! io)
         idle-recv! (or (:idle-recv! io) recv!)
         send!      (or (:send! io) send-all)]
@@ -583,7 +603,7 @@
                   (recur (:leftover r))))))
           :else nil)))))
 
-(defn- worker [handler port ka-ms ws-handler ws-guard on-failure max-bytes io work]
+(defn- worker [handler port ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io work]
   (loop []
     (when-let [conn (async/<!! work)]
       ;; claim at take-time: pending then counts only conns accepted but not
@@ -591,7 +611,7 @@
       ;; where a claimed conn still reads as pressure and over-retires
       ((io :claim!))
       (try
-        (connection-loop conn handler port ka-ms ws-handler ws-guard on-failure max-bytes io nil)
+        (connection-loop conn handler port ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io nil)
         ;; an escaping throwable must not kill the worker: a dead worker
         ;; shrinks the pool permanently and starves later connections
         (catch Throwable _)
@@ -642,15 +662,15 @@
   bound, and idle connections hold no thread. The spawn runs under
   *go-backend* :fiber: the default :thread backend runs go bodies on OS
   threads, where wait-ready would block the carrier instead of parking."
-  [handler port ka-ms ws-handler ws-guard on-failure max-bytes conn conns]
+  [handler port ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms conn conns]
   (let [deadline (atom (+ (System/currentTimeMillis) ka-ms))
         entry {:conn conn :closed? (atom false) :deadline deadline}]
     (swap! conns conj entry)
     (binding [async/*go-backend* :fiber]
       (async/go
         (try
-          (connection-loop conn handler port ka-ms ws-handler ws-guard on-failure max-bytes
-                           (fiber-io conn) deadline)
+          (connection-loop conn handler port ka-ms ws-handler ws-guard on-failure
+                           max-bytes write-timeout-ms (fiber-io conn) deadline)
           (catch Throwable _ nil)
           (finally (conn-close! conns entry)))))))
 
@@ -716,6 +736,7 @@
           ws-guard (get opts :ws-guard)
           on-failure (get opts :on-failure)
           max-bytes (or (:max-bytes v) 1048576)
+          write-timeout-ms (or (:write-timeout-ms v) 30000)
           fd     (listen-socket port)
           running? (atom true)]
       (if (= :fibers strategy)
@@ -724,7 +745,7 @@
           (future (serve-loop fd running?
                               (fn [conn]
                                 (poller/nonblock! conn)
-                                (fiber-serve handler port ka-ms ws-handler ws-guard on-failure max-bytes conn conns))))
+                                (fiber-serve handler port ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms conn conns))))
           {:socket fd :port port :running running? :conns conns :sweep sweep})
         (let [work (async/chan)   ; unbuffered: acceptor parks when all workers busy
               pending (atom 0)    ; conns accepted but not yet claimed by a worker
@@ -755,7 +776,7 @@
                                                    (and (>= now grace) (pos? @pending)) 0
                                                    :else (recur)))))
                                            (finally (ffi/free pfds))))))]
-           (dotimes [_ n] (async/thread (worker handler port ka-ms ws-handler ws-guard on-failure max-bytes io work)))
+           (dotimes [_ n] (async/thread (worker handler port ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io work)))
           (future (serve-loop fd running?
                               (fn [conn]
                                 (swap! pending inc)
