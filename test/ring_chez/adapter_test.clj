@@ -860,6 +860,38 @@
               (client-close fd)))))
       (finally (adapter/stop-server server)))))
 
+;; --- RFC-0002: boot-time option validation -------------------------------------
+
+(defn test-boot-validation []
+  (doseq [[k v] [[:port "abc"] [:port 0] [:port 70000]
+                 [:worker-threads 0] [:worker-threads -1]
+                 [:keep-alive-timeout-ms 0] [:keep-alive-timeout-ms -5]
+                 [:max-request-bytes 0]
+                 [:on-failure :not-a-fn]
+                 [:ws-guard 42]
+                 [:write-timeout-ms -1]]]
+    (try
+      (adapter/run-server handler {k v})
+      (check (str "validation: " k " " (pr-str v) " rejected") :threw :did-not-throw)
+      (catch Throwable t
+        (check (str "validation: " k " " (pr-str v) " rejected") :threw :threw)
+        (check (str "validation: " k " names key in ex-data") k (:key (ex-data t)))
+        (check (str "validation: " k " carries :given")
+               true (contains? (ex-data t) :given)))))
+  ;; a failed validation must never have bound a socket: a clean boot on a
+  ;; fresh port with all keys present-and-valid still serves.
+  (let [server (adapter/run-server handler {:port 8432 :worker-threads 1
+                                            :keep-alive-timeout-ms 30000
+                                            :max-request-bytes 1048576
+                                            :write-timeout-ms 0})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8432 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "validation: valid opts still serve" "200 OK" (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
 (defn -main [& _]
   (println "ring adapter over jolt.ffi sockets")
 
@@ -926,6 +958,7 @@
   (test-fiber-restart-leaves-poller-clean)
   (test-bad-strategy-throws)
   (test-bind-failure-carries-errno)
+  (test-boot-validation)
 
   (if (zero? @failures)
     (println "all passed")

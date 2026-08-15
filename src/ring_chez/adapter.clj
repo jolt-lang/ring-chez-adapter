@@ -608,6 +608,32 @@
           (catch Throwable _ nil)
           (finally (conn-close! conns entry)))))))
 
+;; Igropyr http.sc: bad config must crash HERE, at boot — deferred to request
+;; time it raises inside the reader and the connection just drops. One error
+;; per throw, first failing key; unknown keys pass (forward compatibility).
+(defn- validate-opts! [opts]
+  (letfn [(bad! [k given expected]
+            (throw (ex-info (str "run-server: " k " must be " expected)
+                            {:key k :given given :expected expected})))
+          (check-num [k lo hi]
+            (when (contains? opts k)
+              (let [v (get opts k)]
+                (when-not (and (int? v) (>= v lo) (<= v hi))
+                  (bad! k v (str "an integer in " lo ".." hi)))))
+            (get opts k))
+          (check-ifn [k]
+            (when (contains? opts k)
+              (let [v (get opts k)]
+                (when-not (fn? v) (bad! k v "a function"))))
+            (get opts k))]
+    {:port               (check-num :port 1 65535)
+     :worker-threads     (check-num :worker-threads 1 ##Inf)
+     :ka-ms              (check-num :keep-alive-timeout-ms 1 ##Inf)
+     :max-bytes          (check-num :max-request-bytes 1 ##Inf)
+     :on-failure         (check-ifn :on-failure)
+     :ws-guard           (check-ifn :ws-guard)
+     :write-timeout-ms   (check-num :write-timeout-ms 0 ##Inf)}))
+
 (defn run-server
   "Start the server; return a handle {:socket :port :running}. opts:
     :port                  listen port (default 3000)
@@ -636,11 +662,12 @@
     (when-not (contains? #{:threads :fibers} strategy)
       (throw (ex-info "run-server: :strategy must be :threads or :fibers"
                       {:strategy strategy :given opts})))
-    (let [port   (get opts :port 3000)
-          n      (get opts :worker-threads (.availableProcessors (Runtime/getRuntime)))
-          ka-ms  (get opts :keep-alive-timeout-ms 30000)
+    (let [v      (validate-opts! opts)
+          port   (or (:port v) 3000)
+          n      (or (:worker-threads v) (.availableProcessors (Runtime/getRuntime)))
+          ka-ms  (or (:ka-ms v) 30000)
           ws-handler (get opts :ws-handler)
-          max-bytes (get opts :max-request-bytes 1048576)
+          max-bytes (or (:max-bytes v) 1048576)
           fd     (listen-socket port)
           running? (atom true)]
       (if (= :fibers strategy)
