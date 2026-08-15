@@ -66,6 +66,29 @@ never frame a body. Malformed requests get `400`, unknown HTTP versions `505`,
 and a handler-supplied `Connection: close` header is honored (the connection
 closes after that response).
 
+## Error handling
+
+Every abnormal handler completion — a handler throw, a `nil` response (an
+error per the Ring spec), a `:ws-guard` throw, or a post-`101` websocket
+session throw — flows through `:on-failure`, which gets one attempt to
+produce a response:
+
+```clojure
+(adapter/run-server handler
+  {:port 3000
+   :on-failure (fn [req ex]
+     ;; nil responses arrive tagged {:type :ring-chez/nil-response}
+     {:status 500
+      :headers {"Content-Type" "text/plain"}
+      :body (or (ex-message ex) "handler returned nil")})})
+```
+
+Return a map with `:status` and it is served — keep-alive survives the
+failure; return anything else (or throw) and the server answers the plain
+`500 Internal Server Error`. The worker always survives. Slow peers are
+bounded separately by `:write-timeout-ms`: a client that stops draining
+mid-response gets the connection abandoned instead of pinning a worker.
+
 ## Streaming responses
 
 Return a `core.async` channel as `:body` and the response is sent with
@@ -136,5 +159,5 @@ the Ring handler as usual.
 ## Test
 
 ```bash
-jolt -M:test   # 55 checks; drives the server over raw sockets + http-client
+jolt -M:test   # 214 checks; drives the server over raw sockets + http-client
 ```
