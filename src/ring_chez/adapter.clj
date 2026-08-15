@@ -9,133 +9,11 @@
        (adapter/stop-server server)"
   (:require [clojure.string :as str]
             [clojure.core.async :as async]
+            [ring-chez.socket :as socket]
+            [ring-chez.http :as http]
             [ring-chez.websocket :as ws]
             [jolt.io-poller :as poller]
             [jolt.ffi :as ffi]))
-
-;; The libc/socket symbols are declared in deps.edn (:jolt/native :process) and
-;; loaded by jolt before this namespace is required, so the bindings resolve.
-
-;; accept/recv/send may block — :blocking emits them collect-safe so a parked
-;; accept thread never pins the garbage collector.
-(ffi/defcfn c-socket     "socket"     [:int :int :int] :int)
-(ffi/defcfn c-bind       "bind"       [:int :pointer :int] :int)
-(ffi/defcfn c-listen     "listen"     [:int :int] :int)
-(ffi/defcfn c-setsockopt "setsockopt" [:int :int :int :pointer :int] :int)
-(ffi/defcfn c-close      "close"      [:int] :int)
-(ffi/defcfn c-shutdown   "shutdown"   [:int :int] :int)
-(ffi/defcfn c-accept     "accept"     [:int :pointer :pointer] :int :blocking)
-(ffi/defcfn c-recv       "recv"       [:int :pointer :size_t :int] :ssize_t :blocking)
-(ffi/defcfn c-send       "send"       [:int :pointer :size_t :int] :ssize_t :blocking)
-;; threads-strategy idle reads wait in poll(2) slices (see run-server's
-;; :idle-recv!). struct pollfd { int fd; short events; short revents; } — fd
-;; at 0, events at byte 4, revents at bytes 6-7.
-(ffi/defcfn c-poll       "poll"       [:pointer :int :int] :int :blocking)
-(ffi/defcfn c-strerror  "strerror"   [:int] :pointer)
-
-;; errno + strerror read immediately after a syscall failure return — errno
-;; is thread-local and stale across syscalls, so it is only meaningful in
-;; the window between the failure and any other FFI call.
-(defn- errno-info []
-  (let [n (poller/errno)]
-    {:errno n
-     :strerror (or (try (ffi/ptr->string (c-strerror n)) (catch Throwable _ nil)) "")}))
-
-(def ^:private POLLIN  0x001)
-
-(def ^:private AF-INET 2)
-(def ^:private SOCK-STREAM 1)
-(def ^:private macos?
-  (str/includes? (str/lower-case (or (System/getProperty "os.name") "")) "mac"))
-;; SOL_SOCKET / SO_REUSEADDR differ by platform: macOS 0xffff / 4, Linux 1 / 2.
-(def ^:private sol-socket  (if macos? 0xffff 1))
-(def ^:private so-reuse    (if macos? 4 2))
-(def ^:private so-rcvtimeo (if macos? 0x1006 20))
-;; darwin keeps the sockopt block contiguous: SO_SNDBUF 0x1001 ... SO_SNDTIMEO
-;; 0x1005, SO_RCVTIMEO 0x1006 (0x2005 is nothing — setsockopt ENOPROTOOPTs)
-(def ^:private so-sndtimeo (if macos? 0x1005 21))
-
-;; struct timeval { time_t tv_sec; suseconds_t tv_usec; } — 8 + (4 macOS | 8 Linux)
-(defn- set-rcvtimeo! [fd ms]
-  (let [tv (ffi/alloc 16)]
-    (dotimes [i 16] (ffi/write tv :uint8 i 0))
-    (ffi/write tv :uint64 0 (quot ms 1000))
-    (if macos?
-      (ffi/write tv :uint 8 (rem ms 1000))
-      (ffi/write tv :uint64 8 (rem ms 1000)))
-    (c-setsockopt fd sol-socket so-rcvtimeo tv 16)
-    (ffi/free tv)))
-
-;; Igropyr default-write-timeout-ms: a peer that stops draining must not pin
-;; the worker forever. SO_SNDTIMEO bounds each blocking send; a timed-out
-;; send returns EAGAIN, which send-all already treats as peer-gone (abandon
-;; the response and close). 0 disables. Fiber-strategy sockets are
-;; O_NONBLOCK, where sends park in wait-write! under the ka sweeper instead.
-(defn- set-sndtimeo! [fd ms]
-  (when (pos? ms)
-    (let [tv (ffi/alloc 16)]
-      (dotimes [i 16] (ffi/write tv :uint8 i 0))
-      (ffi/write tv :uint64 0 (quot ms 1000))
-      (if macos?
-        (ffi/write tv :uint 8 (rem ms 1000))
-        (ffi/write tv :uint64 8 (rem ms 1000)))
-      (c-setsockopt fd sol-socket so-sndtimeo tv 16)
-      (ffi/free tv))))
-
-(def ^:private f-getfl 3)
-(def ^:private f-setfl 4)
-(def ^:private o-nonblock (if macos? 0x4 0x800))
-
-(defn- blocking!
-  "Clear O_NONBLOCK (websocket takeover: the session runs on a plain thread
-  via :run! and relies on blocking recv bounded by SO_RCVTIMEO). No-op for a
-  socket that never went nonblocking."
-  [fd]
-  (let [flags (poller/c-fcntl fd f-getfl 0)]
-    (poller/c-fcntl fd f-setfl (bit-and-not flags o-nonblock))))
-
-;; sockaddr_in for 127.0.0.1:port. macOS: byte0 = sin_len (16), byte1 = family;
-;; Linux: bytes0-1 = family (little-endian, so byte0 = AF_INET).
-(defn- make-sockaddr [port]
-  (let [sa (ffi/alloc 16)]
-    (dotimes [i 16] (ffi/write sa :uint8 i 0))
-    (if macos?
-      (do (ffi/write sa :uint8 0 16) (ffi/write sa :uint8 1 AF-INET))
-      (ffi/write sa :uint8 0 AF-INET))
-    (ffi/write sa :uint8 2 (bit-and (bit-shift-right port 8) 0xff))   ; port hi (network order)
-    (ffi/write sa :uint8 3 (bit-and port 0xff))                       ; port lo
-    (ffi/write sa :uint8 4 127) (ffi/write sa :uint8 5 0)             ; 127.0.0.1
-    (ffi/write sa :uint8 6 0)   (ffi/write sa :uint8 7 1)
-    sa))
-
-(defn- listen-socket [port]
-  (let [fd (c-socket AF-INET SOCK-STREAM 0)]
-    (when (neg? fd)
-      (let [e (errno-info)]
-        (throw (ex-info (str "socket() failed: " (:strerror e))
-                        (assoc e :syscall "socket")))))
-    (let [opt (ffi/alloc 4)]
-      (ffi/write opt :int 0 1)
-      (when (neg? (c-setsockopt fd sol-socket so-reuse opt 4))
-        (let [e (errno-info)]
-          (c-close fd) (ffi/free opt)
-          (throw (ex-info (str "setsockopt() failed: " (:strerror e))
-                          (assoc e :syscall "setsockopt")))))
-      (ffi/free opt))
-    (let [sa (make-sockaddr port)]
-      (when (neg? (c-bind fd sa 16))
-        (let [e (errno-info)]
-          (c-close fd) (ffi/free sa)
-          (throw (ex-info (str "bind() failed on port " port ": " (:strerror e)
-                               " (errno " (:errno e) ")")
-                          (assoc e :syscall "bind" :port port)))))
-      (ffi/free sa))
-    (when (neg? (c-listen fd 64))
-      (let [e (errno-info)]
-        (c-close fd)
-        (throw (ex-info (str "listen() failed: " (:strerror e))
-                        (assoc e :syscall "listen")))))
-    fd))
 
 ;; --- fiber strategy io: jolt.io-poller ---------------------------------------
 ;; Accepted fds are set O_NONBLOCK (poller/nonblock!); reads and writes are
@@ -149,281 +27,6 @@
 ;; waker retries recv on the still-open fd, sees EAGAIN, re-parks on a dead
 ;; registration and hangs).
 
-;; --- request reading --------------------------------------------------------
-(def ^:private bufsize 65536)
-
-(defn- content-length [text hdr-end]
-  (let [hdrs (str/lower-case (subs text 0 hdr-end))
-        i (str/index-of hdrs "content-length:")]
-    (if-not i
-      0
-      (let [s (+ i (count "content-length:"))
-            e (loop [j s] (if (or (>= j (count hdrs))
-                                   (= \return (nth hdrs j)) (= \newline (nth hdrs j))) j (recur (inc j))))]
-        (or (parse-long (str/trim (subs hdrs s e))) 0)))))
-
-;; read one complete request from conn; acc carries unconsumed bytes from a
-;; previous read (pipelined requests). recv! abstracts the blocking read:
-;; the threads strategy passes plain c-recv, the fiber strategy passes a
-;; poller-parking variant. idle-recv! handles the first read of the next
-;; request on an idle keep-alive connection — under the threads strategy it
-;; waits in poll(2) slices so a queued connection can retire the idle one
-;; promptly instead of waiting out the full keep-alive timeout. Returns
-;; {:text t :leftover s} when a full request (headers + Content-Length body)
-;; is available, :closed when the peer went away (or recv timed out) before
-;; sending anything, :bad on EOF/timeout mid-request.
-(defn- read-request
-  "Reads one request (head + content-length body). Accumulation is capped at
-  max-bytes — a client that never terminates (or ships an oversized request)
-  gets :too-big instead of exhausting memory."
-  [conn acc max-bytes recv! idle-recv!]
-  (let [buf (ffi/alloc bufsize)]
-    (try
-      (loop [acc acc]
-        (if-let [hdr-end (str/index-of acc "\r\n\r\n")]
-          (let [cl (content-length acc hdr-end)]
-            (if (>= (- (count acc) (+ hdr-end 4)) cl)
-              {:text (subs acc 0 (+ hdr-end 4 cl))
-               :leftover (subs acc (+ hdr-end 4 cl))}
-              (if (> (+ (count acc) cl) max-bytes)
-                :too-big                    ; body exceeds the cap -> 413
-                (let [n (recv! conn buf)]
-                  (if (pos? n)
-                    (recur (str acc (ffi/read-bytes buf n)))
-                    :bad)))))
-          (if (> (count acc) max-bytes)
-            :headers-too-big              ; headers never ended -> 431
-            (let [n ((if (str/blank? acc) idle-recv! recv!) conn buf)]
-              (cond
-                (pos? n) (recur (str acc (ffi/read-bytes buf n)))
-                (str/blank? acc) :closed
-                :else :bad)))))
-      (finally (ffi/free buf)))))
-
-;; --- request -> Ring map ----------------------------------------------------
-(defn- request->ring
-  "Parse raw request text into {:request ring-map}, or {:error response} when
-  the request is malformed (400) or speaks an unsupported HTTP version (505).
-  HTTP/1.1 requests must carry a Host header (RFC 7230 §5.4)."
-  [text port]
-  (let [blank (str/index-of text "\r\n\r\n")
-        head (if blank (subs text 0 blank) text)
-        body (if blank (subs text (+ blank 4)) "")
-        lines (str/split head #"\r\n")
-        parts (str/split (or (first lines) "") #" ")
-        headers (reduce (fn [m line]
-                          (let [i (str/index-of line ":")]
-                            (if (and i (pos? i))
-                              (assoc m (str/lower-case (str/trim (subs line 0 i))) (str/trim (subs line (inc i))))
-                              m)))
-                        {} (rest lines))
-        bad (fn [status msg] {:error {:status status
-                                       :headers {"Content-Type" "text/plain"}
-                                       :body msg}})]
-    (cond
-      (not= 3 (count parts))
-      (bad 400 "Bad Request")
-
-      (not (every? (fn [line] (let [i (str/index-of line ":")] (and i (pos? i))))
-                   (rest lines)))
-      (bad 400 "Bad Request")
-
-      (not (contains? #{"HTTP/1.1" "HTTP/1.0"} (nth parts 2)))
-      (bad 505 "HTTP Version Not Supported")
-
-      (and (= "HTTP/1.1" (nth parts 2)) (not (contains? headers "host")))
-      (bad 400 "Bad Request")
-
-      :else
-      (let [target (second parts)
-            qi (str/index-of target "?")
-            [uri qs] (if qi [(subs target 0 qi) (subs target (inc qi))] [target nil])]
-        {:request {:server-port    port
-                   :server-name    "127.0.0.1"
-                   :remote-addr    "127.0.0.1"
-                   :uri            uri
-                   :query-string   qs
-                   :scheme         :http
-                   :request-method (keyword (str/lower-case (first parts)))
-                   :protocol       (nth parts 2)
-                   :headers        headers
-                   :body           (when (pos? (count body)) (java.io.StringReader. body))}}))))
-
-;; --- Ring response -> the response string -----------------------------------
-(def ^:private status-text
-  {100 "Continue" 101 "Switching Protocols" 102 "Processing" 103 "Early Hints"
-   200 "OK" 201 "Created" 202 "Accepted" 203 "Non-Authoritative Information"
-   204 "No Content" 205 "Reset Content" 206 "Partial Content" 207 "Multi-Status"
-   208 "Already Reported" 226 "IM Used"
-   300 "Multiple Choices" 301 "Moved Permanently" 302 "Found" 303 "See Other"
-   304 "Not Modified" 305 "Use Proxy" 307 "Temporary Redirect" 308 "Permanent Redirect"
-   400 "Bad Request" 401 "Unauthorized" 402 "Payment Required" 403 "Forbidden"
-   404 "Not Found" 405 "Method Not Allowed" 406 "Not Acceptable"
-   407 "Proxy Authentication Required" 408 "Request Timeout" 409 "Conflict"
-   410 "Gone" 411 "Length Required" 412 "Precondition Failed"
-   413 "Content Too Large" 414 "URI Too Long" 415 "Unsupported Media Type"
-   416 "Range Not Satisfiable" 417 "Expectation Failed" 418 "I'm a teapot"
-   421 "Misdirected Request" 422 "Unprocessable Content" 423 "Locked"
-   424 "Failed Dependency" 425 "Too Early" 426 "Upgrade Required"
-   428 "Precondition Required" 429 "Too Many Requests"
-   431 "Request Header Fields Too Large" 451 "Unavailable For Legal Reasons"
-   500 "Internal Server Error" 501 "Not Implemented" 502 "Bad Gateway"
-   503 "Service Unavailable" 504 "Gateway Timeout"
-   505 "HTTP Version Not Supported" 506 "Variant Also Negotiates"
-   507 "Insufficient Storage" 508 "Loop Detected" 510 "Not Extended"
-   511 "Network Authentication Required"})
-
-(defn- body->string [b]
-  (cond (nil? b) ""
-        (string? b) b
-        (or (seq? b) (vector? b)) (apply str b)
-        ;; a File / InputStream / Reader body (ring's resource + file responses):
-        ;; read its contents rather than printing the object.
-        :else (try (slurp b) (catch Throwable _ (str b)))))
-
-(defn- head->string
-  "Response head only. framing: a number (Content-Length), :chunked, or :none
-  (no body framing — bodyless status, HEAD, or close-delimited)."
-  [resp keep-alive? framing]
-  (let [status (or (:status resp) 200)
-        sb (StringBuilder.)]
-    (.append sb (str "HTTP/1.1 " status " " (get status-text status "Unknown") "\r\n"))
-    (doseq [[k v] (:headers resp)]
-      (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))
-            emit (fn [v] (.append sb (str (if (keyword? k) (name k) (str k)) ": " v "\r\n")))]
-        (when (and (not= kn "content-length") (not= kn "transfer-encoding"))
-          ;; vector values emit one header line per element
-          (if (vector? v) (doseq [vv v] (emit vv)) (emit v)))))
-    (cond (number? framing) (.append sb (str "Content-Length: " framing "\r\n"))
-          (= :chunked framing) (.append sb "Transfer-Encoding: chunked\r\n"))
-    ;; the handler's own Connection header (if any) was emitted above; only add
-    ;; ours when it did not set one
-    (when-not (some #(= "connection" (str/lower-case (if (keyword? (key %)) (name (key %)) (str (key %)))))
-                    (:headers resp))
-      (.append sb (str "Connection: " (if keep-alive? "keep-alive" "close") "\r\n")))
-    (.append sb "\r\n")
-    (.toString sb)))
-
-(defn- response->string
-  ([resp] (response->string resp false))
-  ([resp keep-alive?]
-   (let [body (body->string (:body resp))
-         ;; Content-Length is the body's octet count. ring-defaults'
-         ;; wrap-content-length already sets it (as UTF-8 bytes); honor that
-         ;; and only compute when absent, so we never stamp a second, conflicting
-         ;; Content-Length.
-         len (or (->> (:headers resp)
-                      (some (fn [[k v]]
-                              (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))]
-                                (when (= kn "content-length") v)))))
-                 (alength (.getBytes body "UTF-8")))]
-     (str (head->string resp keep-alive? len) body))))
-
-;; Connection headers are comma-separated token lists, case-insensitive
-;; (RFC 7230 §6.1): "Keep-Alive, Close" means close.
-(defn- header-tokens [v]
-  (map str/trim (str/split (or v "") #",")))
-
-(defn- conn-token? [tok v]
-  (some #(= tok (str/lower-case %)) (header-tokens v)))
-
-(defn- keep-alive? [req]
-  (let [c (get-in req [:headers "connection"])]
-    (if (= "HTTP/1.0" (:protocol req))
-      (conn-token? "keep-alive" c)
-      (not (conn-token? "close" c)))))
-
-(defn- response-conn-close?
-  "True when the handler's own response headers ask to close."
-  [resp]
-  (->> (:headers resp)
-       (some (fn [[k v]]
-               (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))]
-                 (when (= kn "connection")
-                   (if (vector? v)
-                     (some #(conn-token? "close" %) v)
-                     (conn-token? "close" v))))))))
-
-(defn- send-all
-  "Write s to conn; false when the peer is gone (caller closes). wait-write!
-  parks the caller until the socket can take more bytes (fiber strategy,
-  O_NONBLOCK sockets); nil leaves -1 meaning peer-gone (blocking sockets
-  block instead of returning EAGAIN)."
-  ([conn s] (send-all conn s nil))
-  ([conn s wait-write!]
-   (let [buf (ffi/alloc (max 1 (* 4 (count s))))     ; UTF-8 worst case 4 bytes/char
-         n (ffi/write-bytes buf s)
-         ok (loop [off 0]
-              (if (< off n)
-                (let [sent (c-send conn (+ buf off) (- n off) 0)]
-                  (cond
-                    (pos? sent) (recur (+ off sent))
-                    (and (neg? sent) (poller/eintr?)) (recur off)
-                    (and (neg? sent) wait-write! (poller/eagain?))
-                    (do (wait-write!) (recur off))
-                    :else false))
-                true))]
-     (ffi/free buf)
-     ok)))
-
-(defn- stream-body
-  "Pump a channel body onto conn: chunked framing for HTTP/1.1, raw bytes for
-  HTTP/1.0 (close-delimited; caller closes). take! abstracts the channel take
-  (blocking on worker threads, parking inside fibers); send! likewise (plain
-  send-all on blocking sockets, parking on writability inside fibers). True
-  when the stream finished cleanly (terminator sent); false when the client
-  went away — the channel is then closed so a parked producer's put returns
-  false instead of hanging."
-  [conn ch http10? take! send!]
-  (loop []
-    (let [v (take! ch)]
-      (cond
-        ;; closed: end of stream. (empty string chunks carry no data and would
-        ;; frame as a bogus terminator, so skip them)
-        (or (nil? v) (= "" v))
-        (if http10? true (send! conn "0\r\n\r\n"))
-
-        (send! conn (if http10?
-                      v
-                      (str (format "%x" (alength (.getBytes ^String v "UTF-8")))
-                           "\r\n" v "\r\n")))
-        (recur)
-
-        :else (do (async/close! ch) false)))))
-
-(defn- send-response
-  "Send resp for req on conn. Returns true when the connection may be reused."
-  [conn req resp take! send!]
-  (let [keep?     (and (keep-alive? req) (not (response-conn-close? resp)))
-        status    (or (:status resp) 200)
-        bodyless? (or (contains? #{100 101 204 304} status)
-                      (= :head (:request-method req)))
-        b         (:body resp)
-        ch        (when (async/chan? b) b)
-        http10?   (= "HTTP/1.0" (:protocol req))]
-    (cond
-      ;; channel body that must not be written at all
-      (and ch bodyless?)
-      (do (async/close! ch)
-          (and (send! conn (head->string resp keep? :none)) keep?))
-
-      ;; channel body: stream it
-      ch
-      (if http10?
-        ;; unknown length on 1.0 -> close-delimited, connection ends after
-        (do (send! conn (head->string resp false :none))
-            (stream-body conn ch true take! send!)
-            false)
-        (and (send! conn (head->string resp keep? :chunked))
-             (stream-body conn ch false take! send!)
-             keep?))
-
-      bodyless?
-      (and (send! conn (head->string resp keep? :none)) keep?)
-
-      :else
-      (and (send! conn (response->string resp keep?)) keep?))))
-
 ;; --- the accept loop --------------------------------------------------------
 ;; Clean shutdown: stop-server shutdown()s the listen fd (SHUT_RDWR), which
 ;; wakes the acceptor parked in accept() on both Linux and macOS (close()
@@ -431,7 +34,7 @@
 ;; false and exits instead of spinning on the dead fd.
 (defn- serve-loop [listen-fd running? serve!]
   (loop []
-    (let [conn (c-accept listen-fd ffi/null ffi/null)]
+    (let [conn (socket/c-accept listen-fd ffi/null ffi/null)]
       (cond
         (not @running?) nil
         (neg? conn) (when @running? (recur))
@@ -457,7 +60,7 @@
 ;; fn (the sync Ring handler or the ws session) directly on the calling
 ;; thread or on a parking-spawned thread.
 (def ^:private threads-io
-  {:recv! (fn [conn buf] (c-recv conn buf bufsize 0))
+  {:recv! (fn [conn buf] (socket/c-recv conn buf socket/bufsize 0))
    :take! (fn [ch] (async/<!! ch))
    :run!  (fn [f] (f))})
 
@@ -473,7 +76,7 @@
   stop/restart stress.)"
   [conn buf]
   (loop []
-    (let [n (c-recv conn buf bufsize 0)]
+    (let [n (socket/c-recv conn buf socket/bufsize 0)]
       (cond
         (and (neg? n) (poller/eintr?)) (recur)
         (and (neg? n) (poller/eagain?)) (do (poller/wait-ready conn :read) (recur))
@@ -487,7 +90,7 @@
   parks. Idle deadlines live in the sweeper, not here."
   [conn]
   {:recv! (fn [_ buf] (fiber-recv! conn buf))
-   :send! (fn [c s] (send-all c s #(poller/wait-ready c :write)))
+   :send! (fn [c s] (http/send-all c s #(poller/wait-ready c :write)))
    :take! (fn [ch] (async/<! ch))
    :run!  (fn [f] (async/<! (async/thread (f))))})
 
@@ -495,7 +98,7 @@
   "Every abnormal handler completion lands here (Igropyr's on-failure
    semantics). The hook gets one attempt: a throw or a non-map/nil return
    falls back to the plain 500, and the worker always survives. The returned
-   map goes through send-response like any handler response, so keep-alive
+   map goes through http/send-response like any handler response, so keep-alive
    is preserved across a failure."
   [on-failure request t]
   (or (when on-failure
@@ -522,34 +125,34 @@
                :body "Forbidden"}))))
 
 (defn- connection-loop [conn handler port ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io deadline]
-  (set-rcvtimeo! conn ka-ms)
-  (set-sndtimeo! conn write-timeout-ms)
+  (socket/set-rcvtimeo! conn ka-ms)
+  (socket/set-sndtimeo! conn write-timeout-ms)
   (let [recv!      (:recv! io)
         idle-recv! (or (:idle-recv! io) recv!)
-        send!      (or (:send! io) send-all)]
+        send!      (or (:send! io) http/send-all)]
     (loop [acc ""]
       ;; deadline: this request (idle wait or mid-request trickle) must finish
       ;; within ka-ms of starting — the fibers-strategy sweeper closes the conn
       ;; past it (a parked read wakes as :closed). nil on the threads strategy,
       ;; where SO_RCVTIMEO already bounds every recv.
       (when deadline (reset! deadline (+ (System/currentTimeMillis) ka-ms)))
-      (let [r (read-request conn acc max-bytes recv! idle-recv!)]
+      (let [r (http/read-request conn acc max-bytes recv! idle-recv!)]
         (cond
-          (= :bad r) (send! conn (response->string
+          (= :bad r) (send! conn (http/response->string
                                    {:status 400 :headers {"Content-Type" "text/plain"}
                                     :body "Bad Request"} false))
-          (= :too-big r) (send! conn (response->string
+          (= :too-big r) (send! conn (http/response->string
                                        {:status 413 :headers {"Content-Type" "text/plain"
                                                               "Connection" "close"}
                                         :body "Payload Too Large"} false))
-          (= :headers-too-big r) (send! conn (response->string
+          (= :headers-too-big r) (send! conn (http/response->string
                                                {:status 431 :headers {"Content-Type" "text/plain"
                                                                       "Connection" "close"}
                                                 :body "Request Header Fields Too Large"} false))
           (map? r)
-          (let [{:keys [request error]} (request->ring (:text r) port)]
+          (let [{:keys [request error]} (http/request->ring (:text r) port)]
             (cond
-              error (send! conn (response->string error false))
+              error (send! conn (http/response->string error false))
                (and ws-handler (upgrade-request? request))
                ;; websocket takeover: 101, then the session owns the fd until it
                ;; returns; the connection is not reused afterwards. The session
@@ -561,7 +164,7 @@
                    ;; refused before any handshake bytes: the guard's response
                    ;; goes through the normal send path, so the connection
                    ;; stays keep-alive-usable and no session ever runs
-                   (when (send-response conn request decision (:take! io) send!)
+                   (when (http/send-response conn request decision (:take! io) send!)
                      (recur (:leftover r)))
                    (when (send! conn (str "HTTP/1.1 101 Switching Protocols\r\n"
                                           "Upgrade: websocket\r\n"
@@ -569,7 +172,7 @@
                                           "Sec-WebSocket-Accept: "
                                           (ws/accept-token (get-in request [:headers "sec-websocket-key"]))
                                           "\r\n\r\n"))
-                     (blocking! conn)
+                     (socket/blocking! conn)
                      ;; the session owns the fd now; its own SO_RCVTIMEO bounds an
                      ;; idle peer, so the sweeper must not reap it mid-session
                      (when deadline (reset! deadline Long/MAX_VALUE))
@@ -595,11 +198,11 @@
                     ;; starve. Only when no pipelined request is already
                     ;; buffered — serving that costs no park.
                     resp (if (and (io :under-pressure?) ((io :under-pressure?))
-                                  (keep-alive? request)
+                                  (http/keep-alive? request)
                                   (str/blank? (:leftover r)))
                            (update resp :headers #(assoc (or % {}) "Connection" "close"))
                            resp)]
-                (when (send-response conn request resp (:take! io) send!)
+                (when (http/send-response conn request resp (:take! io) send!)
                   (recur (:leftover r))))))
           :else nil)))))
 
@@ -617,8 +220,8 @@
         (catch Throwable _)
         ;; shutdown before close: on Linux close() alone does not deliver
         ;; FIN to the peer holding a blocked recv (same family as 791d5c4)
-        (finally (c-shutdown conn 2)
-                 (c-close conn)))
+        (finally (socket/c-shutdown conn 2)
+                 (socket/c-close conn)))
       (recur))))
 
 (defn- conn-close!
@@ -633,8 +236,8 @@
   re-park on a dead registration and hang."
   [conns entry]
   (when (compare-and-set! (:closed? entry) false true)
-    (c-shutdown (:conn entry) 2)
-    (c-close (:conn entry))
+    (socket/c-shutdown (:conn entry) 2)
+    (socket/c-close (:conn entry))
     (poller/forget! (:conn entry)))
   (swap! conns disj entry))
 
@@ -737,7 +340,7 @@
           on-failure (get opts :on-failure)
           max-bytes (or (:max-bytes v) 1048576)
           write-timeout-ms (or (:write-timeout-ms v) 30000)
-          fd     (listen-socket port)
+          fd     (socket/listen-socket port)
           running? (atom true)]
       (if (= :fibers strategy)
         (let [conns (atom #{})   ; live conn entries; sweeper + stop sweep them
@@ -762,15 +365,15 @@
                          :idle-recv! (fn [conn buf]
                                        (let [pfds (ffi/alloc 8)]
                                          (ffi/write pfds :int 0 conn)
-                                         (ffi/write pfds :uint8 4 POLLIN)
+                                         (ffi/write pfds :uint8 4 socket/POLLIN)
                                          (try
                                            (let [deadline (+ (System/currentTimeMillis) ka-ms)
                                                  grace    (+ (System/currentTimeMillis) 2000)]
                                              (loop []
-                                               (let [rc  (c-poll pfds 1 250)
+                                               (let [rc  (socket/c-poll pfds 1 250)
                                                      now (System/currentTimeMillis)]
                                                  (cond
-                                                   (pos? rc) (c-recv conn buf bufsize 0)
+                                                   (pos? rc) (socket/c-recv conn buf socket/bufsize 0)
                                                    (neg? rc) 0
                                                    (>= now deadline) 0
                                                    (and (>= now grace) (pos? @pending)) 0
@@ -797,6 +400,6 @@
   (if-let [conns (:conns server)]
     (doseq [entry @conns] (conn-close! conns entry))
     (async/close! (:work server)))
-  (c-shutdown (:socket server) 2)        ; SHUT_RDWR: wake parked accept()
-  (c-close (:socket server))
+  (socket/c-shutdown (:socket server) 2)        ; SHUT_RDWR: wake parked accept()
+  (socket/c-close (:socket server))
   nil)
