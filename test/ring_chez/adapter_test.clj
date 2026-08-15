@@ -771,6 +771,29 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+(defn test-fiber-stop-wakes-parked-conns []
+  ;; stop-server while fiber go blocks are parked on idle keep-alive conns:
+  ;; it must not wait out the 60s keep-alive timeout — parked conns are woken
+  ;; (or their fds torn down) so stop returns promptly and the port rebinds.
+  (let [server (adapter/run-server handler {:port 8429 :strategy :fibers
+                                            :keep-alive-timeout-ms 60000})
+        t0 (System/currentTimeMillis)]
+    (Thread/sleep 250)
+    (let [fds (mapv (fn [_] (client-connect 8429 5000)) (range 5))]
+      (doseq [fd fds]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "fiber stop: conn served" "200" (client-recv fd)))
+      (adapter/stop-server server)
+      (check "fiber stop: stop returns promptly with parked conns"
+             true (< (- (System/currentTimeMillis) t0) 5000))
+      (doseq [fd fds] (client-close fd))
+      (let [s2 (adapter/run-server handler {:port 8429 :strategy :fibers})]
+        (Thread/sleep 100)
+        (try
+          (let [r (http/get "http://127.0.0.1:8429/")]
+            (check "fiber stop: port rebindable after stop" 200 (:status r)))
+          (finally (adapter/stop-server s2)))))))
+
 (defn test-bad-strategy-throws []
   (try
     (let [server (adapter/run-server handler {:port 8425 :strategy :magic})]
@@ -842,6 +865,7 @@
   (test-fiber-keep-alive-and-pipelining)
   (test-fiber-streaming)
   (test-fiber-idle-timeout)
+  (test-fiber-stop-wakes-parked-conns)
   (test-bad-strategy-throws)
 
   (if (zero? @failures)
