@@ -1,16 +1,3 @@
-# ring adapter for jolt
-
-A Ring HTTP/1.1 server for [jolt](https://github.com/jolt-lang/jolt) (Clojure on
-Chez Scheme). It binds BSD sockets directly through `jolt.ffi` — no jolt
-built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
-
-```clojure
-(require '[ring-chez.adapter :as adapter])
-(def server (adapter/run-server (fn [req] {:status 200 :body "hi"}) {:port 3000}))
-;; ... later ...
-(adapter/stop-server server)
-```
-
 ## Install
 
 Add the git dependency to `deps.edn`:
@@ -25,6 +12,19 @@ Add the git dependency to `deps.edn`:
 
 Requires the `jolt` binary (Clojure on Chez Scheme, no JVM); the adapter
 binds BSD sockets through `jolt.ffi`, so there is nothing else to install.
+
+# ring adapter for jolt
+
+A Ring HTTP/1.1 server for [jolt](https://github.com/jolt-lang/jolt) (Clojure on
+Chez Scheme). It binds BSD sockets directly through `jolt.ffi` — no jolt
+built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
+
+```clojure
+(require '[ring-chez.adapter :as adapter])
+(def server (adapter/run-server (fn [req] {:status 200 :body "hi"}) {:port 3000}))
+;; ... later ...
+(adapter/stop-server server)
+```
 
 ## Options
 
