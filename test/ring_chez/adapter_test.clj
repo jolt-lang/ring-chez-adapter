@@ -860,6 +860,46 @@
               (client-close fd)))))
       (finally (adapter/stop-server server)))))
 
+(defn test-string-content-length-keep-alive []
+  ;; ring middleware (ring-defaults) sets Content-Length as a *string*. The
+  ;; codec honored only numeric values, suppressed the handler's own header,
+  ;; and then emitted no framing at all — an HTTP/1.1 persistent response
+  ;; with no body terminator, so keep-alive clients hang until timeout.
+  (let [server (adapter/run-server (fn [_] {:status 200
+                                             :headers {"Content-Type" "text/plain"
+                                                       "Content-Length" "5"}
+                                             :body "hello"})
+                                    {:port 8445 :worker-threads 1})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8445 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "string CL: response framed with Content-Length"
+                   "Content-Length: 5" (client-recv fd))
+        ;; legal framing means the connection is reusable
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "string CL: connection reusable" "hello" (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+;; --- RFC-0006: friendly port-in-use error ---------------------------------------
+
+(defn test-bind-eaddrinuse-friendly []
+  (let [server (adapter/run-server handler {:port 8444 :worker-threads 1})]
+    (try
+      (Thread/sleep 250)
+      (try
+        (adapter/run-server handler {:port 8444 :worker-threads 1})
+        (check "eaddrinuse: second bind throws" :threw :did-not-throw)
+        (catch Throwable t
+          (let [d (ex-data t)]
+            (check "eaddrinuse: ex-data has :errno-name" "EADDRINUSE" (:errno-name d))
+            (check-has "eaddrinuse: message names the port" "8444" (ex-message t))
+            (check-has "eaddrinuse: message says already in use"
+                       "already in use" (ex-message t))
+            (check-has "eaddrinuse: message suggests :port" ":port" (ex-message t)))))
+      (finally (adapter/stop-server server)))))
+
 ;; --- RFC-0002: boot-time option validation -------------------------------------
 
 (defn test-boot-validation []
@@ -1216,6 +1256,8 @@
   (test-fiber-restart-leaves-poller-clean)
   (test-bad-strategy-throws)
   (test-bind-failure-carries-errno)
+  (test-string-content-length-keep-alive)
+  (test-bind-eaddrinuse-friendly)
   (test-boot-validation)
   (test-on-failure-hook)
   (test-on-failure-hook-throw-falls-back)

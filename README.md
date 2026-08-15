@@ -58,7 +58,10 @@ All options are validated at boot: bad values (`:port 0`, non-fn
 `:on-failure`, negative `:write-timeout-ms`, …) throw before the listen
 socket binds, with `{:key :given :expected}` in `ex-data`. Unknown keys
 pass through for forward compatibility. Socket/bind failures carry
-`:syscall`, `:errno`, and `strerror` text.
+`:syscall`, `:errno`, and `strerror` text; a port that is already taken
+fails with a plain-English message (`port 8080 is already in use — …
+stop it or pass a different :port`) and `:errno-name "EADDRINUSE"` in
+`ex-data`.
 
 Keep-alive is HTTP/1.1 default, HTTP/1.0 opt-in via `Connection: keep-alive`;
 pipelined requests are handled via leftover carry. `204`/`304`/`HEAD` responses

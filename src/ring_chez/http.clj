@@ -165,15 +165,18 @@
   ([resp] (response->string resp false))
   ([resp keep-alive?]
    (let [body (body->string (:body resp))
-         ;; Content-Length is the body's octet count. ring-defaults'
-         ;; wrap-content-length already sets it (as UTF-8 bytes); honor that
-         ;; and only compute when absent, so we never stamp a second, conflicting
-         ;; Content-Length.
-         len (or (->> (:headers resp)
-                      (some (fn [[k v]]
-                              (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))]
-                                (when (= kn "content-length") v)))))
-                 (alength (.getBytes body "UTF-8")))]
+          ;; Content-Length is the body's octet count. ring-defaults'
+          ;; wrap-content-length already sets it (as UTF-8 bytes); honor that
+          ;; and only compute when absent, so we never stamp a second, conflicting
+          ;; Content-Length. Middleware commonly sets it as a *string* —
+          ;; normalize to a number, or head->string emits no framing at all
+          ;; and keep-alive clients hang waiting for a body terminator.
+          len (or (->> (:headers resp)
+                       (some (fn [[k v]]
+                               (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))]
+                                 (when (= kn "content-length")
+                                   (if (string? v) (parse-long v) v))))))
+                  (alength (.getBytes body "UTF-8")))]
      (str (head->string resp keep-alive? len) body))))
 
 ;; Connection headers are comma-separated token lists, case-insensitive
