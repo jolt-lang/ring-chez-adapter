@@ -10,6 +10,7 @@
   (:require [clojure.string :as str]
             [clojure.core.async :as async]
             [ring-chez.websocket :as ws]
+            [jolt.io-poller :as poller]
             [jolt.ffi :as ffi]))
 
 ;; The libc/socket symbols are declared in deps.edn (:jolt/native :process) and
@@ -26,17 +27,12 @@
 (ffi/defcfn c-accept     "accept"     [:int :pointer :pointer] :int :blocking)
 (ffi/defcfn c-recv       "recv"       [:int :pointer :size_t :int] :ssize_t :blocking)
 (ffi/defcfn c-send       "send"       [:int :pointer :size_t :int] :ssize_t :blocking)
-;; poller (fiber strategy): poll(2) over registered fds + a self-pipe so new
-;; registrations can wake a blocked poll. struct pollfd { int fd; short
-;; events; short revents; } — fd at 0, events at byte 4, revents at bytes 6-7.
+;; threads-strategy idle reads wait in poll(2) slices (see run-server's
+;; :idle-recv!). struct pollfd { int fd; short events; short revents; } — fd
+;; at 0, events at byte 4, revents at bytes 6-7.
 (ffi/defcfn c-poll       "poll"       [:pointer :int :int] :int :blocking)
-(ffi/defcfn c-pipe       "pipe"       [:pointer] :int)
-(ffi/defcfn c-read       "read"       [:int :pointer :size_t] :ssize_t :blocking)
-(ffi/defcfn c-write      "write"      [:int :pointer :size_t] :ssize_t :blocking)
 
 (def ^:private POLLIN  0x001)
-(def ^:private POLLERR 0x008)
-(def ^:private POLLHUP 0x010)
 
 (def ^:private AF-INET 2)
 (def ^:private SOCK-STREAM 1)
@@ -57,6 +53,18 @@
       (ffi/write tv :uint64 8 (rem ms 1000)))
     (c-setsockopt fd sol-socket so-rcvtimeo tv 16)
     (ffi/free tv)))
+
+(def ^:private f-getfl 3)
+(def ^:private f-setfl 4)
+(def ^:private o-nonblock (if macos? 0x4 0x800))
+
+(defn- blocking!
+  "Clear O_NONBLOCK (websocket takeover: the session runs on a plain thread
+  via :run! and relies on blocking recv bounded by SO_RCVTIMEO). No-op for a
+  socket that never went nonblocking."
+  [fd]
+  (let [flags (poller/c-fcntl fd f-getfl 0)]
+    (poller/c-fcntl fd f-setfl (bit-and-not flags o-nonblock))))
 
 ;; sockaddr_in for 127.0.0.1:port. macOS: byte0 = sin_len (16), byte1 = family;
 ;; Linux: bytes0-1 = family (little-endian, so byte0 = AF_INET).
@@ -86,84 +94,17 @@
     (when (neg? (c-listen fd 64)) (c-close fd) (throw (ex-info "listen() failed" {})))
     fd))
 
-;; --- io poller (fiber strategy) ----------------------------------------------
-;; One thread blocked in poll(2) over every registered connection fd. Fibers
-;; (core.async go blocks) park on a per-registration channel until the poller
-;; reports their fd readable, so an idle keep-alive connection pins no thread.
-
-(defn- start-poller!
-  "Start the poller thread. Returns {:regs :running :wake :pr :pw}. Registrations
-  are one-shot: wait-readable parks the caller until fd is readable (or the
-  poller stops), then the registration is consumed."
-  []
-  (let [pfds (ffi/alloc 8)]
-    (when (neg? (c-pipe pfds))
-      (ffi/free pfds)
-      (throw (ex-info "pipe() failed" {})))
-    (let [pr  (ffi/read pfds :int 0)
-          pw  (ffi/read pfds :int 4)
-          regs     (atom {})           ; {fd {:ch delivery-chan :events POLLIN}}
-          running? (atom true)
-          wake-buf (ffi/alloc 4096)
-          wake     (fn [] (c-write pw wake-buf 1))]
-      (ffi/free pfds)
-      (future
-        (loop []
-          (if-not @running?
-            ;; shutdown: release every parked waiter (chan closes -> nil) and
-            ;; close the pipe so a late wake write just fails harmlessly
-            (do (doseq [[_ {:keys [ch]}] @regs] (async/close! ch))
-                (c-close pr) (c-close pw))
-            (let [m    @regs
-                  fds  (keys m)
-                  n    (count fds)
-                  pf   (ffi/alloc (* 8 (inc n)))]
-              ;; slot 0: the pipe read end (wakeup), then one slot per fd
-              (ffi/write pf :int 0 pr)
-              (ffi/write pf :uint8 4 POLLIN)
-              (doseq [[i fd] (map-indexed vector fds)]
-                (ffi/write pf :int (* 8 (inc i)) fd)
-                (ffi/write pf :uint8 (+ 4 (* 8 (inc i))) POLLIN))
-              (let [ret (c-poll pf (inc n) -1)
-                    ;; drain the wake pipe only if it fired (at least one byte
-                    ;; is buffered; a single read never blocks and stale bytes
-                    ;; re-fire slot 0 on the next poll)
-                    _    (when (pos? (ffi/read pf :uint8 6))
-                           (c-read pr wake-buf 4096))]
-                (when (pos? ret)
-                  (doseq [[i [fd {:keys [ch]}]] (map-indexed vector (seq m))]
-                    (let [slot (* 8 (inc i))
-                          lo   (ffi/read pf :uint8 (+ 6 slot))
-                          hi   (ffi/read pf :uint8 (+ 7 slot))]
-                      (when (pos? (bit-or lo hi))
-                        ;; one-shot: consume, then deliver revents
-                        (swap! regs dissoc fd)
-                        (async/put! ch (+ lo (* 256 hi))))))))
-              (ffi/free pf)
-              (recur)))))
-      {:regs regs :running running? :wake wake :pr pr :pw pw})))
-
-(defn- wait-readable
-  "Register fd with the poller; returns a channel that yields the revents when
-  fd becomes readable (nil when the poller stops). Must be consumed inside a
-  go block (parking take)."
-  [poller fd]
-  (let [ch (async/chan 1)]
-    (swap! (:regs poller) assoc fd {:ch ch :events POLLIN})
-    ((:wake poller))
-    ;; the poller may have stopped between the swap and the wake
-    (when-not @(:running poller)
-      (when-not (contains? (deref (:regs poller)) fd)
-        (async/close! ch)))
-    ch))
-
-(defn- stop-poller!
-  "Flag the poller down and wake it; it releases parked waiters and closes its
-  pipe fds on the way out."
-  [poller]
-  (reset! (:running poller) false)
-  ((:wake poller))
-  nil)
+;; --- fiber strategy io: jolt.io-poller ---------------------------------------
+;; Accepted fds are set O_NONBLOCK (poller/nonblock!); reads and writes are
+;; raw nonblocking syscalls that park the connection's fiber on
+;; jolt.io-poller — kqueue/epoll with persistent, kernel-held registrations
+;; (the old hand-rolled loop rebuilt its pollfd set from scratch on every
+;; wake). The poller is process-global and never stops, so every close path
+;; must forget! the fd: that keeps the poller table bounded, drops stale
+;; readiness tombstones before the kernel reuses the fd number, and wakes a
+;; fiber still parked on the fd (close first, then forget! — a forget-first
+;; waker retries recv on the still-open fd, sees EAGAIN, re-parks on a dead
+;; registration and hangs).
 
 ;; --- request reading --------------------------------------------------------
 (def ^:private bufsize 65536)
@@ -175,7 +116,7 @@
       0
       (let [s (+ i (count "content-length:"))
             e (loop [j s] (if (or (>= j (count hdrs))
-                                  (= \return (nth hdrs j)) (= \newline (nth hdrs j))) j (recur (inc j))))]
+                                   (= \return (nth hdrs j)) (= \newline (nth hdrs j))) j (recur (inc j))))]
         (or (parse-long (str/trim (subs hdrs s e))) 0)))))
 
 ;; read one complete request from conn; acc carries unconsumed bytes from a
@@ -361,46 +302,55 @@
                      (conn-token? "close" v))))))))
 
 (defn- send-all
-  "Write s to conn; false when the peer is gone (caller closes)."
-  [conn s]
-  (let [buf (ffi/alloc (max 1 (* 4 (count s))))     ; UTF-8 worst case 4 bytes/char
-        n (ffi/write-bytes buf s)
-        ok (loop [off 0]
-             (if (< off n)
-               (let [sent (c-send conn (+ buf off) (- n off) 0)]
-                 (and (pos? sent) (recur (+ off sent))))
-               true))]
-    (ffi/free buf)
-    ok))
-
+  "Write s to conn; false when the peer is gone (caller closes). wait-write!
+  parks the caller until the socket can take more bytes (fiber strategy,
+  O_NONBLOCK sockets); nil leaves -1 meaning peer-gone (blocking sockets
+  block instead of returning EAGAIN)."
+  ([conn s] (send-all conn s nil))
+  ([conn s wait-write!]
+   (let [buf (ffi/alloc (max 1 (* 4 (count s))))     ; UTF-8 worst case 4 bytes/char
+         n (ffi/write-bytes buf s)
+         ok (loop [off 0]
+              (if (< off n)
+                (let [sent (c-send conn (+ buf off) (- n off) 0)]
+                  (cond
+                    (pos? sent) (recur (+ off sent))
+                    (and (neg? sent) (poller/eintr?)) (recur off)
+                    (and (neg? sent) wait-write! (poller/eagain?))
+                    (do (wait-write!) (recur off))
+                    :else false))
+                true))]
+     (ffi/free buf)
+     ok)))
 
 (defn- stream-body
   "Pump a channel body onto conn: chunked framing for HTTP/1.1, raw bytes for
   HTTP/1.0 (close-delimited; caller closes). take! abstracts the channel take
-  (blocking on worker threads, parking inside fibers). True when the stream
-  finished cleanly (terminator sent); false when the client went away — the
-  channel is then closed so a parked producer's put returns false instead of
-  hanging."
-  [conn ch http10? take!]
+  (blocking on worker threads, parking inside fibers); send! likewise (plain
+  send-all on blocking sockets, parking on writability inside fibers). True
+  when the stream finished cleanly (terminator sent); false when the client
+  went away — the channel is then closed so a parked producer's put returns
+  false instead of hanging."
+  [conn ch http10? take! send!]
   (loop []
     (let [v (take! ch)]
       (cond
         ;; closed: end of stream. (empty string chunks carry no data and would
         ;; frame as a bogus terminator, so skip them)
         (or (nil? v) (= "" v))
-        (if http10? true (send-all conn "0\r\n\r\n"))
+        (if http10? true (send! conn "0\r\n\r\n"))
 
-        (send-all conn (if http10?
-                         v
-                         (str (format "%x" (alength (.getBytes ^String v "UTF-8")))
-                              "\r\n" v "\r\n")))
+        (send! conn (if http10?
+                      v
+                      (str (format "%x" (alength (.getBytes ^String v "UTF-8")))
+                           "\r\n" v "\r\n")))
         (recur)
 
         :else (do (async/close! ch) false)))))
 
 (defn- send-response
   "Send resp for req on conn. Returns true when the connection may be reused."
-  [conn req resp take!]
+  [conn req resp take! send!]
   (let [keep?     (and (keep-alive? req) (not (response-conn-close? resp)))
         status    (or (:status resp) 200)
         bodyless? (or (contains? #{100 101 204 304} status)
@@ -412,24 +362,24 @@
       ;; channel body that must not be written at all
       (and ch bodyless?)
       (do (async/close! ch)
-          (and (send-all conn (head->string resp keep? :none)) keep?))
+          (and (send! conn (head->string resp keep? :none)) keep?))
 
       ;; channel body: stream it
       ch
       (if http10?
         ;; unknown length on 1.0 -> close-delimited, connection ends after
-        (do (send-all conn (head->string resp false :none))
-            (stream-body conn ch true take!)
+        (do (send! conn (head->string resp false :none))
+            (stream-body conn ch true take! send!)
             false)
-        (and (send-all conn (head->string resp keep? :chunked))
-             (stream-body conn ch false take!)
+        (and (send! conn (head->string resp keep? :chunked))
+             (stream-body conn ch false take! send!)
              keep?))
 
       bodyless?
-      (and (send-all conn (head->string resp keep? :none)) keep?)
+      (and (send! conn (head->string resp keep? :none)) keep?)
 
       :else
-      (and (send-all conn (response->string resp keep?)) keep?))))
+      (and (send! conn (response->string resp keep?)) keep?))))
 
 ;; --- the accept loop --------------------------------------------------------
 ;; Clean shutdown: stop-server shutdown()s the listen fd (SHUT_RDWR), which
@@ -459,57 +409,89 @@
 
 ;; io: the per-strategy primitives. recv! reads from the socket (blocking on
 ;; worker threads; parking on the poller inside fibers), take! takes from a
-;; channel body, run! executes a blocking fn (the sync Ring handler or the ws
-;; session) directly on the calling thread or on a parking-spawned thread.
+;; channel body, send! writes to the socket (plain send-all on blocking
+;; sockets, parking on writability inside fibers), run! executes a blocking
+;; fn (the sync Ring handler or the ws session) directly on the calling
+;; thread or on a parking-spawned thread.
 (def ^:private threads-io
   {:recv! (fn [conn buf] (c-recv conn buf bufsize 0))
    :take! (fn [ch] (async/<!! ch))
    :run!  (fn [f] (f))})
 
+(defn- fiber-recv!
+  "One recv for a fiber-held conn — the stdlib socket.io-call contract: EINTR
+  retries, EAGAIN parks the CURRENT fiber on jolt.io-poller until readable,
+  anything else is the syscall's answer. No waker go block and no per-read
+  timeout race: deadlines are enforced by the connection sweeper, whose
+  close+forget! wakes this parked fiber and its retry recv answers negative
+  (EBADF) → :closed. (An earlier waker+alts! design leaked: a waker that
+  registered after close parked forever, and its stale poller entry
+  misdirected a reused fd number's wakeups — 10% failure rate under
+  stop/restart stress.)"
+  [conn buf]
+  (loop []
+    (let [n (c-recv conn buf bufsize 0)]
+      (cond
+        (and (neg? n) (poller/eintr?)) (recur)
+        (and (neg? n) (poller/eagain?)) (do (poller/wait-ready conn :read) (recur))
+        :else n))))
+
 (defn- fiber-io
   "Fiber-strategy io for one connection. Must only be used inside the owning
-  go block: recv! races poller readiness against the idle timeout (so an idle
-  keep-alive connection parks without pinning a thread), and run! moves
-  blocking work — the synchronous handler, the websocket session — onto a
-  thread while the fiber parks."
-  [poller conn ka-ms]
-  {:recv! (fn [_ buf]
-            (let [[v _] (async/alts! [(wait-readable poller conn) (async/timeout ka-ms)])]
-              (if (nil? v) -1 (c-recv conn buf bufsize 0))))
+  fiber-backed go block (see fiber-serve): recv! parks the fiber on read
+  readiness, send! parks on writability, and run! moves blocking work — the
+  synchronous handler, the websocket session — onto a thread while the fiber
+  parks. Idle deadlines live in the sweeper, not here."
+  [conn]
+  {:recv! (fn [_ buf] (fiber-recv! conn buf))
+   :send! (fn [c s] (send-all c s #(poller/wait-ready c :write)))
    :take! (fn [ch] (async/<! ch))
    :run!  (fn [f] (async/<! (async/thread (f))))})
 
-(defn- connection-loop [conn handler port ka-ms ws-handler max-bytes io]
+(defn- connection-loop [conn handler port ka-ms ws-handler max-bytes io deadline]
   (set-rcvtimeo! conn ka-ms)
   (let [recv!      (:recv! io)
-        idle-recv! (or (:idle-recv! io) recv!)]
+        idle-recv! (or (:idle-recv! io) recv!)
+        send!      (or (:send! io) send-all)]
     (loop [acc ""]
+      ;; deadline: this request (idle wait or mid-request trickle) must finish
+      ;; within ka-ms of starting — the fibers-strategy sweeper closes the conn
+      ;; past it (a parked read wakes as :closed). nil on the threads strategy,
+      ;; where SO_RCVTIMEO already bounds every recv.
+      (when deadline (reset! deadline (+ (System/currentTimeMillis) ka-ms)))
       (let [r (read-request conn acc max-bytes recv! idle-recv!)]
         (cond
-          (= :bad r) (send-all conn (response->string
-                                      {:status 400 :headers {"Content-Type" "text/plain"}
-                                       :body "Bad Request"} false))
-          (= :too-big r) (send-all conn (response->string
-                                         {:status 413 :headers {"Content-Type" "text/plain"
-                                                                "Connection" "close"}
-                                          :body "Payload Too Large"} false))
-          (= :headers-too-big r) (send-all conn (response->string
-                                                 {:status 431 :headers {"Content-Type" "text/plain"
-                                                                        "Connection" "close"}
-                                                  :body "Request Header Fields Too Large"} false))
+          (= :bad r) (send! conn (response->string
+                                   {:status 400 :headers {"Content-Type" "text/plain"}
+                                    :body "Bad Request"} false))
+          (= :too-big r) (send! conn (response->string
+                                       {:status 413 :headers {"Content-Type" "text/plain"
+                                                              "Connection" "close"}
+                                        :body "Payload Too Large"} false))
+          (= :headers-too-big r) (send! conn (response->string
+                                               {:status 431 :headers {"Content-Type" "text/plain"
+                                                                      "Connection" "close"}
+                                                :body "Request Header Fields Too Large"} false))
           (map? r)
           (let [{:keys [request error]} (request->ring (:text r) port)]
             (cond
-              error (send-all conn (response->string error false))
+              error (send! conn (response->string error false))
               (and ws-handler (upgrade-request? request))
               ;; websocket takeover: 101, then the session owns the fd until it
-              ;; returns; the connection is not reused afterwards
-              (when (send-all conn (str "HTTP/1.1 101 Switching Protocols\r\n"
-                                        "Upgrade: websocket\r\n"
-                                        "Connection: Upgrade\r\n"
-                                        "Sec-WebSocket-Accept: "
-                                        (ws/accept-token (get-in request [:headers "sec-websocket-key"]))
-                                        "\r\n\r\n"))
+              ;; returns; the connection is not reused afterwards. The session
+              ;; runs on a plain thread (see :run!) whose recv blocks bounded
+              ;; by SO_RCVTIMEO — restore the blocking mode the fiber strategy
+              ;; set aside at accept.
+              (when (send! conn (str "HTTP/1.1 101 Switching Protocols\r\n"
+                                     "Upgrade: websocket\r\n"
+                                     "Connection: Upgrade\r\n"
+                                     "Sec-WebSocket-Accept: "
+                                     (ws/accept-token (get-in request [:headers "sec-websocket-key"]))
+                                     "\r\n\r\n"))
+                (blocking! conn)
+                ;; the session owns the fd now; its own SO_RCVTIMEO bounds an
+                ;; idle peer, so the sweeper must not reap it mid-session
+                (when deadline (reset! deadline Long/MAX_VALUE))
                 ((:run! io) #(try (ws-handler (ws/make-session conn))
                                   (catch Throwable _ nil))))
               :else
@@ -527,7 +509,7 @@
                                   (str/blank? (:leftover r)))
                            (update resp :headers #(assoc (or % {}) "Connection" "close"))
                            resp)]
-                (when (send-response conn request resp (:take! io))
+                (when (send-response conn request resp (:take! io) send!)
                   (recur (:leftover r))))))
           :else nil)))))
 
@@ -539,7 +521,7 @@
       ;; where a claimed conn still reads as pressure and over-retires
       ((io :claim!))
       (try
-        (connection-loop conn handler port ka-ms ws-handler max-bytes io)
+        (connection-loop conn handler port ka-ms ws-handler max-bytes io nil)
         ;; an escaping throwable must not kill the worker: a dead worker
         ;; shrinks the pool permanently and starves later connections
         (catch Throwable _)
@@ -549,23 +531,58 @@
                  (c-close conn)))
       (recur))))
 
+(defn- conn-close!
+  "Idempotent teardown for one fiber-held conn, shared by the serving fiber's
+  finally and stop-server's sweep: shutdown -> close -> forget!, exactly once
+  (a second close() on an fd number the kernel already handed to another
+  socket would close the wrong one), then deregister from the live set.
+
+  shutdown -> close: on Linux close() alone does not deliver FIN to the peer's
+  blocked recv. forget! after close: it wakes any fiber still parked on the
+  fd, and the woken read must see EBADF — forget-first lets it see EAGAIN,
+  re-park on a dead registration and hang."
+  [conns entry]
+  (when (compare-and-set! (:closed? entry) false true)
+    (c-shutdown (:conn entry) 2)
+    (c-close (:conn entry))
+    (poller/forget! (:conn entry)))
+  (swap! conns disj entry))
+
+(defn- start-sweeper!
+  "Fibers-strategy deadline enforcement (the counterpart of SO_RCVTIMEO on
+  the threads strategy): every 100ms, close conns whose deadline passed.
+  conn-close! wakes the fiber parked on the fd (forget! resumes registered
+  waiters), so a parked read ends as :closed, not a hang."
+  [conns]
+  (let [stop? (atom false)]
+    (future
+      (loop []
+        (Thread/sleep 100)
+        (when-not @stop?
+          (let [now (System/currentTimeMillis)]
+            (doseq [e @conns]
+              (when (and (not @(e :closed?)) (< @(e :deadline) now))
+                (conn-close! conns e))))
+          (recur))))
+    stop?))
+
 (defn- fiber-serve
-  "Serve one connection on a go block parked on the io poller. The accept loop
-  spawns one per accepted connection — there is no fixed bound, but idle
-  connections hold no threads."
-  [poller handler port ka-ms ws-handler max-bytes conn]
-  (async/go
-    (try
-      (connection-loop conn handler port ka-ms ws-handler max-bytes
-                       (fiber-io poller conn ka-ms))
-      (catch Throwable _ nil)
-      ;; shutdown before close: on Linux close() alone does not deliver FIN
-      ;; to the peer (some reference inside the jolt ffi layer holds the OS
-      ;; socket open, plausibly the poller registration on this fd); the
-      ;; peer's blocked recv never sees EOF. shutdown() forces FIN at the
-      ;; socket level regardless. macOS delivers FIN on close() either way.
-      (finally (c-shutdown conn 2)
-               (c-close conn)))))
+  "Serve one connection on a fiber-backed go block parked on jolt.io-poller.
+  The accept loop spawns one per accepted connection — there is no fixed
+  bound, and idle connections hold no thread. The spawn runs under
+  *go-backend* :fiber: the default :thread backend runs go bodies on OS
+  threads, where wait-ready would block the carrier instead of parking."
+  [handler port ka-ms ws-handler max-bytes conn conns]
+  (let [deadline (atom (+ (System/currentTimeMillis) ka-ms))
+        entry {:conn conn :closed? (atom false) :deadline deadline}]
+    (swap! conns conj entry)
+    (binding [async/*go-backend* :fiber]
+      (async/go
+        (try
+          (connection-loop conn handler port ka-ms ws-handler max-bytes
+                           (fiber-io conn) deadline)
+          (catch Throwable _ nil)
+          (finally (conn-close! conns entry)))))))
 
 (defn run-server
   "Start the server; return a handle {:socket :port :running}. opts:
@@ -574,11 +591,12 @@
                            per busy connection, :worker-threads of them
                            (default = available processors); slow or idle
                            keep-alive connections occupy a worker each.
-                           :fibers — one core.async go block per connection
-                           parked on a shared poll(2) io poller; idle
-                           keep-alive connections pin no thread. Blocking
-                           handlers and websocket sessions still run on
-                           threads, but only while actually working.
+                           :fibers — one fiber-backed go block per connection
+                           parked on jolt.io-poller (kqueue/epoll, persistent
+                           registrations); idle keep-alive connections pin no
+                           thread. Blocking handlers and websocket sessions
+                           still run on threads, but only while actually
+                           working.
     :worker-threads        worker pool size (threads strategy)
                             (default = available processors); slow or idle
                             keep-alive connections occupy a worker each,
@@ -602,9 +620,13 @@
           fd     (listen-socket port)
           running? (atom true)]
       (if (= :fibers strategy)
-        (let [poller (start-poller!)]
-          (future (serve-loop fd running? (partial fiber-serve poller handler port ka-ms ws-handler max-bytes)))
-          {:socket fd :port port :running running? :poller poller})
+        (let [conns (atom #{})   ; live conn entries; sweeper + stop sweep them
+              sweep (start-sweeper! conns)]
+          (future (serve-loop fd running?
+                              (fn [conn]
+                                (poller/nonblock! conn)
+                                (fiber-serve handler port ka-ms ws-handler max-bytes conn conns))))
+          {:socket fd :port port :running running? :conns conns :sweep sweep})
         (let [work (async/chan)   ; unbuffered: acceptor parks when all workers busy
               pending (atom 0)    ; conns accepted but not yet claimed by a worker
                io (assoc threads-io
@@ -643,14 +665,17 @@
 
 (defn stop-server
   "Stop the server: unblock + exit the accept loop and close the listen socket.
-  Fiber strategy: the poller is stopped too, releasing every parked fiber.
+  Fiber strategy: every live connection is closed and forgotten too —
+  jolt.io-poller is process-global and never stops, so a parked fiber is
+  released only by its fd going away (the woken read sees EBADF/EOF).
   shutdown(SHUT_RDWR) before close() is required on Linux: close() alone
   leaves the acceptor parked in accept() holding the port binding, so
   rebinding the same port fails with EADDRINUSE."
   [server]
   (reset! (:running server) false)
-  (if-let [poller (:poller server)]
-    (stop-poller! poller)
+  (when-let [sweep (:sweep server)] (reset! sweep true))
+  (if-let [conns (:conns server)]
+    (doseq [entry @conns] (conn-close! conns entry))
     (async/close! (:work server)))
   (c-shutdown (:socket server) 2)        ; SHUT_RDWR: wake parked accept()
   (c-close (:socket server))
