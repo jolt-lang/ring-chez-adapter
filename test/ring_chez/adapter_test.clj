@@ -5,7 +5,8 @@
             [jolt.http-client :as http]
             [clojure.string :as str]
             [clojure.core.async :as a]
-            [jolt.ffi :as ffi]))
+            [jolt.ffi :as ffi]
+            [jolt.io-poller :as poller]))
 
 ;; --- raw socket test client (keep-alive & later SSE/WS need wire control) ---
 
@@ -794,6 +795,37 @@
             (check "fiber stop: port rebindable after stop" 200 (:status r)))
           (finally (adapter/stop-server s2)))))))
 
+(defn test-fiber-restart-leaves-poller-clean []
+  ;; regression for the io-poller migration flake: an earlier per-read
+  ;; alts![(go (wait-ready)) (timeout)] race leaked a parked waker when it
+  ;; registered after close+forget — its stale poller entry then misdirected
+  ;; wakeups for a REUSED fd number, so a restarted server on the same port
+  ;; accepted but never responded (~10% of stop/restart rounds). The leak's
+  ;; direct signature is a leftover entry in the global poller table; assert
+  ;; the table is empty after every round.
+  (dotimes [i 6]
+    (let [server (adapter/run-server handler {:port 8430 :strategy :fibers
+                                               :keep-alive-timeout-ms 60000})]
+      (Thread/sleep 100)
+      (let [fds (mapv (fn [_] (client-connect 8430 5000)) (range 3))]
+        (doseq [fd fds]
+          (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+          (check-has "fiber restart: conn served" "200" (client-recv fd)))
+        (adapter/stop-server server)
+        (Thread/sleep 100)
+        (doseq [fd fds] (client-close fd))
+        (check (str "fiber restart: poller table clean after round " i)
+               {} (:fds (poller/debug-state)))
+        (let [s2 (adapter/run-server handler {:port 8430 :strategy :fibers})]
+          (Thread/sleep 100)
+          (try
+            (let [fd (client-connect 8430 5000)]
+              (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+              (check-has "fiber restart: rebind serves fresh request"
+                         "200" (client-recv fd))
+              (client-close fd))
+            (finally (adapter/stop-server s2))))))))
+
 (defn test-bad-strategy-throws []
   (try
     (let [server (adapter/run-server handler {:port 8425 :strategy :magic})]
@@ -866,6 +898,7 @@
   (test-fiber-streaming)
   (test-fiber-idle-timeout)
   (test-fiber-stop-wakes-parked-conns)
+  (test-fiber-restart-leaves-poller-clean)
   (test-bad-strategy-throws)
 
   (if (zero? @failures)
