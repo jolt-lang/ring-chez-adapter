@@ -986,6 +986,98 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+;; --- RFC-0004: websocket upgrade guard -----------------------------------------
+
+(defn- ws-handshake [fd path]
+  (client-send fd (str "GET " path " HTTP/1.1\r\nHost: t\r\n"
+                       "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                       "Sec-WebSocket-Version: 13\r\n\r\n")))
+
+(defn test-ws-guard-accepts []
+  ;; truthy non-map return upgrades as before (echo round-trip)
+  (let [server (adapter/run-server handler
+                  {:port 8438 :worker-threads 1
+                   :ws-handler (fn [session]
+                                 (let [m (ws/recv! session)]
+                                   (when (not= :close (:type m))
+                                     (ws/send! session (:data m)))))
+                   :ws-guard (fn [_] true)})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8438 5000)]
+        (ws-handshake fd "/ws")
+        (check-has "guard-accept: 101 sent" "101" (client-recv-until fd "\r\n\r\n"))
+        (t-send-bytes fd (ws-client-frame 0x1 (utf8-bytes "hi")))
+        (let [f (ws-read-server-frame fd)]
+          (check "guard-accept: session runs" "hi" (bytes->str (:payload f))))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-guard-rejects-with-response []
+  ;; a response map is served instead of the 101 — unauthenticated peers
+  ;; never get the socket — and the conn stays keep-alive-usable
+  (let [server (adapter/run-server handler
+                  {:port 8439 :worker-threads 1
+                   :ws-handler (fn [_] (check "guard-reject: session must not run"
+                                              :ran :ran))
+                   :ws-guard (fn [req] (if (= "/open" (req :uri)) true
+                                         {:status 401
+                                          :headers {"Content-Type" "text/plain"}
+                                          :body "no token"}))})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8439 5000)]
+        (ws-handshake fd "/secret")
+        (let [r (client-recv-until fd "\r\n\r\n")]
+          (check-has "guard-reject: 401 instead of 101" "401" r)
+          (check "guard-reject: no upgrade headers on reject"
+                 false (str/includes? (str/lower-case r) "sec-websocket-accept"))
+          (check-has "guard-reject: body" "no token" r))
+        ;; same connection, normal request still served (no takeover happened)
+        (client-send fd "GET /echo?q=after HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "guard-reject: conn reusable" "q=after" (client-recv fd))
+        (client-close fd))
+      ;; the guard's uri check passes on another path: upgrade proceeds
+      (let [fd (client-connect 8439 5000)]
+        (ws-handshake fd "/open")
+        (check-has "guard-reject: other uri upgrades" "101" (client-recv-until fd "\r\n\r\n"))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-guard-nil-is-403 []
+  (let [server (adapter/run-server handler
+                  {:port 8440 :worker-threads 1
+                   :ws-handler (fn [_] (check "guard-403: session must not run"
+                                              :ran :ran))
+                   :ws-guard (fn [_] nil)})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8440 5000)]
+        (ws-handshake fd "/ws")
+        (let [r (client-recv-until fd "\r\n\r\n")]
+          (check-has "guard-403: 403 plain reject" "403" r)
+          (check-has "guard-403: body" "Forbidden" r))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-guard-throw-is-request-failure []
+  (let [seen (atom nil)
+        server (adapter/run-server handler
+                  {:port 8441 :worker-threads 1
+                   :ws-handler (fn [_] (check "guard-throw: session must not run"
+                                              :ran :ran))
+                   :ws-guard (fn [_] (throw (ex-info "guard boom" {:g 1})))
+                   :on-failure (fn [_ t] (reset! seen (ex-data t)))})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8441 5000)]
+        (ws-handshake fd "/ws")
+        (check-has "guard-throw: failure path answers 500" "500" (client-recv fd))
+        (client-close fd))
+      (check "guard-throw: on-failure saw guard throw" {:g 1} @seen)
+      (finally (adapter/stop-server server)))))
+
 (defn -main [& _]
   (println "ring adapter over jolt.ffi sockets")
 
@@ -1057,6 +1149,10 @@
   (test-on-failure-hook-throw-falls-back)
   (test-nil-response-is-500)
   (test-ws-failure-notifies-hook)
+  (test-ws-guard-accepts)
+  (test-ws-guard-rejects-with-response)
+  (test-ws-guard-nil-is-403)
+  (test-ws-guard-throw-is-request-failure)
 
   (if (zero? @failures)
     (println "all passed")

@@ -481,11 +481,28 @@
   [on-failure request t]
   (or (when on-failure
         (let [r (try (on-failure request t) (catch Throwable _ nil))]
-          (when (map? r) r)))
+          (when (and (map? r) (contains? r :status)) r)))
       {:status 500 :headers {"Content-Type" "text/plain"}
        :body "Internal Server Error"}))
 
-(defn- connection-loop [conn handler port ka-ms ws-handler on-failure max-bytes io deadline]
+(defn- ws-guard-decision
+  "Igropyr's ws-reject, Ring-shaped: a guard may refuse an upgrade BEFORE
+   the 101 is sent — an unauthenticated peer never gets the socket. Returns
+   :upgrade, or a response map to serve instead: a map carrying :status is
+   the guard's answer, nil/false is a bare 403, and a throw routes through
+   handle-failure so :on-failure observes it."
+  [guard request on-failure]
+  (if-not guard
+    :upgrade
+    (let [v (try (guard request)
+                 (catch Throwable t (handle-failure on-failure request t)))]
+      (cond
+        (and (map? v) (contains? v :status)) v
+        v :upgrade
+        :else {:status 403 :headers {"Content-Type" "text/plain"}
+               :body "Forbidden"}))))
+
+(defn- connection-loop [conn handler port ka-ms ws-handler ws-guard on-failure max-bytes io deadline]
   (set-rcvtimeo! conn ka-ms)
   (let [recv!      (:recv! io)
         idle-recv! (or (:idle-recv! io) recv!)
@@ -513,28 +530,35 @@
           (let [{:keys [request error]} (request->ring (:text r) port)]
             (cond
               error (send! conn (response->string error false))
-              (and ws-handler (upgrade-request? request))
-              ;; websocket takeover: 101, then the session owns the fd until it
-              ;; returns; the connection is not reused afterwards. The session
-              ;; runs on a plain thread (see :run!) whose recv blocks bounded
-              ;; by SO_RCVTIMEO — restore the blocking mode the fiber strategy
-              ;; set aside at accept.
-              (when (send! conn (str "HTTP/1.1 101 Switching Protocols\r\n"
-                                     "Upgrade: websocket\r\n"
-                                     "Connection: Upgrade\r\n"
-                                     "Sec-WebSocket-Accept: "
-                                     (ws/accept-token (get-in request [:headers "sec-websocket-key"]))
-                                     "\r\n\r\n"))
-                (blocking! conn)
-                ;; the session owns the fd now; its own SO_RCVTIMEO bounds an
-                ;; idle peer, so the sweeper must not reap it mid-session
-                (when deadline (reset! deadline Long/MAX_VALUE))
-                ;; post-101 there is no response to serve — close IS the
-                ;; truncation signal (Igropyr). on-failure still observes it.
-                ((:run! io) #(try (ws-handler (ws/make-session conn))
-                                  (catch Throwable t
-                                    (try (when on-failure (on-failure request t))
-                                         (catch Throwable _ nil))))))
+               (and ws-handler (upgrade-request? request))
+               ;; websocket takeover: 101, then the session owns the fd until it
+               ;; returns; the connection is not reused afterwards. The session
+               ;; runs on a plain thread (see :run!) whose recv blocks bounded
+               ;; by SO_RCVTIMEO — restore the blocking mode the fiber strategy
+               ;; set aside at accept.
+               (let [decision (ws-guard-decision ws-guard request on-failure)]
+                 (if-not (= :upgrade decision)
+                   ;; refused before any handshake bytes: the guard's response
+                   ;; goes through the normal send path, so the connection
+                   ;; stays keep-alive-usable and no session ever runs
+                   (when (send-response conn request decision (:take! io) send!)
+                     (recur (:leftover r)))
+                   (when (send! conn (str "HTTP/1.1 101 Switching Protocols\r\n"
+                                          "Upgrade: websocket\r\n"
+                                          "Connection: Upgrade\r\n"
+                                          "Sec-WebSocket-Accept: "
+                                          (ws/accept-token (get-in request [:headers "sec-websocket-key"]))
+                                          "\r\n\r\n"))
+                     (blocking! conn)
+                     ;; the session owns the fd now; its own SO_RCVTIMEO bounds an
+                     ;; idle peer, so the sweeper must not reap it mid-session
+                     (when deadline (reset! deadline Long/MAX_VALUE))
+                     ;; post-101 there is no response to serve — close IS the
+                     ;; truncation signal (Igropyr). on-failure still observes it.
+                     ((:run! io) #(try (ws-handler (ws/make-session conn))
+                                       (catch Throwable t
+                                         (try (when on-failure (on-failure request t))
+                                              (catch Throwable _ nil))))))))
               :else
                (let [resp (let [r ((:run! io) #(try (handler request)
                                                     (catch Throwable t
@@ -559,7 +583,7 @@
                   (recur (:leftover r))))))
           :else nil)))))
 
-(defn- worker [handler port ka-ms ws-handler on-failure max-bytes io work]
+(defn- worker [handler port ka-ms ws-handler ws-guard on-failure max-bytes io work]
   (loop []
     (when-let [conn (async/<!! work)]
       ;; claim at take-time: pending then counts only conns accepted but not
@@ -567,7 +591,7 @@
       ;; where a claimed conn still reads as pressure and over-retires
       ((io :claim!))
       (try
-        (connection-loop conn handler port ka-ms ws-handler on-failure max-bytes io nil)
+        (connection-loop conn handler port ka-ms ws-handler ws-guard on-failure max-bytes io nil)
         ;; an escaping throwable must not kill the worker: a dead worker
         ;; shrinks the pool permanently and starves later connections
         (catch Throwable _)
@@ -618,14 +642,14 @@
   bound, and idle connections hold no thread. The spawn runs under
   *go-backend* :fiber: the default :thread backend runs go bodies on OS
   threads, where wait-ready would block the carrier instead of parking."
-  [handler port ka-ms ws-handler on-failure max-bytes conn conns]
+  [handler port ka-ms ws-handler ws-guard on-failure max-bytes conn conns]
   (let [deadline (atom (+ (System/currentTimeMillis) ka-ms))
         entry {:conn conn :closed? (atom false) :deadline deadline}]
     (swap! conns conj entry)
     (binding [async/*go-backend* :fiber]
       (async/go
         (try
-          (connection-loop conn handler port ka-ms ws-handler on-failure max-bytes
+          (connection-loop conn handler port ka-ms ws-handler ws-guard on-failure max-bytes
                            (fiber-io conn) deadline)
           (catch Throwable _ nil)
           (finally (conn-close! conns entry)))))))
@@ -689,6 +713,7 @@
           n      (or (:worker-threads v) (.availableProcessors (Runtime/getRuntime)))
           ka-ms  (or (:ka-ms v) 30000)
           ws-handler (get opts :ws-handler)
+          ws-guard (get opts :ws-guard)
           on-failure (get opts :on-failure)
           max-bytes (or (:max-bytes v) 1048576)
           fd     (listen-socket port)
@@ -699,7 +724,7 @@
           (future (serve-loop fd running?
                               (fn [conn]
                                 (poller/nonblock! conn)
-                                (fiber-serve handler port ka-ms ws-handler on-failure max-bytes conn conns))))
+                                (fiber-serve handler port ka-ms ws-handler ws-guard on-failure max-bytes conn conns))))
           {:socket fd :port port :running running? :conns conns :sweep sweep})
         (let [work (async/chan)   ; unbuffered: acceptor parks when all workers busy
               pending (atom 0)    ; conns accepted but not yet claimed by a worker
@@ -730,7 +755,7 @@
                                                    (and (>= now grace) (pos? @pending)) 0
                                                    :else (recur)))))
                                            (finally (ffi/free pfds))))))]
-           (dotimes [_ n] (async/thread (worker handler port ka-ms ws-handler on-failure max-bytes io work)))
+           (dotimes [_ n] (async/thread (worker handler port ka-ms ws-handler ws-guard on-failure max-bytes io work)))
           (future (serve-loop fd running?
                               (fn [conn]
                                 (swap! pending inc)
