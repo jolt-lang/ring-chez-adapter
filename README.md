@@ -36,12 +36,58 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
   closes instead of buffering without bound
 - `:ws-handler` — fn of a websocket session, run when an upgrade request
   arrives (below)
+- `:on-failure` — fn of `(request throwable)`, consulted for every abnormal
+  handler completion: a handler throw, a `nil` response (which Ring defines
+  as an error), a `:ws-guard` throw, and post-101 websocket session throws
+  (observed after the handshake; the connection still closes). Return a
+  response map (with `:status`) to serve it — keep-alive survives — or
+  throw/return nil for the plain `500 Internal Server Error`. The hook gets
+  one attempt and the worker always survives. `nil` responses arrive tagged
+  `{:type :ring-chez/nil-response}` in `ex-data`.
+- `:ws-guard` — fn of the upgrade `request`, consulted before the `101` is
+  sent. Return truthy non-map to proceed with the handshake; return a
+  response map (e.g. `{:status 401 ...}`) to serve it instead — the peer
+  never gets the socket and the connection stays keep-alive-usable; return
+  nil/false for a bare `403 Forbidden`; a throw routes through `:on-failure`.
+- `:write-timeout-ms` (default 30000, `0` disables) — `SO_SNDTIMEO` on every
+  blocking send; a peer that stops draining mid-response gets the connection
+  abandoned (truncated body = close) instead of pinning a worker forever.
+  Applies to the threads strategy and post-upgrade websocket sessions.
+
+All options are validated at boot: bad values (`:port 0`, non-fn
+`:on-failure`, negative `:write-timeout-ms`, …) throw before the listen
+socket binds, with `{:key :given :expected}` in `ex-data`. Unknown keys
+pass through for forward compatibility. Socket/bind failures carry
+`:syscall`, `:errno`, and `strerror` text.
 
 Keep-alive is HTTP/1.1 default, HTTP/1.0 opt-in via `Connection: keep-alive`;
 pipelined requests are handled via leftover carry. `204`/`304`/`HEAD` responses
 never frame a body. Malformed requests get `400`, unknown HTTP versions `505`,
 and a handler-supplied `Connection: close` header is honored (the connection
 closes after that response).
+
+## Error handling
+
+Every abnormal handler completion — a handler throw, a `nil` response (an
+error per the Ring spec), a `:ws-guard` throw, or a post-`101` websocket
+session throw — flows through `:on-failure`, which gets one attempt to
+produce a response:
+
+```clojure
+(adapter/run-server handler
+  {:port 3000
+   :on-failure (fn [req ex]
+     ;; nil responses arrive tagged {:type :ring-chez/nil-response}
+     {:status 500
+      :headers {"Content-Type" "text/plain"}
+      :body (or (ex-message ex) "handler returned nil")})})
+```
+
+Return a map with `:status` and it is served — keep-alive survives the
+failure; return anything else (or throw) and the server answers the plain
+`500 Internal Server Error`. The worker always survives. Slow peers are
+bounded separately by `:write-timeout-ms`: a client that stops draining
+mid-response gets the connection abandoned instead of pinning a worker.
 
 ## Streaming responses
 
@@ -113,5 +159,5 @@ the Ring handler as usual.
 ## Test
 
 ```bash
-jolt -M:test   # 55 checks; drives the server over raw sockets + http-client
+jolt -M:test   # 214 checks; drives the server over raw sockets + http-client
 ```

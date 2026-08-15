@@ -835,6 +835,321 @@
       (check "bad strategy: run-server throws" :threw :threw)
       (check-has "bad strategy: message names :strategy" ":strategy" (ex-message t)))))
 
+;; --- RFC-0001: errno-enriched FFI errors ---------------------------------------
+
+(defn test-bind-failure-carries-errno []
+  (let [server (adapter/run-server handler {:port 8431 :worker-threads 1})]
+    (try
+      (Thread/sleep 250)
+      (try
+        (adapter/run-server handler {:port 8431 :worker-threads 1})
+        (check "errno: second bind throws" :threw :did-not-throw)
+        (catch Throwable t
+          (let [d (ex-data t)]
+            (check "errno: throws ex-info" true (map? d))
+            (check "errno: ex-data names syscall" "bind" (:syscall d))
+            (check "errno: ex-data has positive :errno" true (pos? (:errno d)))
+            (check "errno: ex-data has :strerror text"
+                   true (and (string? (:strerror d)) (pos? (count (:strerror d)))))
+            (check-has "errno: message carries strerror"
+                       "address already in use" (str/lower-case (ex-message t)))
+            ;; the ORIGINAL server must be unaffected by the failed boot
+            (let [fd (client-connect 8431 3000)]
+              (client-send fd "GET /echo?q=ok HTTP/1.1\r\nHost: t\r\n\r\n")
+              (check-has "errno: original server still serves" "q=ok" (client-recv fd))
+              (client-close fd)))))
+      (finally (adapter/stop-server server)))))
+
+;; --- RFC-0002: boot-time option validation -------------------------------------
+
+(defn test-boot-validation []
+  (doseq [[k v] [[:port "abc"] [:port 0] [:port 70000]
+                 [:worker-threads 0] [:worker-threads -1]
+                 [:keep-alive-timeout-ms 0] [:keep-alive-timeout-ms -5]
+                 [:max-request-bytes 0]
+                 [:on-failure :not-a-fn]
+                 [:ws-guard 42]
+                 [:write-timeout-ms -1]]]
+    (try
+      (adapter/run-server handler {k v})
+      (check (str "validation: " k " " (pr-str v) " rejected") :threw :did-not-throw)
+      (catch Throwable t
+        (check (str "validation: " k " " (pr-str v) " rejected") :threw :threw)
+        (check (str "validation: " k " names key in ex-data") k (:key (ex-data t)))
+        (check (str "validation: " k " carries :given")
+               true (contains? (ex-data t) :given)))))
+  ;; a failed validation must never have bound a socket: a clean boot on a
+  ;; fresh port with all keys present-and-valid still serves.
+  (let [server (adapter/run-server handler {:port 8432 :worker-threads 1
+                                            :keep-alive-timeout-ms 30000
+                                            :max-request-bytes 1048576
+                                            :write-timeout-ms 0})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8432 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "validation: valid opts still serve" "200 OK" (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+;; --- RFC-0003: unified failure path --------------------------------------------
+
+(defn test-on-failure-hook []
+  (let [seen (atom [])
+        hook (fn [req t] (swap! seen conj [req t])
+                       {:status 503 :headers {"Content-Type" "text/plain"}
+                        :body "hooked"})
+        server (adapter/run-server (fn [_] (throw (ex-info "boom" {:x 1})))
+                 {:port 8433 :worker-threads 1 :on-failure hook})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8433 3000)]
+        (client-send fd "GET /echo?q=1 HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [r (client-recv fd)]
+          (check-has "on-failure: hook response served" "503" r)
+          (check-has "on-failure: hook body" "hooked" r))
+        ;; keep-alive survives the failure: hook answers via normal path
+        (client-send fd "GET /echo?q=2 HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "on-failure: conn reusable after hook" "503" (client-recv fd))
+        (client-close fd))
+      (let [[_ t] (first @seen)]
+        (check "on-failure: hook got the thrown ex-data" {:x 1} (ex-data t)))
+      (finally (adapter/stop-server server)))))
+
+(defn test-on-failure-hook-throw-falls-back []
+  (let [server (adapter/run-server (fn [_] (throw (ex-info "boom" {})))
+                 {:port 8434 :worker-threads 1
+                  :on-failure (fn [_ _] (throw (ex-info "hook also boom" {})))})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8434 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "hook-throw: falls back to plain 500"
+                   "500" (client-recv fd))
+        (client-close fd))
+      ;; worker survives the hook throw: a fresh request still answers
+      (let [fd (client-connect 8434 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "hook-throw: worker survives" "500" (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-nil-response-is-500 []
+  ;; no hook: nil gets the Ring/Jetty 500, not a dropped connection
+  (let [server (adapter/run-server (fn [_] nil) {:port 8435 :worker-threads 1})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8435 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [r (client-recv fd)]
+          (check-has "nil-resp: 500 served" "500" r)
+          (check-has "nil-resp: complete response body" "Internal Server Error" r))
+        (client-close fd))
+      (finally (adapter/stop-server server))))
+  ;; with a hook: the synthetic throwable is tagged
+  (let [types (atom [])
+        server (adapter/run-server (fn [_] nil)
+                 {:port 8436 :worker-threads 1
+                  :on-failure (fn [_ t] (swap! types conj (:type (ex-data t))))})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8436 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "nil-resp: hook path serves 500" "500" (client-recv fd))
+        (client-close fd))
+      (check "nil-resp: hook sees :ring-chez/nil-response"
+             [:ring-chez/nil-response] @types)
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-failure-notifies-hook []
+  (let [seen (atom [])
+        server (adapter/run-server handler
+                 {:port 8437 :worker-threads 1
+                  :ws-handler (fn [_] (throw (ex-info "ws boom" {:w 1})))
+                  :on-failure (fn [req t] (swap! seen conj [(req :uri) (ex-data t)]))})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8437 5000)]
+        (client-send fd (str "GET /ws HTTP/1.1\r\nHost: t\r\n"
+                             "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                             "Sec-WebSocket-Version: 13\r\n\r\n"))
+        (check-has "ws-fail: 101 already sent" "101" (client-recv-until fd "\r\n\r\n"))
+        ;; session throws -> server closes (close is the truncation signal)
+        (check "ws-fail: server closed conn" "" (client-recv fd))
+        (client-close fd))
+      (check "ws-fail: hook saw the session throw" ["/ws" {:w 1}] (first @seen))
+      ;; worker survives: plain request still served
+      (let [fd (client-connect 8437 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "ws-fail: worker survives" "200 OK" (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+;; --- RFC-0004: websocket upgrade guard -----------------------------------------
+
+(defn- ws-handshake [fd path]
+  (client-send fd (str "GET " path " HTTP/1.1\r\nHost: t\r\n"
+                       "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                       "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                       "Sec-WebSocket-Version: 13\r\n\r\n")))
+
+(defn test-ws-guard-accepts []
+  ;; truthy non-map return upgrades as before (echo round-trip)
+  (let [server (adapter/run-server handler
+                  {:port 8438 :worker-threads 1
+                   :ws-handler (fn [session]
+                                 (let [m (ws/recv! session)]
+                                   (when (not= :close (:type m))
+                                     (ws/send! session (:data m)))))
+                   :ws-guard (fn [_] true)})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8438 5000)]
+        (ws-handshake fd "/ws")
+        (check-has "guard-accept: 101 sent" "101" (client-recv-until fd "\r\n\r\n"))
+        (t-send-bytes fd (ws-client-frame 0x1 (utf8-bytes "hi")))
+        (let [f (ws-read-server-frame fd)]
+          (check "guard-accept: session runs" "hi" (bytes->str (:payload f))))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-guard-rejects-with-response []
+  ;; a response map is served instead of the 101 — unauthenticated peers
+  ;; never get the socket — and the conn stays keep-alive-usable
+  (let [server (adapter/run-server handler
+                  {:port 8439 :worker-threads 1
+                   :ws-handler (fn [_] (check "guard-reject: session must not run"
+                                              :ran :ran))
+                   :ws-guard (fn [req] (if (= "/open" (req :uri)) true
+                                         {:status 401
+                                          :headers {"Content-Type" "text/plain"}
+                                          :body "no token"}))})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8439 5000)]
+        (ws-handshake fd "/secret")
+        (let [r (client-recv-until fd "\r\n\r\n")]
+          (check-has "guard-reject: 401 instead of 101" "401" r)
+          (check "guard-reject: no upgrade headers on reject"
+                 false (str/includes? (str/lower-case r) "sec-websocket-accept"))
+          (check-has "guard-reject: body" "no token" r))
+        ;; same connection, normal request still served (no takeover happened)
+        (client-send fd "GET /echo?q=after HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "guard-reject: conn reusable" "q=after" (client-recv fd))
+        (client-close fd))
+      ;; the guard's uri check passes on another path: upgrade proceeds
+      (let [fd (client-connect 8439 5000)]
+        (ws-handshake fd "/open")
+        (check-has "guard-reject: other uri upgrades" "101" (client-recv-until fd "\r\n\r\n"))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-guard-nil-is-403 []
+  (let [server (adapter/run-server handler
+                  {:port 8440 :worker-threads 1
+                   :ws-handler (fn [_] (check "guard-403: session must not run"
+                                              :ran :ran))
+                   :ws-guard (fn [_] nil)})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8440 5000)]
+        (ws-handshake fd "/ws")
+        (let [r (client-recv-until fd "\r\n\r\n")]
+          (check-has "guard-403: 403 plain reject" "403" r)
+          (check-has "guard-403: body" "Forbidden" r))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-guard-throw-is-request-failure []
+  (let [seen (atom nil)
+        server (adapter/run-server handler
+                  {:port 8441 :worker-threads 1
+                   :ws-handler (fn [_] (check "guard-throw: session must not run"
+                                              :ran :ran))
+                   :ws-guard (fn [_] (throw (ex-info "guard boom" {:g 1})))
+                   :on-failure (fn [_ t] (reset! seen (ex-data t)))})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8441 5000)]
+        (ws-handshake fd "/ws")
+        (check-has "guard-throw: failure path answers 500" "500" (client-recv fd))
+        (client-close fd))
+      (check "guard-throw: on-failure saw guard throw" {:g 1} @seen)
+      (finally (adapter/stop-server server)))))
+
+;; --- RFC-0005: write timeout ----------------------------------------------------
+
+(defn- client-connect-tiny-rcvbuf [port rcvtimeo-ms]
+  ;; SO_RCVBUF 2048 before connect: this peer stops draining almost
+  ;; immediately, so the server's send blocks once buffers fill
+  (let [fd (t-socket 2 1 0)
+        so-rcvbuf (if t-macos? 0x1002 8)
+        v (ffi/alloc 4)]
+    (ffi/write v :int 0 2048)
+    (t-setsockopt fd t-sol-socket so-rcvbuf v 4)
+    (ffi/free v)
+    (t-set-rcvtimeo! fd rcvtimeo-ms)
+    (let [sa (t-sockaddr port)]
+      (when (neg? (t-connect fd sa 16))
+        (t-close fd) (ffi/free sa) (throw (ex-info "connect() failed" {})))
+      (ffi/free sa))
+    fd))
+
+(defn- drain-until-eof [fd]
+  ;; accumulate until the server closes (recv 0) or a read timeout
+  (let [buf (ffi/alloc 65536)]
+    (try
+      (loop [acc ""]
+        (let [n (t-recv fd buf 65536 0)]
+          (cond (pos? n) (recur (str acc (ffi/read-bytes buf n)))
+                (zero? n) acc
+                :else (if (pos? (count acc)) acc ""))))
+      (finally (ffi/free buf)))))
+
+(defn test-write-timeout-cuts-stalled-peer []
+  ;; 16MB: bigger than any autotuned send buffer, so the send genuinely
+  ;; blocks once the peer stops draining
+  (let [big (apply str (repeat 16777216 "a"))
+        server (adapter/run-server
+                 (fn [req] (if (= "/big" (:uri req))
+                             {:status 200 :body big}
+                             {:status 200 :body "q=free"}))
+                 {:port 8442 :worker-threads 1 :write-timeout-ms 300})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect-tiny-rcvbuf 8442 8000)]
+        (client-send fd "GET /big HTTP/1.1\r\nHost: t\r\n\r\n")
+        ;; stall — never read while the body is coming: the tiny rcvbuf and
+        ;; the server sndbuf fill, the blocking send times out at ~300ms,
+        ;; and the server abandons the response and closes
+        (Thread/sleep 1000)
+        (let [r (drain-until-eof fd)]
+          (check "write-timeout: body truncated" true (< (count r) 16777216))
+          (check "write-timeout: some bytes delivered first" true (pos? (count r))))
+        (client-close fd))
+      ;; the worker is free again: a fresh request is served promptly
+      (let [fd (client-connect 8442 3000)
+            _ (client-send fd "GET /echo?q=free HTTP/1.1\r\nHost: t\r\n\r\n")]
+        (check-has "write-timeout: worker freed after cut" "q=free" (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-write-timeout-zero-disables []
+  (let [big (apply str (repeat 262144 "b"))
+        server (adapter/run-server (fn [_] {:status 200 :body big})
+                 {:port 8443 :worker-threads 1 :write-timeout-ms 0})]
+    (try
+      (Thread/sleep 250)
+      ;; Connection: close -> the server closes after the last byte, so
+      ;; drain-until-eof returns without waiting out a read timeout
+      (let [fd (client-connect 8443 8000)
+            _ (client-send fd "GET /big HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+            r (drain-until-eof fd)]
+        (check "write-timeout off: full body delivered" true (<= 262144 (count r)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
 (defn -main [& _]
   (println "ring adapter over jolt.ffi sockets")
 
@@ -900,6 +1215,18 @@
   (test-fiber-stop-wakes-parked-conns)
   (test-fiber-restart-leaves-poller-clean)
   (test-bad-strategy-throws)
+  (test-bind-failure-carries-errno)
+  (test-boot-validation)
+  (test-on-failure-hook)
+  (test-on-failure-hook-throw-falls-back)
+  (test-nil-response-is-500)
+  (test-ws-failure-notifies-hook)
+  (test-ws-guard-accepts)
+  (test-ws-guard-rejects-with-response)
+  (test-ws-guard-nil-is-403)
+  (test-ws-guard-throw-is-request-failure)
+  (test-write-timeout-cuts-stalled-peer)
+  (test-write-timeout-zero-disables)
 
   (if (zero? @failures)
     (println "all passed")
