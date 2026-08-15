@@ -117,11 +117,17 @@
       (ffi/free opt))
     (let [sa (make-sockaddr port)]
       (when (neg? (c-bind fd sa 16))
-        (let [e (errno-info)]
+        (let [e (errno-info)
+              in-use? (= (if macos? 48 98) (:errno e))]
           (c-close fd) (ffi/free sa)
-          (throw (ex-info (str "bind() failed on port " port ": " (:strerror e)
-                               " (errno " (:errno e) ")")
-                          (assoc e :syscall "bind" :port port)))))
+          (throw (ex-info (if in-use?
+                            (str "port " port " is already in use — another process is "
+                                 "listening on 127.0.0.1:" port " (" (:strerror e)
+                                 ", errno " (:errno e) "); stop it or pass a different :port")
+                            (str "bind() failed on port " port ": " (:strerror e)
+                                 " (errno " (:errno e) ")"))
+                          (cond-> (assoc e :syscall "bind" :port port)
+                            in-use? (assoc :errno-name "EADDRINUSE"))))))
       (ffi/free sa))
     (when (neg? (c-listen fd 64))
       (let [e (errno-info)]
