@@ -892,6 +892,100 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+;; --- RFC-0003: unified failure path --------------------------------------------
+
+(defn test-on-failure-hook []
+  (let [seen (atom [])
+        hook (fn [req t] (swap! seen conj [req t])
+                       {:status 503 :headers {"Content-Type" "text/plain"}
+                        :body "hooked"})
+        server (adapter/run-server (fn [_] (throw (ex-info "boom" {:x 1})))
+                 {:port 8433 :worker-threads 1 :on-failure hook})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8433 3000)]
+        (client-send fd "GET /echo?q=1 HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [r (client-recv fd)]
+          (check-has "on-failure: hook response served" "503" r)
+          (check-has "on-failure: hook body" "hooked" r))
+        ;; keep-alive survives the failure: hook answers via normal path
+        (client-send fd "GET /echo?q=2 HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "on-failure: conn reusable after hook" "503" (client-recv fd))
+        (client-close fd))
+      (let [[_ t] (first @seen)]
+        (check "on-failure: hook got the thrown ex-data" {:x 1} (ex-data t)))
+      (finally (adapter/stop-server server)))))
+
+(defn test-on-failure-hook-throw-falls-back []
+  (let [server (adapter/run-server (fn [_] (throw (ex-info "boom" {})))
+                 {:port 8434 :worker-threads 1
+                  :on-failure (fn [_ _] (throw (ex-info "hook also boom" {})))})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8434 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "hook-throw: falls back to plain 500"
+                   "500" (client-recv fd))
+        (client-close fd))
+      ;; worker survives the hook throw: a fresh request still answers
+      (let [fd (client-connect 8434 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "hook-throw: worker survives" "500" (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-nil-response-is-500 []
+  ;; no hook: nil gets the Ring/Jetty 500, not a dropped connection
+  (let [server (adapter/run-server (fn [_] nil) {:port 8435 :worker-threads 1})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8435 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [r (client-recv fd)]
+          (check-has "nil-resp: 500 served" "500" r)
+          (check-has "nil-resp: complete response body" "Internal Server Error" r))
+        (client-close fd))
+      (finally (adapter/stop-server server))))
+  ;; with a hook: the synthetic throwable is tagged
+  (let [types (atom [])
+        server (adapter/run-server (fn [_] nil)
+                 {:port 8436 :worker-threads 1
+                  :on-failure (fn [_ t] (swap! types conj (:type (ex-data t))))})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8436 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "nil-resp: hook path serves 500" "500" (client-recv fd))
+        (client-close fd))
+      (check "nil-resp: hook sees :ring-chez/nil-response"
+             [:ring-chez/nil-response] @types)
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-failure-notifies-hook []
+  (let [seen (atom [])
+        server (adapter/run-server handler
+                 {:port 8437 :worker-threads 1
+                  :ws-handler (fn [_] (throw (ex-info "ws boom" {:w 1})))
+                  :on-failure (fn [req t] (swap! seen conj [(req :uri) (ex-data t)]))})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8437 5000)]
+        (client-send fd (str "GET /ws HTTP/1.1\r\nHost: t\r\n"
+                             "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                             "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                             "Sec-WebSocket-Version: 13\r\n\r\n"))
+        (check-has "ws-fail: 101 already sent" "101" (client-recv-until fd "\r\n\r\n"))
+        ;; session throws -> server closes (close is the truncation signal)
+        (check "ws-fail: server closed conn" "" (client-recv fd))
+        (client-close fd))
+      (check "ws-fail: hook saw the session throw" ["/ws" {:w 1}] (first @seen))
+      ;; worker survives: plain request still served
+      (let [fd (client-connect 8437 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "ws-fail: worker survives" "200 OK" (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
 (defn -main [& _]
   (println "ring adapter over jolt.ffi sockets")
 
@@ -959,6 +1053,10 @@
   (test-bad-strategy-throws)
   (test-bind-failure-carries-errno)
   (test-boot-validation)
+  (test-on-failure-hook)
+  (test-on-failure-hook-throw-falls-back)
+  (test-nil-response-is-500)
+  (test-ws-failure-notifies-hook)
 
   (if (zero? @failures)
     (println "all passed")

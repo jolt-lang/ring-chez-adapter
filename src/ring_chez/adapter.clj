@@ -472,7 +472,20 @@
    :take! (fn [ch] (async/<! ch))
    :run!  (fn [f] (async/<! (async/thread (f))))})
 
-(defn- connection-loop [conn handler port ka-ms ws-handler max-bytes io deadline]
+(defn- handle-failure
+  "Every abnormal handler completion lands here (Igropyr's on-failure
+   semantics). The hook gets one attempt: a throw or a non-map/nil return
+   falls back to the plain 500, and the worker always survives. The returned
+   map goes through send-response like any handler response, so keep-alive
+   is preserved across a failure."
+  [on-failure request t]
+  (or (when on-failure
+        (let [r (try (on-failure request t) (catch Throwable _ nil))]
+          (when (map? r) r)))
+      {:status 500 :headers {"Content-Type" "text/plain"}
+       :body "Internal Server Error"}))
+
+(defn- connection-loop [conn handler port ka-ms ws-handler on-failure max-bytes io deadline]
   (set-rcvtimeo! conn ka-ms)
   (let [recv!      (:recv! io)
         idle-recv! (or (:idle-recv! io) recv!)
@@ -516,13 +529,22 @@
                 ;; the session owns the fd now; its own SO_RCVTIMEO bounds an
                 ;; idle peer, so the sweeper must not reap it mid-session
                 (when deadline (reset! deadline Long/MAX_VALUE))
+                ;; post-101 there is no response to serve — close IS the
+                ;; truncation signal (Igropyr). on-failure still observes it.
                 ((:run! io) #(try (ws-handler (ws/make-session conn))
-                                  (catch Throwable _ nil))))
+                                  (catch Throwable t
+                                    (try (when on-failure (on-failure request t))
+                                         (catch Throwable _ nil))))))
               :else
-              (let [resp ((:run! io) #(try (handler request)
-                                           (catch Throwable _
-                                             {:status 500 :headers {"Content-Type" "text/plain"}
-                                              :body "Internal Server Error"})))
+               (let [resp (let [r ((:run! io) #(try (handler request)
+                                                    (catch Throwable t
+                                                      (handle-failure on-failure request t))))]
+                            ;; nil is a failure per Ring (Jetty answers 500),
+                            ;; tagged so a hook can tell it from a throw
+                            (if (map? r) r
+                                (handle-failure on-failure request
+                                                (ex-info "handler returned nil"
+                                                         {:type :ring-chez/nil-response}))))
                     ;; retire under accept pressure: another connection is
                     ;; waiting for this worker, so decline keep-alive and free
                     ;; it instead of parking on an idle conn while others
@@ -537,7 +559,7 @@
                   (recur (:leftover r))))))
           :else nil)))))
 
-(defn- worker [handler port ka-ms ws-handler max-bytes io work]
+(defn- worker [handler port ka-ms ws-handler on-failure max-bytes io work]
   (loop []
     (when-let [conn (async/<!! work)]
       ;; claim at take-time: pending then counts only conns accepted but not
@@ -545,7 +567,7 @@
       ;; where a claimed conn still reads as pressure and over-retires
       ((io :claim!))
       (try
-        (connection-loop conn handler port ka-ms ws-handler max-bytes io nil)
+        (connection-loop conn handler port ka-ms ws-handler on-failure max-bytes io nil)
         ;; an escaping throwable must not kill the worker: a dead worker
         ;; shrinks the pool permanently and starves later connections
         (catch Throwable _)
@@ -596,14 +618,14 @@
   bound, and idle connections hold no thread. The spawn runs under
   *go-backend* :fiber: the default :thread backend runs go bodies on OS
   threads, where wait-ready would block the carrier instead of parking."
-  [handler port ka-ms ws-handler max-bytes conn conns]
+  [handler port ka-ms ws-handler on-failure max-bytes conn conns]
   (let [deadline (atom (+ (System/currentTimeMillis) ka-ms))
         entry {:conn conn :closed? (atom false) :deadline deadline}]
     (swap! conns conj entry)
     (binding [async/*go-backend* :fiber]
       (async/go
         (try
-          (connection-loop conn handler port ka-ms ws-handler max-bytes
+          (connection-loop conn handler port ka-ms ws-handler on-failure max-bytes
                            (fiber-io conn) deadline)
           (catch Throwable _ nil)
           (finally (conn-close! conns entry)))))))
@@ -667,6 +689,7 @@
           n      (or (:worker-threads v) (.availableProcessors (Runtime/getRuntime)))
           ka-ms  (or (:ka-ms v) 30000)
           ws-handler (get opts :ws-handler)
+          on-failure (get opts :on-failure)
           max-bytes (or (:max-bytes v) 1048576)
           fd     (listen-socket port)
           running? (atom true)]
@@ -676,7 +699,7 @@
           (future (serve-loop fd running?
                               (fn [conn]
                                 (poller/nonblock! conn)
-                                (fiber-serve handler port ka-ms ws-handler max-bytes conn conns))))
+                                (fiber-serve handler port ka-ms ws-handler on-failure max-bytes conn conns))))
           {:socket fd :port port :running running? :conns conns :sweep sweep})
         (let [work (async/chan)   ; unbuffered: acceptor parks when all workers busy
               pending (atom 0)    ; conns accepted but not yet claimed by a worker
@@ -707,7 +730,7 @@
                                                    (and (>= now grace) (pos? @pending)) 0
                                                    :else (recur)))))
                                            (finally (ffi/free pfds))))))]
-          (dotimes [_ n] (async/thread (worker handler port ka-ms ws-handler max-bytes io work)))
+           (dotimes [_ n] (async/thread (worker handler port ka-ms ws-handler on-failure max-bytes io work)))
           (future (serve-loop fd running?
                               (fn [conn]
                                 (swap! pending inc)
