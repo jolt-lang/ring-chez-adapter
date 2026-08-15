@@ -31,6 +31,15 @@
 ;; :idle-recv!). struct pollfd { int fd; short events; short revents; } — fd
 ;; at 0, events at byte 4, revents at bytes 6-7.
 (ffi/defcfn c-poll       "poll"       [:pointer :int :int] :int :blocking)
+(ffi/defcfn c-strerror  "strerror"   [:int] :pointer)
+
+;; errno + strerror read immediately after a syscall failure return — errno
+;; is thread-local and stale across syscalls, so it is only meaningful in
+;; the window between the failure and any other FFI call.
+(defn- errno-info []
+  (let [n (poller/errno)]
+    {:errno n
+     :strerror (or (try (ffi/ptr->string (c-strerror n)) (catch Throwable _ nil)) "")}))
 
 (def ^:private POLLIN  0x001)
 
@@ -82,16 +91,31 @@
 
 (defn- listen-socket [port]
   (let [fd (c-socket AF-INET SOCK-STREAM 0)]
-    (when (neg? fd) (throw (ex-info "socket() failed" {})))
+    (when (neg? fd)
+      (let [e (errno-info)]
+        (throw (ex-info (str "socket() failed: " (:strerror e))
+                        (assoc e :syscall "socket")))))
     (let [opt (ffi/alloc 4)]
       (ffi/write opt :int 0 1)
-      (c-setsockopt fd sol-socket so-reuse opt 4)
+      (when (neg? (c-setsockopt fd sol-socket so-reuse opt 4))
+        (let [e (errno-info)]
+          (c-close fd) (ffi/free opt)
+          (throw (ex-info (str "setsockopt() failed: " (:strerror e))
+                          (assoc e :syscall "setsockopt")))))
       (ffi/free opt))
     (let [sa (make-sockaddr port)]
       (when (neg? (c-bind fd sa 16))
-        (c-close fd) (ffi/free sa) (throw (ex-info (str "bind() failed on port " port) {})))
+        (let [e (errno-info)]
+          (c-close fd) (ffi/free sa)
+          (throw (ex-info (str "bind() failed on port " port ": " (:strerror e)
+                               " (errno " (:errno e) ")")
+                          (assoc e :syscall "bind" :port port)))))
       (ffi/free sa))
-    (when (neg? (c-listen fd 64)) (c-close fd) (throw (ex-info "listen() failed" {})))
+    (when (neg? (c-listen fd 64))
+      (let [e (errno-info)]
+        (c-close fd)
+        (throw (ex-info (str "listen() failed: " (:strerror e))
+                        (assoc e :syscall "listen")))))
     fd))
 
 ;; --- fiber strategy io: jolt.io-poller ---------------------------------------

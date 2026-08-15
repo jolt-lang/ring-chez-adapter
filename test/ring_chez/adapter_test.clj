@@ -835,6 +835,31 @@
       (check "bad strategy: run-server throws" :threw :threw)
       (check-has "bad strategy: message names :strategy" ":strategy" (ex-message t)))))
 
+;; --- RFC-0001: errno-enriched FFI errors ---------------------------------------
+
+(defn test-bind-failure-carries-errno []
+  (let [server (adapter/run-server handler {:port 8431 :worker-threads 1})]
+    (try
+      (Thread/sleep 250)
+      (try
+        (adapter/run-server handler {:port 8431 :worker-threads 1})
+        (check "errno: second bind throws" :threw :did-not-throw)
+        (catch Throwable t
+          (let [d (ex-data t)]
+            (check "errno: throws ex-info" true (map? d))
+            (check "errno: ex-data names syscall" "bind" (:syscall d))
+            (check "errno: ex-data has positive :errno" true (pos? (:errno d)))
+            (check "errno: ex-data has :strerror text"
+                   true (and (string? (:strerror d)) (pos? (count (:strerror d)))))
+            (check-has "errno: message carries strerror"
+                       "address already in use" (str/lower-case (ex-message t)))
+            ;; the ORIGINAL server must be unaffected by the failed boot
+            (let [fd (client-connect 8431 3000)]
+              (client-send fd "GET /echo?q=ok HTTP/1.1\r\nHost: t\r\n\r\n")
+              (check-has "errno: original server still serves" "q=ok" (client-recv fd))
+              (client-close fd)))))
+      (finally (adapter/stop-server server)))))
+
 (defn -main [& _]
   (println "ring adapter over jolt.ffi sockets")
 
@@ -900,6 +925,7 @@
   (test-fiber-stop-wakes-parked-conns)
   (test-fiber-restart-leaves-poller-clean)
   (test-bad-strategy-throws)
+  (test-bind-failure-carries-errno)
 
   (if (zero? @failures)
     (println "all passed")
