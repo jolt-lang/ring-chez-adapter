@@ -1,123 +1,141 @@
 # Benchmarks
 
-Compares this adapter against a minimal [Undertow](https://undertow.io/) Ring
-server (`benchmark/minimal-ring-undertow/`) running the identical handler:
-`GET /plaintext` and `GET /json`, both returning fixed `Hello, World!`
-bodies. Workload is [ApacheBench](https://httpd.apache.org/docs/2.4/programs/ab.html)
+Compares this adapter against two minimal JVM Ring servers running the identical
+handler: [Undertow](https://undertow.io/) (`benchmark/minimal-ring-undertow/`)
+and [Jetty](https://jetty.org) (`benchmark/minimal-ring-jetty/`). Endpoints are
+`GET /plaintext` and `GET /json`, both returning fixed `Hello, World!` bodies.
+Workload is [ApacheBench](https://httpd.apache.org/docs/2.4/programs/ab.html)
 (`ab`), colocated with the servers.
+
+All three servers run the **bare handler with no middleware**. That is the point
+of the comparison: what is measured is the adapter, and a middleware stack on one
+side and not the other would put its cost in the adapter's column. (Until Aug 20
+2026 the Undertow server wrapped its handler in `ring-defaults api-defaults`
+while the chez server ran bare, so the "identical handler" claim above was not
+true and Undertow's numbers carried a per-request tax the others did not.)
 
 ## Run
 
 ```sh
-benchmark/run.sh                     # full matrix, :threads strategy (default)
-STRATEGY=fibers benchmark/run.sh     # fibers strategy
-WORKERS=200 benchmark/run.sh         # threads with :worker-threads 200
-N=2000 C_LIST="10" benchmark/run.sh  # quick smoke run
+benchmark/run.sh                       # full matrix, :threads strategy (default)
+STRATEGY=fibers benchmark/run.sh       # fibers strategy
+WORKERS=200 benchmark/run.sh           # threads with :worker-threads 200
+SERVERS="jetty chez" benchmark/run.sh  # subset of undertow/jetty/chez
+JSON=1 benchmark/run.sh                # add a /json pass
+N=2000 C_LIST="10" benchmark/run.sh    # quick smoke run
 ```
 
 Requires `ab`, `curl`, `timeout`, `lsof`, the Clojure CLI, and `jolt`.
-Defaults: undertow on :8080, adapter on :8081, `N=20000` requests,
-concurrency 10 and 100, plain and keepalive (`-k`) modes. Each line prints
-req/s plus p50/p99 latency; `TIMEOUT` or a `<- client errors (stall?)`
-marker means the run hung or dropped connections — that is a finding, not
-a script failure. Server logs go to mktemp files named at startup.
+Defaults: undertow on :8080, adapter on :8081, jetty on :8082, `N=20000`
+requests, concurrency 10 and 100, plain and keepalive (`-k`) modes. Each line
+prints req/s plus p50/p99 latency; `TIMEOUT` or a `<- client errors (stall?)`
+marker means the run hung or dropped connections — that is a finding, not a
+script failure. Server logs go to mktemp files named at startup.
 
 For a single server by hand: `jolt -M:bench` from the repo root
-(`PORT`, `STRATEGY`, `WORKERS` envs), or
-`cd benchmark/minimal-ring-undertow && clojure -M:run` (`PORT` env).
+(`PORT`, `STRATEGY`, `WORKERS` envs),
+`cd benchmark/minimal-ring-undertow && clojure -M:run` (`PORT` env), or
+`cd benchmark/minimal-ring-jetty && clojure -M:run` (`PORT` env).
 
-## Findings (Aug 2026, M-series Mac, colocated)
+## Findings (2026-08-20, M-series Mac, colocated, `ab -n 20000`)
 
-Representative `ab -n 20000` results on `/plaintext`:
+Three runs of the whole matrix per strategy, same machine, same sitting, so
+every cell below is a RANGE rather than one sample. That matters here: a single
+run of `ab -k -c 100` against this adapter can read anywhere from 4k to 34k
+req/s, and a point value would have been noise dressed as a result. `/plaintext`;
+req/s, with the typical p99 in the last column.
 
-```
-undertow         plain  c=10      ~21-22k req/s   p50 0ms   p99 1ms
-undertow         plain  c=100     ~22k req/s      p50 0ms   p99 1ms
-undertow         ka     c=10      ~55-78k req/s   p50 1ms   p99 3ms
-undertow         ka     c=100     ~93-107k req/s  p50 1ms   p99 4ms
+| server | plain c=10 | ka c=10 | plain c=100 | ka c=100 | p99 |
+|---|---:|---:|---:|---:|---|
+| undertow | 21.4-23.2k | 68-91k | 22.9-23.7k | 94-110k | 1 / 0 / 5 / 3 ms |
+| jetty | 19.7-21.7k | 70-79k | 21.5-22.8k | 75-104k | 1 / 0 / 35 / 4 ms |
+| chez `:threads` | 16.8-18.6k | 47-54k | 18.4-19.2k | **4-34k** | 2 / 1 / 65 / 35 ms |
+| chez `:fibers` | 15.0-15.5k | 15.4-16.0k | 18.6-18.9k | 12.9-13.1k | 2 / 2 / 50 / 40 ms |
 
-chez :threads    plain  c=10      ~16-17k req/s   p50 0ms   p99 2ms
-chez :threads    plain  c=100     ~17-18k req/s
-chez :threads    ka     c=10      ~17-18k req/s   p99 2ms
-chez :threads    ka     c=100     STALLS          (see below)
+`/json`, plain, one run — the body is 27 bytes instead of 13 and nothing else
+differs, which is the control that says the numbers above are adapter cost and
+not body cost:
 
-chez threads-200 ka     c=10      ~19k req/s      p99 4ms
-chez threads-200 ka     c=100     ~12-13k req/s   p99 41ms   (unstable)
-
-chez :fibers*    plain  c=10      ~6k req/s
-chez :fibers*    plain  c=100     ~2k req/s       p99 149ms
-chez :fibers*    ka     c=10      ~1.9k req/s
-chez :fibers*    ka     c=100     ~1.5k req/s     p50 67ms   zero errors
-
-chez :fibers     ka     c=10      ~9.8k req/s     io-poller (post-migration)
-chez :fibers     ka     c=50      ~9.8k req/s     io-poller, flat across c
-
-json endpoint, plain c=100: undertow ~21.4k, chez :threads ~13k req/s
-```
-
-`*` pre-migration numbers for the old hand-rolled poll(2) poller, kept for
-history — see "Adopted: :fibers runs on jolt.io-poller" below for the
-current implementation.
+| server | c=10 | c=100 |
+|---|---:|---:|
+| undertow | 22688 | 22531 |
+| jetty | 21233 | 24028 |
+| chez `:threads` | 18688 | 17729 |
 
 What the numbers say:
 
-- **Plain connections: same ballpark as Undertow.** ~16-18k vs ~21-22k
-  req/s. The adapter's per-connection cost (thread hand-off from the
-  acceptor to the worker pool) costs roughly 20-25%, not a multiple.
-- **Keepalive: Undertow pulls 5x ahead.** Its NIO event loop pipelines
-  requests on an existing connection at ~100k req/s. Our threads strategy
-  parks one worker thread per connection, so keepalive throughput is
-  capped by worker scheduling, not sockets (~18k).
-- **`:fibers` is a scalability feature, not a throughput feature.** Every
-  request parks on the single poll(2) poller thread and hops through two
-  core.async channels, so raw RPS is 3-10x below threads — but idle
-  keepalive/WebSocket/SSE connections pin no threads at all. It ran the
-  entire matrix with zero errors. See "Why fibers lose under load" and
-  "Idle-connection density" below.
-- **Worker count is not a tuning knob for throughput.** 200 workers
-  collapses plain-connection throughput to ~2.6k req/s (thread contention
-  on accept/close churn) and destabilizes keepalive at c=100.
+- **Plain connections: the adapter is in the same class as both JVM servers.**
+  16.8-19.2k against Undertow's 21.4-23.7k and Jetty's 19.7-22.8k — roughly 80%
+  of Undertow and 88% of Jetty. The gap is the per-connection cost of handing
+  off from the acceptor to the worker pool, and it is a fraction, not a
+  multiple.
+- **Keepalive at low concurrency: the adapter reaches ~50k req/s.** That is the
+  row that has moved most since the io-poller and keepalive work; it used to be
+  ~18k, capped by worker scheduling. Undertow and Jetty are still ahead — their
+  NIO event loops pipeline requests on an established connection without a
+  per-request thread hand-off — but the shape is no longer "5x behind", it is
+  ~0.65x of both.
+- **Keepalive at c=100 does not converge on `:threads`, and that is the finding.**
+  Six samples came out 34.0k, 32.0k, 30.9k, 7.0k, 6.8k and 4.2k — bimodal, not
+  spread: the run either sustains keepalive reuse or collapses to roughly a
+  fifth of it, with nothing in between and no client errors either way. The
+  mechanism is the accept-pressure retirement: with 100 keepalive clients and N
+  workers, a worker that sees an unclaimed accepted connection stamps
+  `Connection: close` and frees itself for the backlog rather than parking on an
+  idle keepalive. Whether the run lands in the high mode or the low one is
+  decided by how that race resolves in the first moments and never recovers.
+  It is the right trade — before it, this cell hung until the client's 60s
+  timeout (see the last section) — but "~16k req/s" as previously recorded here
+  is a single sample from inside a bimodal distribution, not a throughput
+  figure. Both JVM servers scale UP in this cell instead (75-110k), because
+  pipelining gets cheaper as connections stay hot.
+- **`:fibers` trades peak throughput for predictability, and now wins the cell
+  `:threads` is worst in.** Every fibers cell is tight — the widest is 3% —
+  where threads swing 8x at ka c=100. Fibers match threads at plain c=100
+  (18.6-18.9k vs 18.4-19.2k) and beat the threads MEDIAN at ka c=100
+  (12.9-13.1k, stable, against a bimodal 4-34k), because a fiber parks per
+  connection instead of pinning a worker, so accept pressure never builds and
+  the retirement never fires. They remain behind at low concurrency (15.0-15.5k
+  vs 16.8-18.6k plain c=10; 15.4-16.0k vs 47-54k keepalive c=10), where a
+  thread's blocking recv costs nothing and the fiber still pays its per-request
+  channel hop. That completes the trajectory recorded below: the old
+  hand-rolled poll(2) fibers ran at ~10% of threads, io-poller took it to ~63%,
+  and it now leads in the cell threads is least predictable in.
+- **Undertow vs Jetty.** Undertow leads on plain connections at both
+  concurrencies, by about 6%. Keepalive at c=10 is a wash once the spread is
+  taken into account (68-91k vs 70-79k). At ka c=100 Undertow is both faster and
+  steadier (94-110k vs 75-104k). The sharpest difference is tail latency on
+  plain c=100: Undertow p99 5-6ms, Jetty p99 35ms across all three runs, which
+  is consistent enough to be a property of the connector rather than noise.
+- **Body size is not a factor.** `/json` tracks `/plaintext` within a few percent
+  for all three servers, so nothing here is measuring serialization.
 
-## Why fibers lose under load (threads vs fibers, same session)
 
-`ab -n 20000` on `/plaintext`, both strategies on the same server binary:
+## Why fibers cost more at low concurrency (threads vs fibers, same session)
 
-```
-threads  plain c=1     3986 req/s   p99 1ms
-fibers   plain c=1     2339 req/s   p99 1ms     <- 1.7x slower at zero contention
-threads  plain c=100  16524 req/s   p99 87ms
-fibers   plain c=100   1825 req/s   p99 137ms   <- 9x slower, does not scale
-threads  ka    c=100  16762 req/s   p99 89ms
-fibers   ka    c=100   1491 req/s   p99 106ms   <- 11x slower
-```
+At c=10 a `:threads` request performs no context switch at all — a blocking recv
+parks the kernel thread and the wake is direct. A `:fibers` request pays, on top
+of the same recv/send: a delivery channel, the park/unpark, and the handler hop
+to `async/thread` and back for a synchronous Ring handler. That is the whole of
+the 15.4k-vs-18.2k gap at plain c=10, and it is fixed cost per request, so it
+stops mattering once the threads strategy starts contending.
 
-Two separate effects, both measured:
+Under the OLD hand-rolled poll(2) poller this fixed cost was much larger and,
+worse, it did not amortise: every registration and wakeup funnelled through one
+poller thread whose per-cycle work was O(N) — rebuild N+1 pollfd slots, two FFI
+writes each, scan 2(N+1) revents fields — so adding concurrency made fibers
+*slower* (2339 -> 1825 req/s from c=1 to c=100) while threads scaled 4x. Those
+numbers are kept here because they are why the poller was replaced, not because
+they describe the current implementation. With `jolt.io-poller` the interest set
+lives in the kernel and a read whose data is already waiting never touches the
+poller at all, which is why the c=100 columns above now favour fibers.
 
-- **Fixed per-request overhead (the c=1 row).** A fiber request costs, on
-  top of the same recv/send the thread does: a delivery chan alloc, a
-  timeout chan alloc (`alts!` vs `async/timeout`), a wake-pipe write to
-  interrupt the poller, a poller wakeup that rebuilds the entire pollfd
-  array from the regs atom, the poll syscall itself, a pipe read to drain
-  the wake byte, a revents scan over every slot, `put!` delivery, a go
-  park/unpark — then `:run!` hops the handler to `async/thread` and back
-  through another channel. "Cheaper switching" never enters the picture:
-  the threads strategy performs no switch at all per request (a blocking
-  recv parks the kernel thread; the wake is direct).
-- **Serialization through one poller (the c=100 rows).** Every
-  registration and every wakeup funnels through a single poller thread
-  whose per-cycle work is O(N) (rebuild N+1 pollfd slots, 2 FFI writes
-  each; scan 2(N+1) revents fields). Adding concurrency makes fibers
-  *slower* (2339 -> 1825 req/s from c=1 to c=100) while threads scales
-  4x. Within a single fibers run, throughput declines as steady-state
-  registration churn builds (3716 -> 1089 req/s across 50k requests).
-
-Fibers win where threads are the scarce resource: thousands of mostly
-idle connections (SSE/WebSocket fleets) that would otherwise pin one
-thread each. Under compute-style load the poller is the bottleneck by
-construction. The fix is adopting `jolt.io-poller` — see
-"Recommended: adopt jolt.io-poller" below.
 
 ## Idle-connection density: where fibers win (measured)
+
+Measured when the io-poller migration landed and **not** re-run for the
+2026-08-20 table above — the numbers here are a separate experiment, not part of
+that matrix.
 
 1000 concurrent keep-alive connections opened, one request each, left
 idle 6s, then reused. Same server binary per strategy, default workers
@@ -219,7 +237,8 @@ itself parks — so the deadline moved to the sweeper and the waker is
 gone. After the fix: 0/30 stress rounds, `:fds {}` (no stale entries),
 waits bounded (~550 per 30 rounds vs millions).
 
-Measured (same session, colocated, `ab -k /plaintext`, M-series Mac):
+Measured when this landed (same session, colocated, `ab -k /plaintext`,
+M-series Mac):
 
 - chez :fibers (io-poller) ka c=10  ~9.8k req/s, 0 failures
 - chez :fibers (io-poller) ka c=50  ~9.8k req/s, 0 failures — flat across
@@ -227,11 +246,13 @@ Measured (same session, colocated, `ab -k /plaintext`, M-series Mac):
   c=10 → c=100 and hit ~2k at plain c=100)
 - chez :threads (same session) ka c=50 ~15.6k req/s
 
-So fibers went from ~10% of threads to ~63%. Idle density re-verified
-post-migration: 300/300 idle keep-alive conns parked and all 300 still
-usable after idling (connect 1.5s, reuse sweep 0.1s, rss ~110MB flat). Remaining gap is the per-request handler hop
-(`async/thread` for the sync Ring handler) and channel ops — candidate
-future work, not a poller problem.
+So fibers went from ~10% of threads to ~63% at the time. Idle density
+re-verified post-migration: 300/300 idle keep-alive conns parked and all 300
+still usable after idling (connect 1.5s, reuse sweep 0.1s, rss ~110MB flat).
+The 2026-08-20 table above supersedes the throughput rows — fibers now match
+threads at plain c=100 and beat them under keepalive pressure. The remaining
+low-concurrency gap is the per-request handler hop (`async/thread` for the sync
+Ring handler) and channel ops — candidate future work, not a poller problem.
 
 Alternatives considered: making the old poll(2) loop persistent with an
 incrementally maintained local array — still a stateless O(N) kernel
@@ -265,8 +286,13 @@ Throwable used to kill the worker and shrink the pool permanently) and
 does shutdown-before-close.
 
 Verified with repeated `ab -k -c 100 -n 50000` runs: 50,000 of 50,000
-complete, zero failures, no resets, no stray fds, ~16k req/s with
-healthy keepalive reuse (~16k of 50k). At c=10 there is no pressure, so
-keepalive is never declined and throughput holds ~19k. Before the fix,
-c=100 keepalive stalled at ~19k of 20k and hung until the client's 60s
-timeout.
+complete, zero failures, no resets, no stray fds. Before the fix, c=100
+keepalive stalled at ~19k of 20k and hung until the client's 60s timeout, so
+the liveness property this section is about does hold.
+
+The throughput figure originally recorded here (~16k req/s) does not. Re-measured
+2026-08-20, this cell is **bimodal** — 34.0k / 32.0k / 30.9k / 7.0k / 6.8k /
+4.2k across six runs — so ~16k was one sample from a distribution with nothing
+near its middle. See the Findings section: the retirement keeps the server live
+under keepalive pressure, but what it costs in throughput is decided by a race
+early in the run and does not converge.

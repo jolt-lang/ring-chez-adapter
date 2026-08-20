@@ -1,6 +1,6 @@
 {:paths ["src"]
  :deps
- {luminus/ring-undertow-adapter {:mvn/version "1.5.2"}
+ {ring/ring-jetty-adapter {:mvn/version "1.15.5"}
   ring/ring-core {:mvn/version "1.15.5"}}
  :aliases
  {:run {:main-opts ["-m" "bench.server"]}
