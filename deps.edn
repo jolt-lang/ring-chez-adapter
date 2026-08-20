@@ -20,6 +20,7 @@
                                 {:git/url "https://github.com/jolt-lang/http-client"
                                 :git/sha "af407efe3006febcb561bc1ac6a393c6bad6f41c"}}
                    :main-opts ["-m" "ring-chez.adapter-test"]}
-           :bench {:main-opts ["-m" "ring-chez.bench"]}}
+           :bench {:extra-paths ["test"]
+                   :main-opts ["-m" "ring-chez.bench"]}}
 
  :tasks {test "jolt -M:test"}}
