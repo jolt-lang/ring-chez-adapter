@@ -9,52 +9,135 @@
             [jolt.io-poller :as poller]
             [jolt.ffi :as ffi]))
 
-(defn- content-length [text hdr-end]
-  (let [hdrs (str/lower-case (subs text 0 hdr-end))
-        i (str/index-of hdrs "content-length:")]
-    (if-not i
-      0
-      (let [s (+ i (count "content-length:"))
-            e (loop [j s] (if (or (>= j (count hdrs))
-                                   (= \return (nth hdrs j)) (= \newline (nth hdrs j))) j (recur (inc j))))]
-        (or (parse-long (str/trim (subs hdrs s e))) 0)))))
+(defn- head-lines
+  "The head's header lines, request line dropped. Hand-rolled rather than
+   str/split — this runs on every request, and the regex split cost ~8x the
+   whole rest of the framing decision."
+  [head]
+  (let [n (count head)]
+    (loop [i (if-let [b (str/index-of head "\r\n")] (+ b 2) n)
+           out []]
+      (if (>= i n)
+        out
+        (let [e (or (str/index-of head "\r\n" i) n)]
+          (recur (+ e 2) (conj out (subs head i e))))))))
+
+(defn- framing-headers
+  "The head's Content-Length / Transfer-Encoding values, keyed by field name.
+   Reading the field name off each line — rather than scanning the whole head
+   for \"content-length:\" — keeps a value like \"X-Note: content-length: 9\"
+   from being mistaken for framing."
+  [head]
+  (reduce (fn [m line]
+            (let [i (str/index-of line ":")]
+              (if-not (and i (pos? i))
+                m
+                (let [k (str/lower-case (str/trim (subs line 0 i)))]
+                  (if (or (= k "content-length") (= k "transfer-encoding"))
+                    (update m k (fnil conj []) (str/trim (subs line (inc i))))
+                    m)))))
+          {} (head-lines head)))
+
+(defn- body-framing
+  "Octets of body the head declares: 0 when it carries no Content-Length,
+   :bad when the framing is unrecoverable (a Content-Length that is not a
+   single non-negative integer — RFC 7230 §3.3.3), :unsupported when it
+   declares a Transfer-Encoding. Chunked decoding is not implemented, and
+   framing such a request by its Content-Length (or as bodyless) would let
+   the undecoded body through as a second, forged request."
+  [head]
+  (let [named (framing-headers head)
+        cls (get named "content-length")
+        lens (map #(let [n (parse-long %)] (when (and n (not (neg? n))) n)) cls)]
+    (cond
+      (contains? named "transfer-encoding") :unsupported
+      (empty? cls) 0
+      (some nil? lens) :bad
+      (apply = lens) (first lens)
+      :else :bad)))
+
+(def no-bytes (byte-array 0))
+
+(defn- append-bytes
+  "acc plus the first n bytes sitting in the FFI buffer buf."
+  [^bytes acc buf n]
+  (let [have (alength acc)]
+    (if (zero? have)
+      (ffi/read-array buf n)
+      (let [out (byte-array (+ have n))]
+        (System/arraycopy acc 0 out 0 have)
+        (System/arraycopy (ffi/read-array buf n) 0 out have n)
+        out))))
+
+(defn- head-end
+  "Index of the \r\n\r\n that ends the request head, or nil. from skips the
+  prefix an earlier pass already scanned (callers back it off by 3 so a
+  terminator straddling the seam is still seen)."
+  [^bytes bs from]
+  (let [last-start (- (alength bs) 4)]
+    (loop [i (max 0 from)]
+      (when (<= i last-start)
+        (if (and (= 13 (aget bs i))       (= 10 (aget bs (+ i 1)))
+                 (= 13 (aget bs (+ i 2))) (= 10 (aget bs (+ i 3))))
+          i
+          (recur (inc i)))))))
 
 ;; read one complete request from conn; acc carries unconsumed bytes from a
-;; previous read (pipelined requests). recv! abstracts the blocking read:
+;; previous read (pipelined requests). Accumulation is raw octets, not a
+;; decoded string: Content-Length counts octets, and a multibyte codepoint
+;; may straddle two recv calls — decoding each chunk on its own would both
+;; mis-frame the body and corrupt it. recv! abstracts the blocking read:
 ;; the threads strategy passes plain c-recv, the fiber strategy passes a
 ;; poller-parking variant. idle-recv! handles the first read of the next
 ;; request on an idle keep-alive connection — under the threads strategy it
 ;; waits in poll(2) slices so a queued connection can retire the idle one
 ;; promptly instead of waiting out the full keep-alive timeout. Returns
-;; {:text t :leftover s} when a full request (headers + Content-Length body)
+;; {:text t :leftover bs} when a full request (headers + Content-Length body)
 ;; is available, :closed when the peer went away (or recv timed out) before
-;; sending anything, :bad on EOF/timeout mid-request.
+;; sending anything, :bad on EOF/timeout mid-request or an unframeable head,
+;; :unsupported for a Transfer-Encoding we do not decode.
 (defn read-request
   "Reads one request (head + content-length body). Accumulation is capped at
   max-bytes — a client that never terminates (or ships an oversized request)
-  gets :too-big instead of exhausting memory."
+  gets :too-big instead of exhausting memory. acc and :leftover are byte
+  arrays; :text is the framed request decoded as UTF-8."
   [conn acc max-bytes recv! idle-recv!]
   (let [buf (ffi/alloc socket/bufsize)]
     (try
-      (loop [acc acc]
-        (if-let [hdr-end (str/index-of acc "\r\n\r\n")]
-          (let [cl (content-length acc hdr-end)]
-            (if (>= (- (count acc) (+ hdr-end 4)) cl)
-              {:text (subs acc 0 (+ hdr-end 4 cl))
-               :leftover (subs acc (+ hdr-end 4 cl))}
-              (if (> (+ (count acc) cl) max-bytes)
-                :too-big                    ; body exceeds the cap -> 413
-                (let [n (recv! conn buf)]
-                  (if (pos? n)
-                    (recur (str acc (ffi/read-bytes buf n)))
-                    :bad)))))
-          (if (> (count acc) max-bytes)
-            :headers-too-big              ; headers never ended -> 431
-            (let [n ((if (str/blank? acc) idle-recv! recv!) conn buf)]
-              (cond
-                (pos? n) (recur (str acc (ffi/read-bytes buf n)))
-                (str/blank? acc) :closed
-                :else :bad)))))
+      ;; scanned: how far into acc the head-terminator search already ran.
+      ;; frame: the whole request's length in octets, resolved once the head
+      ;; is complete (not re-parsed on every trickle of the body).
+      (loop [^bytes acc acc, scanned 0, frame nil]
+        (let [have  (alength acc)
+              frame (or frame
+                        (when-let [he (head-end acc scanned)]
+                          (let [f (body-framing (String. acc 0 he "UTF-8"))]
+                            (if (number? f) (+ he 4 f) f))))]
+          (cond
+            (keyword? frame) frame          ; :bad -> 400, :unsupported -> 501
+
+            (nil? frame)                    ; head still incomplete
+            (if (> have max-bytes)
+              :headers-too-big              ; headers never ended -> 431
+              (let [n ((if (zero? have) idle-recv! recv!) conn buf)]
+                (cond
+                  (pos? n) (recur (append-bytes acc buf n) (max 0 (- have 3)) nil)
+                  (zero? have) :closed
+                  :else :bad)))
+
+            (> frame max-bytes) :too-big    ; declared request exceeds the cap -> 413
+
+            (>= have frame)
+            {:text (String. acc 0 frame "UTF-8")
+             :leftover (if (= have frame)
+                         no-bytes
+                         (java.util.Arrays/copyOfRange acc frame have))}
+
+            :else
+            (let [n (recv! conn buf)]
+              (if (pos? n)
+                (recur (append-bytes acc buf n) scanned frame)
+                :bad)))))
       (finally (ffi/free buf)))))
 
 ;; --- request -> Ring map ----------------------------------------------------

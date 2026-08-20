@@ -68,6 +68,20 @@
           (when (pos? sent) (recur (+ off sent))))))
     (ffi/free buf)))
 
+;; Responses accumulate as raw bytes and decode once, at the end: Content-Length
+;; is an octet count, and a multibyte codepoint can straddle two recv calls.
+;; ISO-8859-1 is byte-transparent, so scanning that view keeps the index
+;; arithmetic below equal to byte offsets.
+(defn- latin1 [^bytes bs] (String. bs "ISO-8859-1"))
+
+(defn- bcat [^bytes a ^bytes b]
+  (let [out (byte-array (+ (alength a) (alength b)))]
+    (System/arraycopy a 0 out 0 (alength a))
+    (System/arraycopy b 0 out (alength a) (alength b))
+    out))
+
+(def ^:private no-bytes (byte-array 0))
+
 (defn client-recv
   "Read until response looks complete: headers + Content-Length body, or
   connection closed / recv timeout. Returns the accumulated string
@@ -75,28 +89,27 @@
   [fd]
   (let [buf (ffi/alloc 65536)]
     (try
-      (loop [acc ""]
-        (if-let [hdr-end (str/index-of acc "\r\n\r\n")]
-          (let [hdrs (str/lower-case (subs acc 0 hdr-end))
-                i    (str/index-of hdrs "content-length:")
-                need (if i
-                       (let [s (+ i (count "content-length:"))
-                             e (loop [j s] (if (or (>= j (count hdrs))
-                                                   (= \return (nth hdrs j))
-                                                   (= \newline (nth hdrs j)))
-                                             j (recur (inc j))))]
-                         (or (parse-long (str/trim (subs hdrs s e))) 0))
-                       0)]
-            (if (>= (- (count acc) (+ hdr-end 4)) need)
-              acc
-              (let [n (t-recv fd buf 65536 0)]
-                (cond (pos? n) (recur (str acc (ffi/read-bytes buf n)))
-                      (zero? n) acc
-                      :else (if (pos? (count acc)) acc nil)))))
-          (let [n (t-recv fd buf 65536 0)]
-            (cond (pos? n) (recur (str acc (ffi/read-bytes buf n)))
-                  (zero? n) acc
-                  :else (if (pos? (count acc)) acc nil)))))
+      (loop [acc no-bytes]
+        (let [view    (latin1 acc)
+              hdr-end (str/index-of view "\r\n\r\n")
+              done?   (when hdr-end
+                        (let [hdrs (str/lower-case (subs view 0 hdr-end))
+                              i    (str/index-of hdrs "content-length:")
+                              need (if i
+                                     (let [s (+ i (count "content-length:"))
+                                           e (loop [j s] (if (or (>= j (count hdrs))
+                                                                 (= \return (nth hdrs j))
+                                                                 (= \newline (nth hdrs j)))
+                                                           j (recur (inc j))))]
+                                       (or (parse-long (str/trim (subs hdrs s e))) 0))
+                                     0)]
+                          (>= (- (alength acc) (+ hdr-end 4)) need)))]
+          (if done?
+            (String. acc "UTF-8")
+            (let [n (t-recv fd buf 65536 0)]
+              (cond (pos? n)  (recur (bcat acc (ffi/read-array buf n)))
+                    (zero? n) (String. acc "UTF-8")
+                    :else     (when (pos? (alength acc)) (String. acc "UTF-8")))))))
       (finally (ffi/free buf)))))
 
 (defn client-close [fd] (t-close fd))
@@ -165,15 +178,16 @@
   "Read until marker is seen in the accumulated bytes (returns the whole
   accumulation), or the connection closes / recv times out."
   [fd marker]
-  (let [buf (ffi/alloc 65536)]
+  (let [buf (ffi/alloc 65536)
+        needle (latin1 (.getBytes ^String marker "UTF-8"))]
     (try
-      (loop [acc ""]
-        (if (str/includes? acc marker)
-          acc
+      (loop [acc no-bytes]
+        (if (str/includes? (latin1 acc) needle)
+          (String. acc "UTF-8")
           (let [n (t-recv fd buf 65536 0)]
             (if (pos? n)
-              (recur (str acc (ffi/read-bytes buf n)))
-              acc))))
+              (recur (bcat acc (ffi/read-array buf n)))
+              (String. acc "UTF-8")))))
       (finally (ffi/free buf)))))
 
 (defn client-recv-all
@@ -182,11 +196,11 @@
   [fd]
   (let [buf (ffi/alloc 65536)]
     (try
-      (loop [acc ""]
+      (loop [acc no-bytes]
         (let [n (t-recv fd buf 65536 0)]
           (if (pos? n)
-            (recur (str acc (ffi/read-bytes buf n)))
-            acc)))
+            (recur (bcat acc (ffi/read-array buf n)))
+            (String. acc "UTF-8"))))
       (finally (ffi/free buf)))))
 
 (def failures (atom 0))
@@ -1190,6 +1204,152 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+;; --- UTF-8 request framing ----------------------------------------------------
+
+(def ^:private em-dash "\u2014")            ; 1 character, 3 UTF-8 octets
+
+(defn- echo-body-handler [req]
+  (let [body (if-let [b (:body req)] (slurp b) "")]
+    {:status 200
+     :headers {"Content-Type" "text/plain; charset=utf-8"
+               "X-Body-Octets" (str (alength (.getBytes ^String body "UTF-8")))
+               "X-Body-Chars" (str (count body))}
+     :body body}))
+
+(defn- utf8-request [path body]
+  (str "POST " path " HTTP/1.1\r\nHost: t\r\n"
+       "Content-Type: application/json\r\n"
+       "Content-Length: " (alength (.getBytes ^String body "UTF-8")) "\r\n\r\n"
+       body))
+
+(defn- byte-vals
+  "wire[from,to) as unsigned ints, for t-send-bytes."
+  [^bytes wire from to]
+  (map #(bit-and 0xff (long (aget wire %))) (range from to)))
+
+(defn test-utf8-request-body []
+  ;; Content-Length is octets; framing the body by character count leaves the
+  ;; server waiting for bytes that already arrived, and it 400s on timeout
+  (let [server (adapter/run-server echo-body-handler
+                                   {:port 8446 :worker-threads 1
+                                    :keep-alive-timeout-ms 1000})]
+    (try
+      (Thread/sleep 250)
+      (let [body (str "{\"text\":\"" em-dash "\"}")
+            fd (client-connect 8446 3000)
+            _ (client-send fd (utf8-request "/" body))
+            r (or (client-recv fd) "")]
+        (check-has "utf8: handler ran" "200 OK" r)
+        (check-has "utf8: body framed by octets" "X-Body-Octets: 14" r)
+        (check-has "utf8: body decoded as 12 characters" "X-Body-Chars: 12" r)
+        (check-has "utf8: body echoed intact" body r)
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-utf8-split-across-reads []
+  ;; the em dash's three octets land in two different recv() calls: decoding
+  ;; each chunk on its own corrupts the codepoint
+  (let [server (adapter/run-server echo-body-handler
+                                   {:port 8447 :worker-threads 1
+                                    :keep-alive-timeout-ms 2000})]
+    (try
+      (Thread/sleep 250)
+      (let [body (str "{\"text\":\"" em-dash "\"}")
+            wire (.getBytes ^String (utf8-request "/" body) "UTF-8")
+            cut (- (alength wire) 4)         ; after the em dash's first octet
+            fd (client-connect 8447 3000)]
+        (t-send-bytes fd (byte-vals wire 0 cut))
+        (Thread/sleep 150)                   ; force the server to recv twice
+        (t-send-bytes fd (byte-vals wire cut (alength wire)))
+        (let [r (or (client-recv fd) "")]
+          (check-has "utf8 split: handler ran" "200 OK" r)
+          (check-has "utf8 split: octets intact" "X-Body-Octets: 14" r)
+          (check-has "utf8 split: codepoint intact" body r))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-utf8-pipelined []
+  ;; leftover must be carried as bytes: slicing it by character count shifts
+  ;; the second request's frame
+  (let [server (adapter/run-server echo-body-handler
+                                   {:port 8448 :worker-threads 1
+                                    :keep-alive-timeout-ms 2000})]
+    (try
+      (Thread/sleep 250)
+      (let [b1 (str "{\"a\":\"" em-dash "\"}")
+            b2 "{\"b\":\"\u65e5\u672c\u8a9e\"}"
+            fd (client-connect 8448 3000)]
+        (client-send fd (str (utf8-request "/one" b1) (utf8-request "/two" b2)))
+        (let [r (client-recv-until fd b2)]
+          (check-has "utf8 pipelined: first body" b1 r)
+          (check-has "utf8 pipelined: second body" b2 r))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-utf8-large-body []
+  ;; a body spanning many recv buffers, every chunk boundary a coin flip on
+  ;; landing mid-codepoint
+  (let [server (adapter/run-server echo-body-handler
+                                   {:port 8449 :worker-threads 1
+                                    :keep-alive-timeout-ms 5000})]
+    (try
+      (Thread/sleep 250)
+      (let [body (apply str (repeat 40000 em-dash))    ; 120000 octets
+            fd (client-connect 8449 8000)
+            _ (client-send fd (utf8-request "/" body))
+            r (or (client-recv fd) "")]
+        (check-has "utf8 large: octet count" "X-Body-Octets: 120000" r)
+        (check-has "utf8 large: char count" "X-Body-Chars: 40000" r)
+        (check "utf8 large: body round-trips" true (str/includes? r body))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-utf8-fiber-request-body []
+  (let [server (adapter/run-server echo-body-handler
+                                   {:port 8450 :strategy :fibers
+                                    :keep-alive-timeout-ms 2000})]
+    (try
+      (Thread/sleep 250)
+      (let [body (str "{\"text\":\"" em-dash "\"}")
+            fd (client-connect 8450 3000)
+            _ (client-send fd (utf8-request "/" body))
+            r (or (client-recv fd) "")]
+        (check-has "utf8 fiber: handler ran" "200 OK" r)
+        (check-has "utf8 fiber: body echoed intact" body r)
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-unframeable-requests []
+  ;; a head whose Content-Length cannot be trusted must not be framed by
+  ;; guesswork: the leftover would be served as a second, forged request
+  (let [server (adapter/run-server echo-body-handler
+                                   {:port 8451 :worker-threads 1
+                                    :keep-alive-timeout-ms 1000})
+        ask (fn [head]
+              (let [fd (client-connect 8451 3000)]
+                (client-send fd head)
+                (let [r (or (client-recv-until fd "\r\n\r\n") "")]
+                  (client-close fd)
+                  r)))]
+    (try
+      (Thread/sleep 250)
+      (check-has "framing: non-numeric Content-Length is 400"
+                 "400" (ask "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: abc\r\n\r\n"))
+      (check-has "framing: negative Content-Length is 400"
+                 "400" (ask "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: -5\r\n\r\nhello"))
+      (check-has "framing: conflicting Content-Lengths are 400"
+                 "400" (ask (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                                 "Content-Length: 5\r\nContent-Length: 7\r\n\r\nhello")))
+      (check-has "framing: Transfer-Encoding is 501"
+                 "501" (ask (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                                 "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")))
+      ;; a header whose *value* mentions content-length must not be mistaken
+      ;; for framing — that request has no body at all
+      (check-has "framing: content-length in a value is not framing"
+                 "X-Body-Octets: 0"
+                 (ask "GET / HTTP/1.1\r\nHost: t\r\nX-Note: content-length: 9\r\n\r\n"))
+      (finally (adapter/stop-server server)))))
+
 (defn -main [& _]
   (println "ring adapter over jolt.ffi sockets")
 
@@ -1269,6 +1429,14 @@
   (test-ws-guard-throw-is-request-failure)
   (test-write-timeout-cuts-stalled-peer)
   (test-write-timeout-zero-disables)
+
+  ;; --- UTF-8 request framing ---
+  (test-utf8-request-body)
+  (test-utf8-split-across-reads)
+  (test-utf8-pipelined)
+  (test-utf8-large-body)
+  (test-utf8-fiber-request-body)
+  (test-unframeable-requests)
 
   (if (zero? @failures)
     (println "all passed")

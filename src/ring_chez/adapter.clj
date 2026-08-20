@@ -130,7 +130,7 @@
   (let [recv!      (:recv! io)
         idle-recv! (or (:idle-recv! io) recv!)
         send!      (or (:send! io) http/send-all)]
-    (loop [acc ""]
+    (loop [acc http/no-bytes]
       ;; deadline: this request (idle wait or mid-request trickle) must finish
       ;; within ka-ms of starting — the fibers-strategy sweeper closes the conn
       ;; past it (a parked read wakes as :closed). nil on the threads strategy,
@@ -149,6 +149,10 @@
                                                {:status 431 :headers {"Content-Type" "text/plain"
                                                                       "Connection" "close"}
                                                 :body "Request Header Fields Too Large"} false))
+          (= :unsupported r) (send! conn (http/response->string
+                                           {:status 501 :headers {"Content-Type" "text/plain"
+                                                                  "Connection" "close"}
+                                            :body "Not Implemented"} false))
           (map? r)
           (let [{:keys [request error]} (http/request->ring (:text r) port)]
             (cond
@@ -199,7 +203,7 @@
                     ;; buffered — serving that costs no park.
                     resp (if (and (io :under-pressure?) ((io :under-pressure?))
                                   (http/keep-alive? request)
-                                  (str/blank? (:leftover r)))
+                                  (zero? (alength ^bytes (:leftover r))))
                            (update resp :headers #(assoc (or % {}) "Connection" "close"))
                            resp)]
                 (when (http/send-response conn request resp (:take! io) send!)

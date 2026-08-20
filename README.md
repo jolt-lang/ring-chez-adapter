@@ -84,6 +84,13 @@ never frame a body. Malformed requests get `400`, unknown HTTP versions `505`,
 and a handler-supplied `Connection: close` header is honored (the connection
 closes after that response).
 
+Requests are framed in octets: the socket accumulates raw bytes and only the
+completed request is decoded as UTF-8, so a multibyte body matches its
+`Content-Length` and a codepoint split across two reads survives. A request
+whose `Content-Length` is missing is treated as bodyless; one that is not a
+single non-negative integer gets `400`. `Transfer-Encoding` is not decoded —
+such a request gets `501` rather than being framed by guesswork.
+
 ## Error handling
 
 Every abnormal handler completion — a handler throw, a `nil` response (an
