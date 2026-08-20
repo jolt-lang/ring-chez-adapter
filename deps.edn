@@ -14,11 +14,15 @@
                                :git/sha "0adae49db6064180374ffdcfc72b5b9ac01888cd"}}
 
  ;; The test drives the server with the jolt-lang/http-client library (jolt no
- ;; longer ships a built-in HTTP client).
+ ;; longer ships a built-in HTTP client). v0.0.4 or newer matters here: earlier
+ ;; versions replace java.io.ByteArrayInputStream process-wide with a shim, so
+ ;; the SUITE's request bodies (not an app's — this dep is test-only) were a
+ ;; stream ~1300x slower to drain and without .readAllBytes.
   :aliases {:test {:extra-paths ["test"]
                    :extra-deps {jolt-lang/http-client
                                 {:git/url "https://github.com/jolt-lang/http-client"
-                                :git/sha "af407efe3006febcb561bc1ac6a393c6bad6f41c"}}
+                                :git/tag "v0.0.4"
+                                :git/sha "93e2b253ccd4d960e5fd631e966ff7b3caac9355"}}
                    :main-opts ["-m" "ring-chez.adapter-test"]}
            :bench {:extra-paths ["test"]
                    :main-opts ["-m" "ring-chez.bench"]}}
