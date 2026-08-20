@@ -105,9 +105,19 @@ Requests are framed in octets: the socket accumulates raw bytes, and only the
 head — which RFC 7230 restricts to ASCII — is decoded (as UTF-8). So a
 multibyte body matches its `Content-Length`, and a codepoint split across two
 reads survives. A request whose `Content-Length` is missing is treated as
-bodyless; one that is not a single non-negative integer gets `400`.
-`Transfer-Encoding` is not decoded — such a request gets `501` rather than
-being framed by guesswork.
+bodyless; one that is not one or more identical non-negative integers gets
+`400`. `Transfer-Encoding: chunked` is decoded, with optional trailers
+validated and dropped; any other transfer coding gets `501` rather than being
+framed by guesswork. `Expect: 100-continue` is answered with the interim
+response before the body is collected.
+
+The head is parsed strictly, because a framing decision is only as trustworthy
+as the parse behind it. A bare LF, a stray CR, an obs-fold continuation line, a
+header name that is not a token, a request declaring both `Content-Length` and
+`Transfer-Encoding`, or chunked framing on HTTP/1.0 all get `400` — each is a
+case where this server and an intermediary in front of it could read the same
+bytes as different messages. Repeated headers coalesce into one comma-joined
+value rather than the last one winning.
 
 `:remote-addr` is the peer address `accept(2)` reported, and `:server-name`
 the host the client asked for (the `Host` header, port stripped), falling back
@@ -244,5 +254,5 @@ requests go to the Ring handler as usual.
 ## Test
 
 ```bash
-jolt -M:test   # 311 checks; drives the server over raw sockets + http-client
+jolt -M:test   # 335 checks; drives the server over raw sockets + http-client
 ```
