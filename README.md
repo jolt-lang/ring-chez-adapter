@@ -92,11 +92,27 @@ bodyless; one that is not a single non-negative integer gets `400`.
 `Transfer-Encoding` is not decoded — such a request gets `501` rather than
 being framed by guesswork.
 
-`:body` is a `java.io.InputStream` over the body's own octets (`nil` when the
-request has no body), so an upload stays byte-exact — an image, a gzip stream,
-or text in some charset other than UTF-8 all arrive as sent. `slurp` it for
-text (UTF-8 by default), or `clojure.java.io/copy` it for bytes. Note that
-`.readAllBytes` does not resolve under jolt; use `copy` or `.read`.
+The request `:body` is a `java.io.InputStream` over the body's own octets
+(`nil` when the request has no body), so an upload stays byte-exact — an
+image, a gzip stream, or text in some charset other than UTF-8 all arrive as
+sent. `slurp` it for text (UTF-8 by default), or `clojure.java.io/copy` it for
+bytes. Note that `.readAllBytes` does not resolve under jolt; use `copy` or
+`.read`.
+
+Response bodies work the same way in reverse. A `String` is encoded as UTF-8;
+a byte array, `InputStream`, or `File` is served as its own octets; a
+seq/vector contributes each element's octets in turn. `Content-Length` counts
+what actually goes on the wire, so serving a PNG is just:
+
+```clojure
+{:status 200
+ :headers {"Content-Type" "image/png"}
+ :body (clojure.java.io/file "logo.png")}
+```
+
+Channel bodies (see below) may yield strings or byte arrays; each chunk's
+size line counts its octets. Anything else on a channel throws, which closes
+that connection rather than writing garbage into the stream.
 
 ## Error handling
 

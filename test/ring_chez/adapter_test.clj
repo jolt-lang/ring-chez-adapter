@@ -83,10 +83,10 @@
 
 (def ^:private no-bytes (byte-array 0))
 
-(defn client-recv
+(defn client-recv-raw
   "Read until response looks complete: headers + Content-Length body, or
-  connection closed / recv timeout. Returns the accumulated string
-  (\"\" when peer closed immediately, nil on timeout with nothing)."
+  connection closed / recv timeout. Returns the raw response octets — a
+  binary body does not survive a UTF-8 decode (nil on timeout with nothing)."
   [fd]
   (let [buf (ffi/alloc 65536)]
     (try
@@ -106,12 +106,32 @@
                                      0)]
                           (>= (- (alength acc) (+ hdr-end 4)) need)))]
           (if done?
-            (String. acc "UTF-8")
+            acc
             (let [n (t-recv fd buf 65536 0)]
               (cond (pos? n)  (recur (bcat acc (ffi/read-array buf n)))
-                    (zero? n) (String. acc "UTF-8")
-                    :else     (when (pos? (alength acc)) (String. acc "UTF-8")))))))
+                    (zero? n) acc
+                    :else     (when (pos? (alength acc)) acc))))))
       (finally (ffi/free buf)))))
+
+(defn client-recv
+  "client-recv-raw decoded as UTF-8 (\"\" when the peer closed immediately,
+  nil on timeout with nothing)."
+  [fd]
+  (some-> (client-recv-raw fd) (String. "UTF-8")))
+
+(defn response-body-bytes
+  "The body octets of a raw response, framed by its Content-Length."
+  [^bytes raw]
+  (let [view (latin1 raw)
+        hdr-end (str/index-of view "\r\n\r\n")
+        from (+ hdr-end 4)
+        i (str/index-of (str/lower-case (subs view 0 hdr-end)) "content-length:")
+        len (if i
+              (let [s (+ i (count "content-length:"))
+                    e (str/index-of view "\r\n" s)]
+                (parse-long (str/trim (subs view s e))))
+              (- (alength raw) from))]
+    (java.util.Arrays/copyOfRange raw from (+ from len))))
 
 (defn client-close [fd] (t-close fd))
 
@@ -175,21 +195,39 @@
                       (+ (bit-shift-left (first ext) 8) (second ext)) -1)]
             {:opcode opcode :masked masked? :payload (t-recv-n fd len)}))))))
 
-(defn client-recv-until
+(defn client-recv-until-bytes
   "Read until marker is seen in the accumulated bytes (returns the whole
-  accumulation), or the connection closes / recv times out."
+  accumulation as octets), or the connection closes / recv times out."
   [fd marker]
   (let [buf (ffi/alloc 65536)
         needle (latin1 (.getBytes ^String marker "UTF-8"))]
     (try
       (loop [acc no-bytes]
         (if (str/includes? (latin1 acc) needle)
-          (String. acc "UTF-8")
+          acc
           (let [n (t-recv fd buf 65536 0)]
             (if (pos? n)
               (recur (bcat acc (ffi/read-array buf n)))
-              (String. acc "UTF-8")))))
+              acc))))
       (finally (ffi/free buf)))))
+
+(defn client-recv-until
+  "client-recv-until-bytes decoded as UTF-8."
+  [fd marker]
+  (String. (client-recv-until-bytes fd marker) "UTF-8"))
+
+(defn dechunk
+  "A chunked transfer body -> the octets it carries."
+  [^bytes body]
+  (let [view (latin1 body)
+        out (java.io.ByteArrayOutputStream.)]
+    (loop [i 0]
+      (let [e (str/index-of view "\r\n" i)
+            n (Long/parseLong (str/trim (subs view i e)) 16)]
+        (when (pos? n)
+          (.write out body (+ e 2) n)
+          (recur (+ e 2 n 2)))))
+    (.toByteArray out)))
 
 (defn client-recv-all
   "Read until the connection closes (returns everything) or recv times out
@@ -1404,6 +1442,96 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+;; --- binary response bodies ---------------------------------------------------
+
+;; PNG magic + IEND: real bytes no charset survives
+(def ^:private png-bytes
+  [0x89 0x50 0x4e 0x47 0x0d 0x0a 0x1a 0x0a 0x00 0x00 0x00 0x0d
+   0xff 0xd8 0xff 0xe0 0x80 0xc3 0x28 0x00])
+
+(defn- unsigned->bytes [vs]
+  (byte-array (map #(byte (if (> % 127) (- % 256) %)) vs)))
+
+(defn- binary-response-handler [req]
+  (let [bs (unsigned->bytes png-bytes)]
+    (case (:uri req)
+      "/bytes"  {:status 200 :headers {"Content-Type" "image/png"} :body bs}
+      "/stream" {:status 200 :headers {"Content-Type" "image/png"}
+                 :body (java.io.ByteArrayInputStream. bs)}
+      "/file"   (let [f (java.io.File/createTempFile "ring-chez" ".bin")]
+                  (io/copy bs f)
+                  (.deleteOnExit f)
+                  {:status 200 :headers {"Content-Type" "application/octet-stream"} :body f})
+      "/seq"    {:status 200 :headers {"Content-Type" "application/octet-stream"}
+                 :body [(unsigned->bytes (take 10 png-bytes))
+                        (unsigned->bytes (drop 10 png-bytes))]}
+      "/chunks" (let [ch (a/chan)]
+                  (a/go (a/>! ch (unsigned->bytes (take 10 png-bytes)))
+                        (a/>! ch (unsigned->bytes (drop 10 png-bytes)))
+                        (a/close! ch))
+                  {:status 200 :headers {"Content-Type" "image/png"} :body ch})
+      "/echo"   {:status 200 :headers {"Content-Type" "application/octet-stream"}
+                 :body (drain (:body req))}
+      {:status 404 :body "nope"})))
+
+(defn test-binary-response-body []
+  (let [server (adapter/run-server binary-response-handler
+                                   {:port 8453 :worker-threads 1
+                                    :keep-alive-timeout-ms 2000})
+        get-raw (fn [path]
+                  (let [fd (client-connect 8453 3000)]
+                    (client-send fd (str "GET " path " HTTP/1.1\r\nHost: t\r\n\r\n"))
+                    (let [raw (client-recv-raw fd)] (client-close fd) raw)))]
+    (try
+      (Thread/sleep 250)
+      (doseq [[path label] [["/bytes" "byte-array"] ["/stream" "InputStream"]
+                            ["/file" "File"] ["/seq" "seq of byte-arrays"]]]
+        (let [raw (get-raw path)]
+          (check-has (str "binary resp (" label "): Content-Length is octets")
+                     (str "Content-Length: " (count png-bytes)) (String. raw "ISO-8859-1"))
+          (check (str "binary resp (" label "): body byte-for-byte")
+                 (hex (unsigned->bytes png-bytes)) (hex (response-body-bytes raw)))))
+      (finally (adapter/stop-server server)))))
+
+(defn test-binary-response-chunks []
+  ;; chunked framing sizes each chunk by its octets, and the chunk bytes go
+  ;; out untouched
+  (let [server (adapter/run-server binary-response-handler
+                                   {:port 8454 :worker-threads 1
+                                    :keep-alive-timeout-ms 2000})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8454 3000)]
+        (client-send fd "GET /chunks HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [raw (client-recv-until-bytes fd "0\r\n\r\n")
+              view (latin1 raw)
+              from (+ 4 (str/index-of view "\r\n\r\n"))
+              body (java.util.Arrays/copyOfRange raw from (alength raw))]
+          (check-has "binary chunks: chunked framing" "Transfer-Encoding: chunked" view)
+          ;; wire: a CRLF <10 octets> CRLF a CRLF <10 octets> CRLF 0 CRLF CRLF
+          (check "binary chunks: dechunked body byte-for-byte"
+                 (hex (unsigned->bytes png-bytes)) (hex (dechunk body))))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-binary-round-trip []
+  ;; request body in, same octets back out
+  (let [server (adapter/run-server binary-response-handler
+                                   {:port 8455 :worker-threads 1
+                                    :keep-alive-timeout-ms 2000})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8455 3000)
+            head (str "POST /echo HTTP/1.1\r\nHost: t\r\n"
+                      "Content-Type: application/octet-stream\r\n"
+                      "Content-Length: " (count png-bytes) "\r\n\r\n")]
+        (t-send-bytes fd (concat (utf8-bytes head) png-bytes))
+        (let [raw (client-recv-raw fd)]
+          (check "binary round-trip: octets unchanged"
+                 (hex (unsigned->bytes png-bytes)) (hex (response-body-bytes raw))))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
 (defn -main [& _]
   (println "ring adapter over jolt.ffi sockets")
 
@@ -1492,6 +1620,9 @@
   (test-utf8-fiber-request-body)
   (test-unframeable-requests)
   (test-binary-request-body)
+  (test-binary-response-body)
+  (test-binary-response-chunks)
+  (test-binary-round-trip)
 
   (if (zero? @failures)
     (println "all passed")

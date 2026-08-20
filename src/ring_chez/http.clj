@@ -5,6 +5,7 @@
    behavior of reads and writes is injected by ring-chez.adapter."
   (:require [clojure.string :as str]
             [clojure.core.async :as async]
+            [clojure.java.io :as io]
             [ring-chez.socket :as socket]
             [jolt.io-poller :as poller]
             [jolt.ffi :as ffi]))
@@ -68,6 +69,19 @@
         (System/arraycopy acc 0 out 0 have)
         (System/arraycopy (ffi/read-array buf n) 0 out have n)
         out))))
+
+(defn- concat-bytes
+  "One byte array from several."
+  [arrays]
+  (let [total (loop [as (seq arrays), n 0]
+                (if as (recur (next as) (+ n (alength ^bytes (first as)))) n))
+        out (byte-array total)]
+    (loop [as (seq arrays), off 0]
+      (if-not as
+        out
+        (let [^bytes a (first as)]
+          (System/arraycopy a 0 out off (alength a))
+          (recur (next as) (+ off (alength a))))))))
 
 (defn- head-end
   "Index of the \r\n\r\n that ends the request head, or nil. from skips the
@@ -223,13 +237,25 @@
    507 "Insufficient Storage" 508 "Loop Detected" 510 "Not Extended"
    511 "Network Authentication Required"})
 
-(defn- body->string [b]
-  (cond (nil? b) ""
-        (string? b) b
-        (or (seq? b) (vector? b)) (apply str b)
-        ;; a File / InputStream / Reader body (ring's resource + file responses):
-        ;; read its contents rather than printing the object.
-        :else (try (slurp b) (catch Throwable _ (str b)))))
+(defn- body->bytes
+  "The octets a response body puts on the wire. Strings encode as UTF-8;
+  byte arrays, InputStreams and Files pass through as their own bytes, so an
+  image or a gzip stream is served as sent rather than mangled by a charset
+  round-trip. A seq/vector body contributes each element's octets in turn —
+  for the seq-of-strings Ring defines, that is the same as encoding the
+  concatenation, since UTF-8 concatenates."
+  [b]
+  (cond
+    (nil? b) no-bytes
+    (string? b) (.getBytes ^String b "UTF-8")
+    (bytes? b) b
+    (or (seq? b) (vector? b)) (concat-bytes (mapv body->bytes b))
+    ;; a File / InputStream / Reader body (ring's resource + file responses):
+    ;; copy its contents rather than printing the object.
+    :else (try (let [out (java.io.ByteArrayOutputStream.)]
+                 (io/copy b out)
+                 (.toByteArray out))
+               (catch Throwable _ (.getBytes ^String (str b) "UTF-8")))))
 
 (defn- head->string
   "Response head only. framing: a number (Content-Length), :chunked, or :none
@@ -254,23 +280,29 @@
     (.append sb "\r\n")
     (.toString sb)))
 
-(defn response->string
-  ([resp] (response->string resp false))
+(defn- declared-length
+  "The Content-Length the handler's own headers carry, if any. ring-defaults'
+  wrap-content-length already sets it (as UTF-8 bytes); honor that and only
+  compute when absent, so we never stamp a second, conflicting
+  Content-Length. Middleware commonly sets it as a *string* — normalize to a
+  number, or head->string emits no framing at all and keep-alive clients hang
+  waiting for a body terminator."
+  [resp]
+  (->> (:headers resp)
+       (some (fn [[k v]]
+               (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))]
+                 (when (= kn "content-length")
+                   (if (string? v) (parse-long v) v)))))))
+
+(defn response->parts
+  "The whole response as send-all parts: the head, then the body's octets.
+  Left as parts rather than spliced — send-all writes them back to back into
+  one buffer, so a large body is not copied a second time just to be sent."
+  ([resp] (response->parts resp false))
   ([resp keep-alive?]
-   (let [body (body->string (:body resp))
-          ;; Content-Length is the body's octet count. ring-defaults'
-          ;; wrap-content-length already sets it (as UTF-8 bytes); honor that
-          ;; and only compute when absent, so we never stamp a second, conflicting
-          ;; Content-Length. Middleware commonly sets it as a *string* —
-          ;; normalize to a number, or head->string emits no framing at all
-          ;; and keep-alive clients hang waiting for a body terminator.
-          len (or (->> (:headers resp)
-                       (some (fn [[k v]]
-                               (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))]
-                                 (when (= kn "content-length")
-                                   (if (string? v) (parse-long v) v))))))
-                  (alength (.getBytes body "UTF-8")))]
-     (str (head->string resp keep-alive? len) body))))
+   (let [body (body->bytes (:body resp))
+         len (or (declared-length resp) (alength body))]
+     [(head->string resp keep-alive? len) body])))
 
 ;; Connection headers are comma-separated token lists, case-insensitive
 ;; (RFC 7230 §6.1): "Keep-Alive, Close" means close.
@@ -297,15 +329,27 @@
                      (some #(conn-token? "close" %) v)
                      (conn-token? "close" v))))))))
 
+(defn- part-capacity [p]
+  (if (string? p) (* 4 (count p)) (alength ^bytes p)))   ; UTF-8 worst case 4 bytes/char
+
+(defn- write-part!
+  "Encode p into buf at off; returns the octets written."
+  [buf off p]
+  (if (string? p)
+    (ffi/write-bytes (+ buf off) p)
+    (ffi/write-array (+ buf off) p)))
+
 (defn send-all
-  "Write s to conn; false when the peer is gone (caller closes). wait-write!
-  parks the caller until the socket can take more bytes (fiber strategy,
-  O_NONBLOCK sockets); nil leaves -1 meaning peer-gone (blocking sockets
-  block instead of returning EAGAIN)."
-  ([conn s] (send-all conn s nil))
-  ([conn s wait-write!]
-   (let [buf (ffi/alloc (max 1 (* 4 (count s))))     ; UTF-8 worst case 4 bytes/char
-         n (ffi/write-bytes buf s)
+  "Write data to conn: a string (encoded as UTF-8), a byte array, or a vector
+  of those written back to back. false when the peer is gone (caller closes).
+  wait-write! parks the caller until the socket can take more bytes (fiber
+  strategy, O_NONBLOCK sockets); nil leaves -1 meaning peer-gone (blocking
+  sockets block instead of returning EAGAIN)."
+  ([conn data] (send-all conn data nil))
+  ([conn data wait-write!]
+   (let [parts (if (vector? data) data [data])
+         buf (ffi/alloc (max 1 (reduce (fn [n p] (+ n (part-capacity p))) 0 parts)))
+         n (reduce (fn [off p] (+ off (write-part! buf off p))) 0 parts)
          ok (loop [off 0]
               (if (< off n)
                 (let [sent (socket/c-send conn (+ buf off) (- n off) 0)]
@@ -319,6 +363,23 @@
      (ffi/free buf)
      ok)))
 
+(defn- chunk->bytes
+  "One stream chunk's octets. Chunks are strings or byte arrays — anything
+  else is a handler bug, and throwing hands it to the worker's catch (which
+  abandons the connection) instead of serializing garbage into the stream."
+  [v]
+  (cond
+    (string? v) (.getBytes ^String v "UTF-8")
+    (bytes? v) v
+    :else (throw (ex-info "stream chunk must be a string or byte array"
+                          {:type :ring-chez/bad-chunk :chunk-type (type v)}))))
+
+(defn- chunk-parts
+  "bs wrapped in chunked framing — the size line counts octets, so a
+  multibyte or binary chunk is framed by what actually goes on the wire."
+  [^bytes bs]
+  [(str (format "%x" (alength bs)) "\r\n") bs "\r\n"])
+
 (defn- stream-body
   "Pump a channel body onto conn: chunked framing for HTTP/1.1, raw bytes for
   HTTP/1.0 (close-delimited; caller closes). take! abstracts the channel take
@@ -329,17 +390,15 @@
   false instead of hanging."
   [conn ch http10? take! send!]
   (loop []
-    (let [v (take! ch)]
+    (let [v (take! ch)
+          bs (when (some? v) (chunk->bytes v))]
       (cond
-        ;; closed: end of stream. (empty string chunks carry no data and would
-        ;; frame as a bogus terminator, so skip them)
-        (or (nil? v) (= "" v))
+        ;; closed, or an empty chunk: end of stream. (an empty chunk carries no
+        ;; data and would frame as a bogus terminator)
+        (or (nil? bs) (zero? (alength bs)))
         (if http10? true (send! conn "0\r\n\r\n"))
 
-        (send! conn (if http10?
-                      v
-                      (str (format "%x" (alength (.getBytes ^String v "UTF-8")))
-                           "\r\n" v "\r\n")))
+        (send! conn (if http10? bs (chunk-parts bs)))
         (recur)
 
         :else (do (async/close! ch) false)))))
@@ -375,4 +434,4 @@
       (and (send! conn (head->string resp keep? :none)) keep?)
 
       :else
-      (and (send! conn (response->string resp keep?)) keep?))))
+      (and (send! conn (response->parts resp keep?)) keep?))))
