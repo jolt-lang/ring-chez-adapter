@@ -1200,6 +1200,16 @@
       (ffi/free sa))
     fd))
 
+(defn- t-recv-some
+  "One recv: whatever has arrived, as a string. Blocks until there is
+  something (or the read times out)."
+  [fd]
+  (let [buf (ffi/alloc 65536)]
+    (try
+      (let [n (t-recv fd buf 65536 0)]
+        (if (pos? n) (ffi/read-bytes buf n) ""))
+      (finally (ffi/free buf)))))
+
 (defn- drain-until-eof [fd]
   ;; accumulate until the server closes (recv 0) or a read timeout
   (let [buf (ffi/alloc 65536)]
@@ -1224,13 +1234,22 @@
       (Thread/sleep 250)
       (let [fd (client-connect-tiny-rcvbuf 8442 8000)]
         (client-send fd "GET /big HTTP/1.1\r\nHost: t\r\n\r\n")
-        ;; stall — never read while the body is coming: the tiny rcvbuf and
-        ;; the server sndbuf fill, the blocking send times out at ~300ms,
-        ;; and the server abandons the response and closes
-        (Thread/sleep 1000)
-        (let [r (drain-until-eof fd)]
-          (check "write-timeout: body truncated" true (< (count r) 16777216))
-          (check "write-timeout: some bytes delivered first" true (pos? (count r))))
+        ;; Read just enough to know the send is under way, THEN stall. A fixed
+        ;; sleep is not enough: building a 16MB body and its send buffer can
+        ;; take longer than the stall window on a loaded machine, and a stall
+        ;; that opens before the first byte moves proves nothing — the client
+        ;; then drains at the server's pace and the whole body arrives. That
+        ;; is what made this flaky on CI.
+        (let [head (t-recv-some fd)]
+          (check "write-timeout: response started" true (pos? (count head)))
+          ;; now never read: the tiny rcvbuf and the server sndbuf fill, the
+          ;; blocking send times out at ~300ms, and the server abandons the
+          ;; response and closes
+          (Thread/sleep 1000)
+          (let [r (drain-until-eof fd)
+                total (+ (count head) (count r))]
+            (check "write-timeout: body truncated" true (< total 16777216))
+            (check "write-timeout: some bytes delivered first" true (pos? total))))
         (client-close fd))
       ;; the worker is free again: a fresh request is served promptly
       (let [fd (client-connect 8442 3000)
