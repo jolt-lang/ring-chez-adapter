@@ -203,20 +203,37 @@ test vector) and then your fn owns the connection through a session:
                        (recur)))))})
 ```
 
-- `ws/recv!` blocks for the next message, answers pings automatically, and
-  returns `{:type :text :data s}` / `{:type :binary :data bs}` / `{:type :close}`
-  (`:close` covers peer close — echoed per RFC — timeouts, and vanishes)
-- `ws/send!` sends a text frame, `ws/send-binary!` a binary frame, `ws/close!`
-  a close frame; all return `false` once the peer is gone
+- `ws/recv!` blocks for the next message, answers pings, reassembles
+  fragmented messages, and returns `{:type :text :data s}` /
+  `{:type :binary :data bytes}` / `{:type :close}` (`:close` covers peer close
+  — echoed with the peer's own status code per RFC 6455 §5.5.1 — timeouts, and
+  vanishes). `:binary` data is a byte array.
+- `ws/send!` sends a text frame, `ws/send-binary!` a binary frame (byte array,
+  or any seq of octets), `ws/close!` a close frame; all return `false` once the
+  peer is gone
 - the session runs on the worker thread; when your fn returns the connection
   closes. `:keep-alive-timeout-ms` doubles as the idle read timeout for open
   websocket connections
 
-The handshake is only offered when `:ws-handler` is set; other requests go to
-the Ring handler as usual.
+A message that breaks the protocol never reaches your handler: the connection
+is failed with the RFC's status code and `recv!` answers `{:type :close}`.
+That covers an unmasked client frame, a non-zero RSV bit, an unknown opcode, an
+oversized or non-final control frame, a non-minimal length encoding, and a
+broken fragmentation sequence (all `1002`); invalid UTF-8 in a text message
+(`1007`); and a frame or reassembled message past the caps (`1009`). The caps
+are Igropyr's: 1 MiB per frame, 8 MiB per message, 16384 fragments — a declared
+length is refused from the header alone, so it is never a memory reservation.
+
+The handshake is only offered when `:ws-handler` is set, and only for a
+complete RFC 6455 opening handshake: `GET` over HTTP/1.1, `Upgrade: websocket`,
+an `upgrade` token in `Connection`, `Sec-WebSocket-Version: 13`, and a
+`Sec-WebSocket-Key` that decodes to 16 bytes. A request that reaches for
+websocket without meeting all of that gets `400`, as does an upgrade that also
+declares a request body (its octets would otherwise be read as frames). Other
+requests go to the Ring handler as usual.
 
 ## Test
 
 ```bash
-jolt -M:test   # 268 checks; drives the server over raw sockets + http-client
+jolt -M:test   # 288 checks; drives the server over raw sockets + http-client
 ```

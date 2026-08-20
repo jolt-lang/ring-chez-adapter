@@ -47,11 +47,29 @@
 ;; goes away, sends Connection: close, or the idle recv timeout fires.
 ;; Blocking handler calls park the worker thread, so the pool size is the
 ;; concurrency bound.
-(defn- upgrade-request?
-  "True for an HTTP request asking to switch to websocket."
+(defn- upgrade-attempt?
+  "True for a request that is trying to reach the websocket endpoint at all,
+  well-formed or not. Anything naming websocket in Upgrade, or carrying either
+  of the handshake headers, counts — so a broken handshake is answered as one
+  (400) instead of quietly falling through to the Ring handler."
   [req]
-  (and (= "websocket" (str/lower-case (get-in req [:headers "upgrade"] "")))
-       (get-in req [:headers "sec-websocket-key"])))
+  (or (= "websocket" (str/lower-case (get-in req [:headers "upgrade"] "")))
+      (contains? (:headers req) "sec-websocket-key")
+      (contains? (:headers req) "sec-websocket-version")))
+
+(defn- upgrade-request?
+  "True only for a complete RFC 6455 opening handshake (Igropyr
+   websocket-key, http.sc:577): GET over HTTP/1.1, Upgrade: websocket, an
+   `upgrade` token in Connection, version 13, and a Sec-WebSocket-Key that
+   really is a base64 16-byte nonce. Checking only Upgrade and the presence
+   of a key let malformed and downlevel handshakes through to a 101."
+  [req]
+  (and (= :get (:request-method req))
+       (= "HTTP/1.1" (:protocol req))
+       (= "websocket" (str/lower-case (get-in req [:headers "upgrade"] "")))
+       (http/connection-token? req "upgrade")
+       (= "13" (get-in req [:headers "sec-websocket-version"]))
+       (ws/valid-client-key? (get-in req [:headers "sec-websocket-key"]))))
 
 ;; io: the per-strategy primitives. recv! reads from the socket (blocking on
 ;; worker threads; parking on the poller inside fibers), take! takes from a
@@ -186,6 +204,26 @@
           (let [{:keys [request error]} (http/request->ring (:head r) (:body r) port)]
             (cond
               error (send! conn (http/response->parts error false))
+               ;; A 101 ends HTTP framing: every byte after the head is read
+               ;; as websocket frames. An upgrade that ALSO declares a body has
+               ;; two readings — body then frames, or frames straight away —
+               ;; and the declared octets would reach the frame parser as if
+               ;; they were frames. Refuse the ambiguity before the handshake
+               ;; (Igropyr http.sc:1598).
+               (and ws-handler (upgrade-request? request) (some? (:body request)))
+               (send! conn (http/response->parts
+                             {:status 400 :headers {"Content-Type" "text/plain"
+                                                    "Connection" "close"}
+                              :body "Bad Request"} false))
+
+               ;; an upgrade attempt this server cannot complete is answered as
+               ;; a failed handshake, not handed to the Ring handler
+               (and ws-handler (upgrade-attempt? request) (not (upgrade-request? request)))
+               (send! conn (http/response->parts
+                             {:status 400 :headers {"Content-Type" "text/plain"
+                                                    "Connection" "close"}
+                              :body "Bad WebSocket Handshake"} false))
+
                (and ws-handler (upgrade-request? request))
                ;; websocket takeover: 101, then the session owns the fd until it
                ;; returns; the connection is not reused afterwards. The session
@@ -211,7 +249,11 @@
                      ;; for everything past the read, so the sweeper leaves it be
                      ;; post-101 there is no response to serve — close IS the
                      ;; truncation signal (Igropyr). on-failure still observes it.
-                     ((:run! io) #(try (ws-handler (ws/make-session conn))
+                     ;; the session inherits whatever the head read overshot
+                     ;; into: a client may pipeline its first frames in the
+                     ;; same segment as the upgrade request, and dropping them
+                     ;; parked the session on bytes already delivered
+                     ((:run! io) #(try (ws-handler (ws/make-session conn (:leftover r)))
                                        (catch Throwable t
                                          (try (when on-failure (on-failure request t))
                                               (catch Throwable _ nil))))))))

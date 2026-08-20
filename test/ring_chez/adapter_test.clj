@@ -185,26 +185,57 @@
     (swap! t-pending update fd #(vec (drop n %)))
     out))
 
+(defn ws-frame
+  "A client frame, masked as RFC 6455 §5.3 requires of clients. opcode 0x0
+  continuation, 0x1 text, 0x2 binary, 0x8 close, 0x9 ping. All three length
+  encodings; fin?, mask? and rsv let a test build the invalid ones too."
+  [opcode payload-bytes & {:keys [fin? mask? rsv declared-len]
+                           :or {fin? true mask? true rsv 0}}]
+  (let [mask [0x11 0x22 0x33 0x44]
+        n (or declared-len (count payload-bytes))
+        b0 (bit-or (if fin? 0x80 0x00) (bit-shift-left rsv 4) opcode)
+        mbit (if mask? 0x80 0x00)
+        len-bytes (cond
+                    (< n 126) [(bit-or mbit n)]
+                    (< n 65536) [(bit-or mbit 126)
+                                 (bit-and 0xff (bit-shift-right n 8))
+                                 (bit-and 0xff n)]
+                    :else (into [(bit-or mbit 127)]
+                                (map #(bit-and 0xff (bit-shift-right n (* 8 (- 7 %))))
+                                     (range 8))))
+        body (if mask?
+               (map-indexed (fn [i b] (bit-xor b (nth mask (mod i 4)))) payload-bytes)
+               payload-bytes)]
+    (concat [b0] len-bytes (when mask? mask) body)))
+
 (defn ws-client-frame
-  "Masked client frame (clients must mask). opcode 0x1 text, 0x9 ping, 0x8 close.
-  Payload length < 126."
+  "Masked, final client frame. Payload length < 126."
   [opcode payload-bytes]
-  (let [mask [0x11 0x22 0x33 0x44]  ; all < 0x80 so masked ASCII stays < 0x80
-        masked (map-indexed (fn [i b] (bit-xor b (nth mask (mod i 4)))) payload-bytes)]
-    (concat [(bit-or 0x80 opcode) (bit-or 0x80 (count payload-bytes))] mask masked)))
+  (ws-frame opcode payload-bytes))
 
 (defn ws-read-server-frame [fd]
   (let [h (t-recv-n fd 2)]
     (when (= 2 (count h))
-      (let [opcode (bit-and 0x0f (first h))
+      (let [fin (pos? (bit-and 0x80 (first h)))
+            opcode (bit-and 0x0f (first h))
             masked? (pos? (bit-and 0x80 (second h)))
-            len7 (bit-and 0x7f (second h))]
-        (if (< len7 126)
-          {:opcode opcode :masked masked? :payload (t-recv-n fd len7)}
-          (let [ext (t-recv-n fd 2)
-                len (if (= 2 (count ext))
-                      (+ (bit-shift-left (first ext) 8) (second ext)) -1)]
-            {:opcode opcode :masked masked? :payload (t-recv-n fd len)}))))))
+            len7 (bit-and 0x7f (second h))
+            len (cond
+                  (< len7 126) len7
+                  (= len7 126) (let [ext (t-recv-n fd 2)]
+                                 (if (= 2 (count ext))
+                                   (+ (bit-shift-left (first ext) 8) (second ext)) -1))
+                  :else (let [ext (t-recv-n fd 8)]
+                          (if (= 8 (count ext))
+                            (reduce (fn [a b] (+ (* a 256) b)) 0 ext) -1)))]
+        {:fin fin :opcode opcode :masked masked? :len len
+         :payload (if (neg? len) [] (t-recv-n fd len))}))))
+
+(defn ws-close-code
+  "The status code carried by a close frame, or nil."
+  [f]
+  (when (and (= 8 (:opcode f)) (<= 2 (count (:payload f))))
+    (+ (bit-shift-left (first (:payload f)) 8) (second (:payload f)))))
 
 (defn client-recv-until-bytes
   "Read until marker is seen in the accumulated bytes (returns the whole
@@ -1273,6 +1304,211 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+;; --- Round 2: RFC 6455 codec ----------------------------------------------------
+
+(defn- ws-echo-server [port ws-handler]
+  (adapter/run-server handler {:port port :worker-threads 2 :ws-handler ws-handler}))
+
+(defn- ws-open [port]
+  (let [fd (client-connect port 5000)]
+    (client-send fd (str "GET /ws HTTP/1.1\r\nHost: t\r\n"
+                         "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                         "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                         "Sec-WebSocket-Version: 13\r\n\r\n"))
+    (client-recv-until fd "\r\n\r\n")
+    fd))
+
+(defn test-ws-large-frame []
+  ;; encode-frame had only the 7-bit and 16-bit length forms, so a payload of
+  ;; 65536 or more built a 16-bit header out of bytes that did not fit in one
+  ;; (70000 >> 8 = 273): ffi/write :uint8 rejected it, the session died and the
+  ;; connection closed with nothing on the wire.
+  (let [big (apply str (repeat 70000 \x))
+        server (ws-echo-server 8470 (fn [s] (ws/send! s big) (Thread/sleep 400)))]
+    (try
+      (Thread/sleep 250)
+      (let [fd (ws-open 8470)
+            f (ws-read-server-frame fd)]
+        (check "ws big: 64-bit length form" 70000 (:len f))
+        (check "ws big: opcode text" 1 (:opcode f))
+        (check "ws big: payload delivered whole" 70000 (count (:payload f)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-leftover-frame []
+  ;; A frame arriving in the same TCP segment as the handshake was dropped: the
+  ;; adapter built the session from the fd alone and discarded read-request's
+  ;; leftover, so the session parked forever on bytes it had already been given.
+  (let [got (atom :none)
+        server (ws-echo-server 8471 (fn [s] (reset! got (ws/recv! s))))]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8471 3000)]
+        (t-send-bytes fd (concat (map int (str "GET /ws HTTP/1.1\r\nHost: t\r\n"
+                                               "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+                                               "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                                               "Sec-WebSocket-Version: 13\r\n\r\n"))
+                                 (ws-client-frame 0x1 (utf8-bytes "hello"))))
+        (Thread/sleep 600)
+        (check "ws leftover: frame pipelined with the handshake is seen"
+               {:type :text :data "hello"} @got)
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-fragmented-message []
+  ;; recv-frame required FIN, so a fragmented message read as a peer close and
+  ;; the connection was dropped mid-conversation.
+  (let [got (atom :none)
+        server (ws-echo-server 8472 (fn [s] (reset! got (ws/recv! s))))]
+    (try
+      (Thread/sleep 250)
+      (let [fd (ws-open 8472)]
+        (t-send-bytes fd (ws-frame 0x1 (utf8-bytes "hel") :fin? false))
+        (t-send-bytes fd (ws-frame 0x0 (utf8-bytes "lo")))
+        (Thread/sleep 500)
+        (check "ws fragments: continuation frames reassembled"
+               {:type :text :data "hello"} @got)
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-unmasked-client-frame-rejected []
+  ;; RFC 6455 §5.1: a server that receives an unmasked frame MUST fail the
+  ;; connection. We delivered the payload to the handler instead.
+  (let [got (atom :none)
+        server (ws-echo-server 8473 (fn [s] (reset! got (ws/recv! s))))]
+    (try
+      (Thread/sleep 250)
+      (let [fd (ws-open 8473)]
+        (t-send-bytes fd (ws-frame 0x1 (utf8-bytes "hello") :mask? false))
+        (let [f (ws-read-server-frame fd)]
+          (check "ws unmasked: closed with 1002" 1002 (ws-close-code f)))
+        (check "ws unmasked: handler saw a close, not the payload"
+               :close (:type @got))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-rsv-bits-rejected []
+  (let [server (ws-echo-server 8474 (fn [s] (ws/recv! s)))]
+    (try
+      (Thread/sleep 250)
+      (let [fd (ws-open 8474)]
+        (t-send-bytes fd (ws-frame 0x1 (utf8-bytes "hi") :rsv 4))
+        (let [f (ws-read-server-frame fd)]
+          (check "ws rsv: non-zero RSV closed with 1002" 1002 (ws-close-code f)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-invalid-utf8-is-1007 []
+  ;; String. substitutes U+FFFD, so invalid UTF-8 in a text frame reached the
+  ;; handler as mangled text instead of failing the connection with 1007.
+  (let [server (ws-echo-server 8475 (fn [s] (ws/recv! s)))]
+    (try
+      (Thread/sleep 250)
+      (let [fd (ws-open 8475)]
+        ;; 0xC3 starts a 2-byte sequence; 0x28 is not a continuation byte
+        (t-send-bytes fd (ws-frame 0x1 [0xC3 0x28]))
+        (let [f (ws-read-server-frame fd)]
+          (check "ws utf8: invalid text frame closed with 1007" 1007 (ws-close-code f)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-close-code-echoed []
+  ;; RFC 6455 §5.5.1: a conforming peer expects its own code back. Replying
+  ;; with an empty close made every clean shutdown look like "no status".
+  (let [server (ws-echo-server 8476 (fn [s] (ws/recv! s)))]
+    (try
+      (Thread/sleep 250)
+      (let [fd (ws-open 8476)]
+        (t-send-bytes fd (ws-frame 0x8 [0x03 0xE8]))          ; 1000 normal
+        (let [f (ws-read-server-frame fd)]
+          (check "ws close: code echoed" 1000 (ws-close-code f)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-bad-close-code-is-1002 []
+  (let [server (ws-echo-server 8477 (fn [s] (ws/recv! s)))]
+    (try
+      (Thread/sleep 250)
+      (let [fd (ws-open 8477)]
+        (t-send-bytes fd (ws-frame 0x8 [0x03 0xEC]))          ; 1004: reserved
+        (let [f (ws-read-server-frame fd)]
+          (check "ws close: reserved code answered 1002" 1002 (ws-close-code f)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-oversized-frame-rejected []
+  ;; A declared length was taken at face value and buffered without limit, one
+  ;; boxed Long per wire byte. A frame past the cap is now refused outright.
+  (let [server (ws-echo-server 8478 (fn [s] (ws/recv! s)))]
+    (try
+      (Thread/sleep 250)
+      (let [fd (ws-open 8478)]
+        ;; declare 8 MiB, send nothing: the cap must fire on the header alone
+        (t-send-bytes fd (ws-frame 0x2 [] :declared-len 8388608))
+        (let [f (ws-read-server-frame fd)]
+          (check "ws oversized: frame past the cap closed with 1009"
+                 1009 (ws-close-code f)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-binary-round-trip []
+  (let [payload [0x00 0xff 0x7f 0x80 0x01]
+        server (ws-echo-server 8479
+                 (fn [s] (let [m (ws/recv! s)]
+                           (ws/send-binary! s (:data m)))))]
+    (try
+      (Thread/sleep 250)
+      (let [fd (ws-open 8479)]
+        (t-send-bytes fd (ws-frame 0x2 payload))
+        (let [f (ws-read-server-frame fd)]
+          (check "ws binary: opcode preserved" 2 (:opcode f))
+          (check "ws binary: octets survive verbatim" payload (vec (:payload f))))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ws-handshake-validation []
+  ;; Igropyr websocket-key: GET + HTTP/1.1 + Connection: upgrade + version 13 +
+  ;; a 16-byte-decodable key, and an upgrade must not also declare a body.
+  (let [server (ws-echo-server 8480 (fn [s] (ws/recv! s)))]
+    (try
+      (Thread/sleep 250)
+      (doseq [[label req]
+              [["missing Sec-WebSocket-Version"
+                (str "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+                     "Connection: Upgrade\r\n"
+                     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n\r\n")]
+               ["wrong websocket version"
+                (str "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+                     "Connection: Upgrade\r\n"
+                     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                     "Sec-WebSocket-Version: 8\r\n\r\n")]
+               ["key that is not 16 bytes"
+                (str "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+                     "Connection: Upgrade\r\nSec-WebSocket-Key: c2hvcnQ=\r\n"
+                     "Sec-WebSocket-Version: 13\r\n\r\n")]
+               ["POST instead of GET"
+                (str "POST /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+                     "Connection: Upgrade\r\n"
+                     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                     "Sec-WebSocket-Version: 13\r\n\r\n")]
+               ["upgrade that also declares a body"
+                (str "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+                     "Connection: Upgrade\r\n"
+                     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                     "Sec-WebSocket-Version: 13\r\nContent-Length: 5\r\n\r\nhello")]
+               ["no Connection: upgrade token"
+                (str "GET /ws HTTP/1.1\r\nHost: t\r\nUpgrade: websocket\r\n"
+                     "Connection: keep-alive\r\n"
+                     "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                     "Sec-WebSocket-Version: 13\r\n\r\n")]]]
+        (let [fd (client-connect 8480 3000)]
+          (client-send fd req)
+          (let [r (client-recv fd)]
+            (check (str "ws handshake: " label " is refused")
+                   false (str/includes? (or r "") "101")))
+          (client-close fd)))
+      (finally (adapter/stop-server server)))))
+
 ;; --- Round 1: correctness fixes ------------------------------------------------
 
 (defn test-timeout-granularity []
@@ -1755,6 +1991,19 @@
   (test-ws-guard-throw-is-request-failure)
   (test-write-timeout-cuts-stalled-peer)
   (test-write-timeout-zero-disables)
+
+  ;; --- Round 2: RFC 6455 codec ---
+  (test-ws-large-frame)
+  (test-ws-leftover-frame)
+  (test-ws-fragmented-message)
+  (test-ws-unmasked-client-frame-rejected)
+  (test-ws-rsv-bits-rejected)
+  (test-ws-invalid-utf8-is-1007)
+  (test-ws-close-code-echoed)
+  (test-ws-bad-close-code-is-1002)
+  (test-ws-oversized-frame-rejected)
+  (test-ws-binary-round-trip)
+  (test-ws-handshake-validation)
 
   ;; --- Round 1: correctness fixes ---
   (test-timeout-granularity)
