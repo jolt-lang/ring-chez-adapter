@@ -279,6 +279,17 @@
                  (.toByteArray out))
                (catch Throwable _ (.getBytes ^String (str b) "UTF-8")))))
 
+(defn- header-safe?
+  "False for a header name or value carrying CR or LF (Igropyr header-safe?,
+  http.sc:677). Such a value written verbatim ends the head early and the
+  bytes after it are read as further headers — a handler that echoes user
+  data into a response header would otherwise inject whole headers (response
+  splitting). Unsafe headers are dropped, not escaped: there is no encoding
+  a client would read back as the intended single value."
+  [s]
+  (let [t (str s)]
+    (not (or (str/index-of t "\r") (str/index-of t "\n")))))
+
 (defn- head->string
   "Response head only. framing: a number (Content-Length), :chunked, or :none
   (no body framing — bodyless status, HEAD, or close-delimited)."
@@ -287,9 +298,12 @@
         sb (StringBuilder.)]
     (.append sb (str "HTTP/1.1 " status " " (get status-text status "Unknown") "\r\n"))
     (doseq [[k v] (:headers resp)]
-      (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))
-            emit (fn [v] (.append sb (str (if (keyword? k) (name k) (str k)) ": " v "\r\n")))]
-        (when (and (not= kn "content-length") (not= kn "transfer-encoding"))
+      (let [kname (if (keyword? k) (name k) (str k))
+            kn (str/lower-case kname)
+            emit (fn [v] (when (header-safe? v)
+                           (.append sb (str kname ": " v "\r\n"))))]
+        (when (and (not= kn "content-length") (not= kn "transfer-encoding")
+                   (header-safe? kname))
           ;; vector values emit one header line per element
           (if (vector? v) (doseq [vv v] (emit vv)) (emit v)))))
     (cond (number? framing) (.append sb (str "Content-Length: " framing "\r\n"))
@@ -302,29 +316,24 @@
     (.append sb "\r\n")
     (.toString sb)))
 
-(defn- declared-length
-  "The Content-Length the handler's own headers carry, if any. ring-defaults'
-  wrap-content-length already sets it (as UTF-8 bytes); honor that and only
-  compute when absent, so we never stamp a second, conflicting
-  Content-Length. Middleware commonly sets it as a *string* — normalize to a
-  number, or head->string emits no framing at all and keep-alive clients hang
-  waiting for a body terminator."
-  [resp]
-  (->> (:headers resp)
-       (some (fn [[k v]]
-               (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))]
-                 (when (= kn "content-length")
-                   (if (string? v) (parse-long v) v)))))))
-
 (defn response->parts
   "The whole response as send-all parts: the head, then the body's octets.
   Left as parts rather than spliced — send-all writes them back to back into
-  one buffer, so a large body is not copied a second time just to be sent."
+  one buffer, so a large body is not copied a second time just to be sent.
+
+  Content-Length counts the octets that actually go on the wire, never the
+  handler's own declaration (Igropyr framing-header?, http.sc:671: the
+  framework owns framing and drops any the caller set). A response declaring
+  a length that disagrees with its body desynchronises the connection for
+  good — the peer reads the surplus as the head of the next response — which
+  is a response-splitting and cache-poisoning primitive, and no middleware
+  can be trusted to keep the two in step through a body rewrite. Middleware
+  that sets the header correctly (ring-defaults' wrap-content-length) agrees
+  with the count and loses nothing."
   ([resp] (response->parts resp false))
   ([resp keep-alive?]
-   (let [body (body->bytes (:body resp))
-         len (or (declared-length resp) (alength body))]
-     [(head->string resp keep-alive? len) body])))
+   (let [body (body->bytes (:body resp))]
+     [(head->string resp keep-alive? (alength body)) body])))
 
 ;; Connection headers are comma-separated token lists, case-insensitive
 ;; (RFC 7230 §6.1): "Keep-Alive, Close" means close.
