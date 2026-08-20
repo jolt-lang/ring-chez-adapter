@@ -130,7 +130,7 @@
   (let [recv!      (:recv! io)
         idle-recv! (or (:idle-recv! io) recv!)
         send!      (or (:send! io) http/send-all)]
-    (loop [acc ""]
+    (loop [acc http/no-bytes]
       ;; deadline: this request (idle wait or mid-request trickle) must finish
       ;; within ka-ms of starting — the fibers-strategy sweeper closes the conn
       ;; past it (a parked read wakes as :closed). nil on the threads strategy,
@@ -138,21 +138,25 @@
       (when deadline (reset! deadline (+ (System/currentTimeMillis) ka-ms)))
       (let [r (http/read-request conn acc max-bytes recv! idle-recv!)]
         (cond
-          (= :bad r) (send! conn (http/response->string
+          (= :bad r) (send! conn (http/response->parts
                                    {:status 400 :headers {"Content-Type" "text/plain"}
                                     :body "Bad Request"} false))
-          (= :too-big r) (send! conn (http/response->string
+          (= :too-big r) (send! conn (http/response->parts
                                        {:status 413 :headers {"Content-Type" "text/plain"
                                                               "Connection" "close"}
                                         :body "Payload Too Large"} false))
-          (= :headers-too-big r) (send! conn (http/response->string
+          (= :headers-too-big r) (send! conn (http/response->parts
                                                {:status 431 :headers {"Content-Type" "text/plain"
                                                                       "Connection" "close"}
                                                 :body "Request Header Fields Too Large"} false))
+          (= :unsupported r) (send! conn (http/response->parts
+                                           {:status 501 :headers {"Content-Type" "text/plain"
+                                                                  "Connection" "close"}
+                                            :body "Not Implemented"} false))
           (map? r)
-          (let [{:keys [request error]} (http/request->ring (:text r) port)]
+          (let [{:keys [request error]} (http/request->ring (:head r) (:body r) port)]
             (cond
-              error (send! conn (http/response->string error false))
+              error (send! conn (http/response->parts error false))
                (and ws-handler (upgrade-request? request))
                ;; websocket takeover: 101, then the session owns the fd until it
                ;; returns; the connection is not reused afterwards. The session
@@ -199,7 +203,7 @@
                     ;; buffered — serving that costs no park.
                     resp (if (and (io :under-pressure?) ((io :under-pressure?))
                                   (http/keep-alive? request)
-                                  (str/blank? (:leftover r)))
+                                  (zero? (alength ^bytes (:leftover r))))
                            (update resp :headers #(assoc (or % {}) "Connection" "close"))
                            resp)]
                 (when (http/send-response conn request resp (:take! io) send!)

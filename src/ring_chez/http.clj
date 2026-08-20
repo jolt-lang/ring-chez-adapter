@@ -5,68 +5,193 @@
    behavior of reads and writes is injected by ring-chez.adapter."
   (:require [clojure.string :as str]
             [clojure.core.async :as async]
+            [clojure.java.io :as io]
             [ring-chez.socket :as socket]
             [jolt.io-poller :as poller]
             [jolt.ffi :as ffi]))
 
-(defn- content-length [text hdr-end]
-  (let [hdrs (str/lower-case (subs text 0 hdr-end))
-        i (str/index-of hdrs "content-length:")]
-    (if-not i
-      0
-      (let [s (+ i (count "content-length:"))
-            e (loop [j s] (if (or (>= j (count hdrs))
-                                   (= \return (nth hdrs j)) (= \newline (nth hdrs j))) j (recur (inc j))))]
-        (or (parse-long (str/trim (subs hdrs s e))) 0)))))
+(defn- head-lines
+  "The head's header lines, request line dropped. Hand-rolled rather than
+   str/split — this runs on every request, and the regex split cost ~8x the
+   whole rest of the framing decision."
+  [head]
+  (let [n (count head)]
+    (loop [i (if-let [b (str/index-of head "\r\n")] (+ b 2) n)
+           out []]
+      (if (>= i n)
+        out
+        (let [e (or (str/index-of head "\r\n" i) n)]
+          (recur (+ e 2) (conj out (subs head i e))))))))
+
+(defn- framing-headers
+  "The head's Content-Length / Transfer-Encoding values, keyed by field name.
+   Reading the field name off each line — rather than scanning the whole head
+   for \"content-length:\" — keeps a value like \"X-Note: content-length: 9\"
+   from being mistaken for framing."
+  [head]
+  (reduce (fn [m line]
+            (let [i (str/index-of line ":")]
+              (if-not (and i (pos? i))
+                m
+                (let [k (str/lower-case (str/trim (subs line 0 i)))]
+                  (if (or (= k "content-length") (= k "transfer-encoding"))
+                    (update m k (fnil conj []) (str/trim (subs line (inc i))))
+                    m)))))
+          {} (head-lines head)))
+
+(defn- body-framing
+  "Octets of body the head declares: 0 when it carries no Content-Length,
+   :bad when the framing is unrecoverable (a Content-Length that is not a
+   single non-negative integer — RFC 7230 §3.3.3), :unsupported when it
+   declares a Transfer-Encoding. Chunked decoding is not implemented, and
+   framing such a request by its Content-Length (or as bodyless) would let
+   the undecoded body through as a second, forged request."
+  [head]
+  (let [named (framing-headers head)
+        cls (get named "content-length")
+        lens (map #(let [n (parse-long %)] (when (and n (not (neg? n))) n)) cls)]
+    (cond
+      (contains? named "transfer-encoding") :unsupported
+      (empty? cls) 0
+      (some nil? lens) :bad
+      (apply = lens) (first lens)
+      :else :bad)))
+
+(def no-bytes (byte-array 0))
+
+(defn- ensure-capacity
+  "acc, with room for n more bytes past have. Grows by DOUBLING: a body that
+  arrives over many reads is then copied an amortised constant number of times
+  per byte, not once per read — reallocating to fit each chunk made receiving a
+  10 MB upload move ~800 MB. limit caps the growth at the largest capacity that
+  could ever be useful, so a declared Content-Length never becomes a memory
+  reservation the client has not paid for yet."
+  [^bytes acc have n limit]
+  (let [cap (alength acc)
+        need (+ have n)]
+    (if (<= need cap)
+      acc
+      (let [out (byte-array (max need (min (* 2 cap) limit)))]
+        (System/arraycopy acc 0 out 0 have)
+        out))))
+
+(defn- fill!
+  "Copy the first n bytes of the FFI buffer buf into acc at off."
+  [^bytes acc off buf n]
+  ;; jolt.ffi/read-array allocates the chunk and we copy it in; jolt.ffi's
+  ;; read-into! (unreleased) reads straight into acc and drops this copy.
+  (System/arraycopy (ffi/read-array buf n) 0 acc off n))
+
+(defn- concat-bytes
+  "One byte array from several."
+  [arrays]
+  (let [total (loop [as (seq arrays), n 0]
+                (if as (recur (next as) (+ n (alength ^bytes (first as)))) n))
+        out (byte-array total)]
+    (loop [as (seq arrays), off 0]
+      (if-not as
+        out
+        (let [^bytes a (first as)]
+          (System/arraycopy a 0 out off (alength a))
+          (recur (next as) (+ off (alength a))))))))
+
+(defn- head-end
+  "Index of the \r\n\r\n that ends the request head within bs[0,have), or nil.
+  from skips the prefix an earlier pass already scanned (callers back it off by
+  3 so a terminator straddling the seam is still seen)."
+  [^bytes bs from have]
+  (let [last-start (- have 4)]
+    (loop [i (max 0 from)]
+      (when (<= i last-start)
+        (if (and (= 13 (aget bs i))       (= 10 (aget bs (+ i 1)))
+                 (= 13 (aget bs (+ i 2))) (= 10 (aget bs (+ i 3))))
+          i
+          (recur (inc i)))))))
 
 ;; read one complete request from conn; acc carries unconsumed bytes from a
-;; previous read (pipelined requests). recv! abstracts the blocking read:
+;; previous read (pipelined requests). Accumulation is raw octets, not a
+;; decoded string: Content-Length counts octets, and a multibyte codepoint
+;; may straddle two recv calls — decoding each chunk on its own would both
+;; mis-frame the body and corrupt it. recv! abstracts the blocking read:
 ;; the threads strategy passes plain c-recv, the fiber strategy passes a
 ;; poller-parking variant. idle-recv! handles the first read of the next
 ;; request on an idle keep-alive connection — under the threads strategy it
 ;; waits in poll(2) slices so a queued connection can retire the idle one
 ;; promptly instead of waiting out the full keep-alive timeout. Returns
-;; {:text t :leftover s} when a full request (headers + Content-Length body)
-;; is available, :closed when the peer went away (or recv timed out) before
-;; sending anything, :bad on EOF/timeout mid-request.
+;; {:head s :body bs :leftover bs} when a full request (headers +
+;; Content-Length body) is available, :closed when the peer went away (or
+;; recv timed out) before sending anything, :bad on EOF/timeout mid-request
+;; or an unframeable head, :unsupported for a Transfer-Encoding we do not
+;; decode.
 (defn read-request
   "Reads one request (head + content-length body). Accumulation is capped at
   max-bytes — a client that never terminates (or ships an oversized request)
-  gets :too-big instead of exhausting memory."
+  gets :too-big instead of exhausting memory. acc, :body and :leftover are
+  byte arrays; only :head — which RFC 7230 restricts to ASCII — is decoded.
+  The body stays opaque octets: it may be an image, a gzip stream, or text in
+  some other charset, none of which survive a UTF-8 decode."
   [conn acc max-bytes recv! idle-recv!]
   (let [buf (ffi/alloc socket/bufsize)]
     (try
-      (loop [acc acc]
-        (if-let [hdr-end (str/index-of acc "\r\n\r\n")]
-          (let [cl (content-length acc hdr-end)]
-            (if (>= (- (count acc) (+ hdr-end 4)) cl)
-              {:text (subs acc 0 (+ hdr-end 4 cl))
-               :leftover (subs acc (+ hdr-end 4 cl))}
-              (if (> (+ (count acc) cl) max-bytes)
-                :too-big                    ; body exceeds the cap -> 413
-                (let [n (recv! conn buf)]
-                  (if (pos? n)
-                    (recur (str acc (ffi/read-bytes buf n)))
-                    :bad)))))
-          (if (> (count acc) max-bytes)
-            :headers-too-big              ; headers never ended -> 431
-            (let [n ((if (str/blank? acc) idle-recv! recv!) conn buf)]
-              (cond
-                (pos? n) (recur (str acc (ffi/read-bytes buf n)))
-                (str/blank? acc) :closed
-                :else :bad)))))
+      ;; acc is a capacity buffer, valid over [0,have) — it is not sliced to
+      ;; size until the request is framed. scanned: how far into it the
+      ;; head-terminator search already ran. framing: {:head s :from i :to i} —
+      ;; where the body starts and ends — resolved once the head is complete,
+      ;; so the head is neither re-scanned nor re-parsed on every trickle of
+      ;; the body. A read can overshoot :to (the next pipelined request rode
+      ;; along), which is why the buffer keeps room past it rather than being
+      ;; sized to the frame exactly.
+      (loop [^bytes acc acc, have (alength acc), scanned 0, framing nil]
+        (let [framing (or framing
+                          (when-let [he (head-end acc scanned have)]
+                            (let [head (String. acc 0 he "UTF-8")
+                                  f (body-framing head)]
+                              (if (number? f)
+                                {:head head :from (+ he 4) :to (+ he 4 f)}
+                                f))))
+              ;; map? not framing? — an unframeable head is a KEYWORD here, and
+              ;; (:to :bad) is nil
+              limit   (+ (if (map? framing) (:to framing) max-bytes) socket/bufsize)]
+          (cond
+            (keyword? framing) framing      ; :bad -> 400, :unsupported -> 501
+
+            (nil? framing)                  ; head still incomplete
+            (if (> have max-bytes)
+              :headers-too-big              ; headers never ended -> 431
+              (let [n ((if (zero? have) idle-recv! recv!) conn buf)]
+                (cond
+                  (pos? n) (let [acc (ensure-capacity acc have n limit)]
+                             (fill! acc have buf n)
+                             (recur acc (+ have n) (max 0 (- have 3)) nil))
+                  (zero? have) :closed
+                  :else :bad)))
+
+            ;; declared request exceeds the cap -> 413
+            (> (:to framing) max-bytes) :too-big
+
+            (>= have (:to framing))
+            (let [{:keys [head from to]} framing]
+              {:head head
+               :body (if (= from to) no-bytes (java.util.Arrays/copyOfRange acc from to))
+               :leftover (if (= have to) no-bytes (java.util.Arrays/copyOfRange acc to have))})
+
+            :else
+            (let [n (recv! conn buf)]
+              (if (pos? n)
+                (let [acc (ensure-capacity acc have n limit)]
+                  (fill! acc have buf n)
+                  (recur acc (+ have n) scanned framing))
+                :bad)))))
       (finally (ffi/free buf)))))
 
 ;; --- request -> Ring map ----------------------------------------------------
 (defn request->ring
-  "Parse raw request text into {:request ring-map}, or {:error response} when
-  the request is malformed (400) or speaks an unsupported HTTP version (505).
-  HTTP/1.1 requests must carry a Host header (RFC 7230 §5.4)."
-  [text port]
-  (let [blank (str/index-of text "\r\n\r\n")
-        head (if blank (subs text 0 blank) text)
-        body (if blank (subs text (+ blank 4)) "")
-        lines (str/split head #"\r\n")
+  "Parse a request head (as read-request framed it) and its body octets into
+  {:request ring-map}, or {:error response} when the request is malformed
+  (400) or speaks an unsupported HTTP version (505). HTTP/1.1 requests must
+  carry a Host header (RFC 7230 §5.4)."
+  [head ^bytes body port]
+  (let [lines (str/split head #"\r\n")
         parts (str/split (or (first lines) "") #" ")
         headers (reduce (fn [m line]
                           (let [i (str/index-of line ":")]
@@ -104,7 +229,11 @@
                    :request-method (keyword (str/lower-case (first parts)))
                    :protocol       (nth parts 2)
                    :headers        headers
-                   :body           (when (pos? (count body)) (java.io.StringReader. body))}}))))
+                   ;; an InputStream per the Ring spec, over the body's own
+                   ;; octets — a handler that wants text slurps it (UTF-8 by
+                   ;; default), one that wants bytes reads them unmangled
+                   :body           (when (pos? (alength body))
+                                     (java.io.ByteArrayInputStream. body))}}))))
 
 ;; --- Ring response -> the response string -----------------------------------
 (def ^:private status-text
@@ -130,13 +259,25 @@
    507 "Insufficient Storage" 508 "Loop Detected" 510 "Not Extended"
    511 "Network Authentication Required"})
 
-(defn- body->string [b]
-  (cond (nil? b) ""
-        (string? b) b
-        (or (seq? b) (vector? b)) (apply str b)
-        ;; a File / InputStream / Reader body (ring's resource + file responses):
-        ;; read its contents rather than printing the object.
-        :else (try (slurp b) (catch Throwable _ (str b)))))
+(defn- body->bytes
+  "The octets a response body puts on the wire. Strings encode as UTF-8;
+  byte arrays, InputStreams and Files pass through as their own bytes, so an
+  image or a gzip stream is served as sent rather than mangled by a charset
+  round-trip. A seq/vector body contributes each element's octets in turn —
+  for the seq-of-strings Ring defines, that is the same as encoding the
+  concatenation, since UTF-8 concatenates."
+  [b]
+  (cond
+    (nil? b) no-bytes
+    (string? b) (.getBytes ^String b "UTF-8")
+    (bytes? b) b
+    (or (seq? b) (vector? b)) (concat-bytes (mapv body->bytes b))
+    ;; a File / InputStream / Reader body (ring's resource + file responses):
+    ;; copy its contents rather than printing the object.
+    :else (try (let [out (java.io.ByteArrayOutputStream.)]
+                 (io/copy b out)
+                 (.toByteArray out))
+               (catch Throwable _ (.getBytes ^String (str b) "UTF-8")))))
 
 (defn- head->string
   "Response head only. framing: a number (Content-Length), :chunked, or :none
@@ -161,23 +302,29 @@
     (.append sb "\r\n")
     (.toString sb)))
 
-(defn response->string
-  ([resp] (response->string resp false))
+(defn- declared-length
+  "The Content-Length the handler's own headers carry, if any. ring-defaults'
+  wrap-content-length already sets it (as UTF-8 bytes); honor that and only
+  compute when absent, so we never stamp a second, conflicting
+  Content-Length. Middleware commonly sets it as a *string* — normalize to a
+  number, or head->string emits no framing at all and keep-alive clients hang
+  waiting for a body terminator."
+  [resp]
+  (->> (:headers resp)
+       (some (fn [[k v]]
+               (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))]
+                 (when (= kn "content-length")
+                   (if (string? v) (parse-long v) v)))))))
+
+(defn response->parts
+  "The whole response as send-all parts: the head, then the body's octets.
+  Left as parts rather than spliced — send-all writes them back to back into
+  one buffer, so a large body is not copied a second time just to be sent."
+  ([resp] (response->parts resp false))
   ([resp keep-alive?]
-   (let [body (body->string (:body resp))
-          ;; Content-Length is the body's octet count. ring-defaults'
-          ;; wrap-content-length already sets it (as UTF-8 bytes); honor that
-          ;; and only compute when absent, so we never stamp a second, conflicting
-          ;; Content-Length. Middleware commonly sets it as a *string* —
-          ;; normalize to a number, or head->string emits no framing at all
-          ;; and keep-alive clients hang waiting for a body terminator.
-          len (or (->> (:headers resp)
-                       (some (fn [[k v]]
-                               (let [kn (str/lower-case (if (keyword? k) (name k) (str k)))]
-                                 (when (= kn "content-length")
-                                   (if (string? v) (parse-long v) v))))))
-                  (alength (.getBytes body "UTF-8")))]
-     (str (head->string resp keep-alive? len) body))))
+   (let [body (body->bytes (:body resp))
+         len (or (declared-length resp) (alength body))]
+     [(head->string resp keep-alive? len) body])))
 
 ;; Connection headers are comma-separated token lists, case-insensitive
 ;; (RFC 7230 §6.1): "Keep-Alive, Close" means close.
@@ -204,15 +351,27 @@
                      (some #(conn-token? "close" %) v)
                      (conn-token? "close" v))))))))
 
+(defn- part-capacity [p]
+  (if (string? p) (* 4 (count p)) (alength ^bytes p)))   ; UTF-8 worst case 4 bytes/char
+
+(defn- write-part!
+  "Encode p into buf at off; returns the octets written."
+  [buf off p]
+  (if (string? p)
+    (ffi/write-bytes (+ buf off) p)
+    (ffi/write-array (+ buf off) p)))
+
 (defn send-all
-  "Write s to conn; false when the peer is gone (caller closes). wait-write!
-  parks the caller until the socket can take more bytes (fiber strategy,
-  O_NONBLOCK sockets); nil leaves -1 meaning peer-gone (blocking sockets
-  block instead of returning EAGAIN)."
-  ([conn s] (send-all conn s nil))
-  ([conn s wait-write!]
-   (let [buf (ffi/alloc (max 1 (* 4 (count s))))     ; UTF-8 worst case 4 bytes/char
-         n (ffi/write-bytes buf s)
+  "Write data to conn: a string (encoded as UTF-8), a byte array, or a vector
+  of those written back to back. false when the peer is gone (caller closes).
+  wait-write! parks the caller until the socket can take more bytes (fiber
+  strategy, O_NONBLOCK sockets); nil leaves -1 meaning peer-gone (blocking
+  sockets block instead of returning EAGAIN)."
+  ([conn data] (send-all conn data nil))
+  ([conn data wait-write!]
+   (let [parts (if (vector? data) data [data])
+         buf (ffi/alloc (max 1 (reduce (fn [n p] (+ n (part-capacity p))) 0 parts)))
+         n (reduce (fn [off p] (+ off (write-part! buf off p))) 0 parts)
          ok (loop [off 0]
               (if (< off n)
                 (let [sent (socket/c-send conn (+ buf off) (- n off) 0)]
@@ -226,6 +385,23 @@
      (ffi/free buf)
      ok)))
 
+(defn- chunk->bytes
+  "One stream chunk's octets. Chunks are strings or byte arrays — anything
+  else is a handler bug, and throwing hands it to the worker's catch (which
+  abandons the connection) instead of serializing garbage into the stream."
+  [v]
+  (cond
+    (string? v) (.getBytes ^String v "UTF-8")
+    (bytes? v) v
+    :else (throw (ex-info "stream chunk must be a string or byte array"
+                          {:type :ring-chez/bad-chunk :chunk-type (type v)}))))
+
+(defn- chunk-parts
+  "bs wrapped in chunked framing — the size line counts octets, so a
+  multibyte or binary chunk is framed by what actually goes on the wire."
+  [^bytes bs]
+  [(str (format "%x" (alength bs)) "\r\n") bs "\r\n"])
+
 (defn- stream-body
   "Pump a channel body onto conn: chunked framing for HTTP/1.1, raw bytes for
   HTTP/1.0 (close-delimited; caller closes). take! abstracts the channel take
@@ -236,17 +412,15 @@
   false instead of hanging."
   [conn ch http10? take! send!]
   (loop []
-    (let [v (take! ch)]
+    (let [v (take! ch)
+          bs (when (some? v) (chunk->bytes v))]
       (cond
-        ;; closed: end of stream. (empty string chunks carry no data and would
-        ;; frame as a bogus terminator, so skip them)
-        (or (nil? v) (= "" v))
+        ;; closed, or an empty chunk: end of stream. (an empty chunk carries no
+        ;; data and would frame as a bogus terminator)
+        (or (nil? bs) (zero? (alength bs)))
         (if http10? true (send! conn "0\r\n\r\n"))
 
-        (send! conn (if http10?
-                      v
-                      (str (format "%x" (alength (.getBytes ^String v "UTF-8")))
-                           "\r\n" v "\r\n")))
+        (send! conn (if http10? bs (chunk-parts bs)))
         (recur)
 
         :else (do (async/close! ch) false)))))
@@ -282,4 +456,4 @@
       (and (send! conn (head->string resp keep? :none)) keep?)
 
       :else
-      (and (send! conn (response->string resp keep?)) keep?))))
+      (and (send! conn (response->parts resp keep?)) keep?))))

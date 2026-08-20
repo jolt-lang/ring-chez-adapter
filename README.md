@@ -84,6 +84,35 @@ never frame a body. Malformed requests get `400`, unknown HTTP versions `505`,
 and a handler-supplied `Connection: close` header is honored (the connection
 closes after that response).
 
+Requests are framed in octets: the socket accumulates raw bytes, and only the
+head — which RFC 7230 restricts to ASCII — is decoded (as UTF-8). So a
+multibyte body matches its `Content-Length`, and a codepoint split across two
+reads survives. A request whose `Content-Length` is missing is treated as
+bodyless; one that is not a single non-negative integer gets `400`.
+`Transfer-Encoding` is not decoded — such a request gets `501` rather than
+being framed by guesswork.
+
+The request `:body` is a `java.io.InputStream` over the body's own octets
+(`nil` when the request has no body), so an upload stays byte-exact — an
+image, a gzip stream, or text in some charset other than UTF-8 all arrive as
+sent. `slurp` it for text (UTF-8 by default), or `clojure.java.io/copy`,
+`.readAllBytes`, or `.read` for bytes.
+
+Response bodies work the same way in reverse. A `String` is encoded as UTF-8;
+a byte array, `InputStream`, or `File` is served as its own octets; a
+seq/vector contributes each element's octets in turn. `Content-Length` counts
+what actually goes on the wire, so serving a PNG is just:
+
+```clojure
+{:status 200
+ :headers {"Content-Type" "image/png"}
+ :body (clojure.java.io/file "logo.png")}
+```
+
+Channel bodies (see below) may yield strings or byte arrays; each chunk's
+size line counts its octets. Anything else on a channel throws, which closes
+that connection rather than writing garbage into the stream.
+
 ## Error handling
 
 Every abnormal handler completion — a handler throw, a `nil` response (an
