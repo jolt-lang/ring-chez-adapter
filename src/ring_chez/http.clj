@@ -185,12 +185,28 @@
       (finally (ffi/free buf)))))
 
 ;; --- request -> Ring map ----------------------------------------------------
+(defn- host-name
+  "The name part of a Host header — the port, if it named one, is not part of
+  the server name. Only a trailing \":digits\" is stripped, so an IPv6 literal
+  in brackets survives intact."
+  [h]
+  (let [h (str/trim (or h ""))
+        i (str/last-index-of h ":")]
+    (if (and i (pos? i) (< (inc i) (count h))
+             (every? #(<= (int \0) (int %) (int \9)) (subs h (inc i))))
+      (subs h 0 i)
+      h)))
+
 (defn request->ring
   "Parse a request head (as read-request framed it) and its body octets into
   {:request ring-map}, or {:error response} when the request is malformed
   (400) or speaks an unsupported HTTP version (505). HTTP/1.1 requests must
-  carry a Host header (RFC 7230 §5.4)."
-  [head ^bytes body port]
+  carry a Host header (RFC 7230 §5.4).
+
+  conn-info carries what the request itself cannot say: {:server-port
+  :server-name :remote-addr}, where :server-name is the bind address and
+  :remote-addr the peer accept() reported."
+  [head ^bytes body conn-info]
   (let [lines (str/split head #"\r\n")
         parts (str/split (or (first lines) "") #" ")
         headers (reduce (fn [m line]
@@ -220,9 +236,15 @@
       (let [target (second parts)
             qi (str/index-of target "?")
             [uri qs] (if qi [(subs target 0 qi) (subs target (inc qi))] [target nil])]
-        {:request {:server-port    port
-                   :server-name    "127.0.0.1"
-                   :remote-addr    "127.0.0.1"
+        {:request {:server-port    (:server-port conn-info)
+                   ;; Ring: the resolved server name. The Host header is what
+                   ;; the client asked for and what virtual-host middleware
+                   ;; needs; the bind address is the fallback when there is
+                   ;; none (HTTP/1.0 may omit it).
+                   :server-name    (if-let [h (get headers "host")]
+                                     (host-name h)
+                                     (:server-name conn-info))
+                   :remote-addr    (:remote-addr conn-info)
                    :uri            uri
                    :query-string   qs
                    :scheme         :http
