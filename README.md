@@ -95,9 +95,8 @@ being framed by guesswork.
 The request `:body` is a `java.io.InputStream` over the body's own octets
 (`nil` when the request has no body), so an upload stays byte-exact — an
 image, a gzip stream, or text in some charset other than UTF-8 all arrive as
-sent. `slurp` it for text (UTF-8 by default), or `clojure.java.io/copy` it for
-bytes. Note that `.readAllBytes` does not resolve under jolt; use `copy` or
-`.read`.
+sent. `slurp` it for text (UTF-8 by default), or `clojure.java.io/copy`,
+`.readAllBytes`, or `.read` for bytes.
 
 Response bodies work the same way in reverse. A `String` is encoded as UTF-8;
 a byte array, `InputStream`, or `File` is served as its own octets; a

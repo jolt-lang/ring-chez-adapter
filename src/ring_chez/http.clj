@@ -59,16 +59,28 @@
 
 (def no-bytes (byte-array 0))
 
-(defn- append-bytes
-  "acc plus the first n bytes sitting in the FFI buffer buf."
-  [^bytes acc buf n]
-  (let [have (alength acc)]
-    (if (zero? have)
-      (ffi/read-array buf n)
-      (let [out (byte-array (+ have n))]
+(defn- ensure-capacity
+  "acc, with room for n more bytes past have. Grows by DOUBLING: a body that
+  arrives over many reads is then copied an amortised constant number of times
+  per byte, not once per read — reallocating to fit each chunk made receiving a
+  10 MB upload move ~800 MB. limit caps the growth at the largest capacity that
+  could ever be useful, so a declared Content-Length never becomes a memory
+  reservation the client has not paid for yet."
+  [^bytes acc have n limit]
+  (let [cap (alength acc)
+        need (+ have n)]
+    (if (<= need cap)
+      acc
+      (let [out (byte-array (max need (min (* 2 cap) limit)))]
         (System/arraycopy acc 0 out 0 have)
-        (System/arraycopy (ffi/read-array buf n) 0 out have n)
         out))))
+
+(defn- fill!
+  "Copy the first n bytes of the FFI buffer buf into acc at off."
+  [^bytes acc off buf n]
+  ;; jolt.ffi/read-array allocates the chunk and we copy it in; jolt.ffi's
+  ;; read-into! (unreleased) reads straight into acc and drops this copy.
+  (System/arraycopy (ffi/read-array buf n) 0 acc off n))
 
 (defn- concat-bytes
   "One byte array from several."
@@ -84,11 +96,11 @@
           (recur (next as) (+ off (alength a))))))))
 
 (defn- head-end
-  "Index of the \r\n\r\n that ends the request head, or nil. from skips the
-  prefix an earlier pass already scanned (callers back it off by 3 so a
-  terminator straddling the seam is still seen)."
-  [^bytes bs from]
-  (let [last-start (- (alength bs) 4)]
+  "Index of the \r\n\r\n that ends the request head within bs[0,have), or nil.
+  from skips the prefix an earlier pass already scanned (callers back it off by
+  3 so a terminator straddling the seam is still seen)."
+  [^bytes bs from have]
+  (let [last-start (- have 4)]
     (loop [i (max 0 from)]
       (when (<= i last-start)
         (if (and (= 13 (aget bs i))       (= 10 (aget bs (+ i 1)))
@@ -121,19 +133,25 @@
   [conn acc max-bytes recv! idle-recv!]
   (let [buf (ffi/alloc socket/bufsize)]
     (try
-      ;; scanned: how far into acc the head-terminator search already ran.
-      ;; framing: {:head s :from i :to i} — where the body starts and ends in
-      ;; acc — resolved once the head is complete, so the head is neither
-      ;; re-scanned nor re-parsed on every trickle of the body.
-      (loop [^bytes acc acc, scanned 0, framing nil]
-        (let [have    (alength acc)
-              framing (or framing
-                          (when-let [he (head-end acc scanned)]
+      ;; acc is a capacity buffer, valid over [0,have) — it is not sliced to
+      ;; size until the request is framed. scanned: how far into it the
+      ;; head-terminator search already ran. framing: {:head s :from i :to i} —
+      ;; where the body starts and ends — resolved once the head is complete,
+      ;; so the head is neither re-scanned nor re-parsed on every trickle of
+      ;; the body. A read can overshoot :to (the next pipelined request rode
+      ;; along), which is why the buffer keeps room past it rather than being
+      ;; sized to the frame exactly.
+      (loop [^bytes acc acc, have (alength acc), scanned 0, framing nil]
+        (let [framing (or framing
+                          (when-let [he (head-end acc scanned have)]
                             (let [head (String. acc 0 he "UTF-8")
                                   f (body-framing head)]
                               (if (number? f)
                                 {:head head :from (+ he 4) :to (+ he 4 f)}
-                                f))))]
+                                f))))
+              ;; map? not framing? — an unframeable head is a KEYWORD here, and
+              ;; (:to :bad) is nil
+              limit   (+ (if (map? framing) (:to framing) max-bytes) socket/bufsize)]
           (cond
             (keyword? framing) framing      ; :bad -> 400, :unsupported -> 501
 
@@ -142,7 +160,9 @@
               :headers-too-big              ; headers never ended -> 431
               (let [n ((if (zero? have) idle-recv! recv!) conn buf)]
                 (cond
-                  (pos? n) (recur (append-bytes acc buf n) (max 0 (- have 3)) nil)
+                  (pos? n) (let [acc (ensure-capacity acc have n limit)]
+                             (fill! acc have buf n)
+                             (recur acc (+ have n) (max 0 (- have 3)) nil))
                   (zero? have) :closed
                   :else :bad)))
 
@@ -158,7 +178,9 @@
             :else
             (let [n (recv! conn buf)]
               (if (pos? n)
-                (recur (append-bytes acc buf n) scanned framing)
+                (let [acc (ensure-capacity acc have n limit)]
+                  (fill! acc have buf n)
+                  (recur acc (+ have n) scanned framing))
                 :bad)))))
       (finally (ffi/free buf)))))
 

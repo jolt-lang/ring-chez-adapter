@@ -1399,8 +1399,12 @@
   [0x00 0xff 0xfe 0x41 0x0d 0x0a 0x0d 0x0a 0x80 0xc3 0x28 0x00])
 
 (defn- drain
-  "Every octet of a Ring body InputStream. (.readAllBytes does not resolve
-  under jolt; io/copy and .read do.)"
+  "Every octet of a Ring body InputStream. io/copy rather than .readAllBytes
+  because this suite loads jolt-lang/http-client to drive requests, and that
+  library replaces java.io.ByteArrayInputStream process-wide with its own
+  tagged-table shim — which has no .readAllBytes (and is ~3600x slower to
+  drain). A handler in an app that does not pull http-client gets the real
+  host stream and can call .readAllBytes."
   [in]
   (let [out (java.io.ByteArrayOutputStream.)]
     (io/copy in out)
