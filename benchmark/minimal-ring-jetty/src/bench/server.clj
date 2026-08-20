@@ -1,7 +1,7 @@
 (ns bench.server
   (:require [clojure.string :as str]
-            [ring.adapter.undertow :refer [run-undertow]]
-            [ring.adapter.undertow.response :as ures]
+            [ring.adapter.jetty :refer [run-jetty]]
+            [ring.core.protocols :as protocols]
             [ring.websocket :as ws])
   (:import [java.io OutputStream IOException]))
 
@@ -11,25 +11,20 @@
 (defn- event-bytes [i]
   (.getBytes (format "id: %d\nevent: tick\ndata: {\"tick\":%d}\n\n" i i) "UTF-8"))
 
-;; The adapter streams InputStream bodies with io/copy and never flushes, so
-;; small events sit in Undertow's write buffer until it fills. Flushing after
-;; each event is what makes SSE actually stream.
+;; SSE over the portable Ring streaming protocol. The adapter hands the body an
+;; OutputStream and does not flush, so each event is flushed here — without that
+;; small events sit in Jetty's write buffer until it fills.
 (defrecord SSEBody [interval-ms total]
-  ures/RespondBody
-  (respond [_ exchange]
-    (if (.isInIoThread exchange)
-      (.dispatch exchange ^Runnable (fn [] (let [body (->SSEBody interval-ms total)]
-                                             (ures/respond body exchange))))
-      (do
-        (when-not (.isBlocking exchange) (.startBlocking exchange))
-        (let [^OutputStream os (.getOutputStream exchange)]
-          (try
-            (dotimes [i total]
-              (when (pos? i) (Thread/sleep interval-ms))
-              (.write os (event-bytes i))
-              (.flush os))
-            (catch IOException _)
-            (finally (.endExchange exchange))))))))
+  protocols/StreamableResponseBody
+  (write-body-to-stream [_ _response out]
+    (let [^OutputStream os out]
+      (try
+        (dotimes [i total]
+          (when (pos? i) (Thread/sleep interval-ms))
+          (.write os ^bytes (event-bytes i))
+          (.flush os))
+        (catch IOException _)
+        (finally (.close os))))))
 
 ;; The benchmark runs no middleware (see benchmark/README.md), so the query
 ;; string is parsed here rather than by wrap-params.
@@ -72,6 +67,6 @@
 
 (defn -main
   [& _args]
-  (let [port (Long/parseLong (or (System/getenv "PORT") "8080"))]
+  (let [port (Long/parseLong (or (System/getenv "PORT") "8082"))]
     (println "listening on 0.0.0.0:" port)
-    (run-undertow app {:host "0.0.0.0" :port port})))
+    (run-jetty app {:host "0.0.0.0" :port port :join? true})))

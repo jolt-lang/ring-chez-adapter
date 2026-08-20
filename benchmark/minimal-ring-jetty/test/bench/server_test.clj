@@ -1,5 +1,5 @@
 (ns bench.server-test
-  (:require [clojure.test :refer [deftest is testing]]
+  (:require [clojure.test :refer [deftest is]]
             [clojure.string :as str]
             [ring.websocket.protocols :as wsp]
             [bench.server :as server]))
@@ -32,9 +32,18 @@
 (deftest sse-defaults-applied
   (let [resp (server/app {:request-method :get :uri "/sse"})]
     (is (= 200 (:status resp)))
-    (is (instance? bench.server.SSEBody (:body resp)))
     (is (= 1000 (:interval-ms (:body resp))))
     (is (= 10 (:total (:body resp))))))
+
+(deftest sse-body-streams-and-flushes
+  (let [flushes (atom 0)
+        out (proxy [java.io.ByteArrayOutputStream] [] (flush [] (swap! flushes inc)))
+        body (server/->SSEBody 0 3)]
+    (ring.core.protocols/write-body-to-stream body {} out)
+    (let [text (.toString out "UTF-8")]
+      (is (= 3 (count (re-seq #"event: tick" text))))
+      (is (str/starts-with? text "id: 0\n")))
+    (is (<= 3 @flushes))))
 
 (deftest ws-route-returns-listener-map
   (let [resp (server/app {:request-method :get :uri "/ws"})]

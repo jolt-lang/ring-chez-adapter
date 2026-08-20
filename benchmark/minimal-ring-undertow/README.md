@@ -3,6 +3,8 @@
 Minimal Ring benchmark server on [Undertow](http://undertow.io) via
 [ring-undertow-adapter](https://github.com/luminus-framework/ring-undertow-adapter),
 exposing plain HTTP routes, Server-Sent Events, and a WebSocket echo endpoint.
+Same handler and same endpoints as `../minimal-ring-jetty`, so the two JVM
+adapters are directly comparable to each other and to `ring-chez-adapter`.
 
 ## Run
 
@@ -40,12 +42,14 @@ for its duration; scale with `:worker-threads`/`:io-threads` passed to
 
 Sample (`ab -n 20000 -c 100`, M-series MacBook, server and client colocated):
 ~19k req/s plaintext, 0 failed requests — `ab` saturates before the server does.
+Current numbers for all three servers are in `benchmark/README.md`.
 
 ## Implementation notes
 
-- Routing is a `case` on `[request-method uri]`; middleware is
-  `ring-defaults` `api-defaults`. No router or serialization libraries —
-  nothing between the handler and the adapter except defaults.
+- Routing is a `case` on `[request-method uri]`, and there is **no middleware**
+  — the query string is parsed in the handler. That is deliberate: the
+  benchmark compares adapters, so nothing may sit between the handler and the
+  adapter. See `benchmark/README.md`.
 - The WebSocket endpoint uses the portable `ring.websocket` listener API from
   ring-core (`{:ring.websocket/listener {...}}`), not the adapter-proprietary
   callback map.
