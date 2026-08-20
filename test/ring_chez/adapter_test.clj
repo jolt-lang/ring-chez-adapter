@@ -60,14 +60,28 @@
       (ffi/free sa))
     fd))
 
+(defn- send-buf!
+  "Write all n bytes of buf to fd. A short send is normal and gets retried, and
+  so does EINTR — under a loaded suite send(2) is interrupted often enough to
+  matter. The old loop stopped on any non-positive return, which silently sent
+  a PARTIAL request (or none at all): the server then sat waiting for a body
+  that never arrived and closed on its idle timeout, and the test saw an empty
+  response with nothing to say why. Anything that is not a retry throws."
+  [fd buf n]
+  (loop [off 0]
+    (when (< off n)
+      (let [sent (t-send fd (+ buf off) (- n off) 0)]
+        (cond
+          (pos? sent) (recur (+ off sent))
+          (and (neg? sent) (or (poller/eintr?) (poller/eagain?))) (recur off)
+          :else (throw (ex-info "client send failed"
+                                {:sent sent :offset off :length n})))))))
+
 (defn client-send [fd ^String s]
   (let [buf (ffi/alloc (max 1 (* 4 (count s))))
         n (ffi/write-bytes buf s)]
-    (loop [off 0]
-      (when (< off n)
-        (let [sent (t-send fd (+ buf off) (- n off) 0)]
-          (when (pos? sent) (recur (+ off sent))))))
-    (ffi/free buf)))
+    (try (send-buf! fd buf n)
+         (finally (ffi/free buf)))))
 
 ;; Responses accumulate as raw bytes and decode once, at the end: Content-Length
 ;; is an octet count, and a multibyte codepoint can straddle two recv calls.
@@ -147,11 +161,8 @@
 (defn t-send-bytes [fd bs]
   (let [n (count bs) buf (ffi/alloc (max 1 n))]
     (doseq [[i b] (map-indexed vector bs)] (ffi/write buf :uint8 i b))
-    (loop [off 0]
-      (when (< off n)
-        (let [sent (t-send fd (+ buf off) (- n off) 0)]
-          (when (pos? sent) (recur (+ off sent))))))
-    (ffi/free buf)))
+    (try (send-buf! fd buf n)
+         (finally (ffi/free buf)))))
 
 (def t-pending (atom {}))
 
