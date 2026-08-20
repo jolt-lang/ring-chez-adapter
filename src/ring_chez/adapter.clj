@@ -154,7 +154,7 @@
                                                                   "Connection" "close"}
                                             :body "Not Implemented"} false))
           (map? r)
-          (let [{:keys [request error]} (http/request->ring (:text r) port)]
+          (let [{:keys [request error]} (http/request->ring (:head r) (:body r) port)]
             (cond
               error (send! conn (http/response->string error false))
                (and ws-handler (upgrade-request? request))

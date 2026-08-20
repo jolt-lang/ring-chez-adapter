@@ -92,31 +92,38 @@
 ;; request on an idle keep-alive connection — under the threads strategy it
 ;; waits in poll(2) slices so a queued connection can retire the idle one
 ;; promptly instead of waiting out the full keep-alive timeout. Returns
-;; {:text t :leftover bs} when a full request (headers + Content-Length body)
-;; is available, :closed when the peer went away (or recv timed out) before
-;; sending anything, :bad on EOF/timeout mid-request or an unframeable head,
-;; :unsupported for a Transfer-Encoding we do not decode.
+;; {:head s :body bs :leftover bs} when a full request (headers +
+;; Content-Length body) is available, :closed when the peer went away (or
+;; recv timed out) before sending anything, :bad on EOF/timeout mid-request
+;; or an unframeable head, :unsupported for a Transfer-Encoding we do not
+;; decode.
 (defn read-request
   "Reads one request (head + content-length body). Accumulation is capped at
   max-bytes — a client that never terminates (or ships an oversized request)
-  gets :too-big instead of exhausting memory. acc and :leftover are byte
-  arrays; :text is the framed request decoded as UTF-8."
+  gets :too-big instead of exhausting memory. acc, :body and :leftover are
+  byte arrays; only :head — which RFC 7230 restricts to ASCII — is decoded.
+  The body stays opaque octets: it may be an image, a gzip stream, or text in
+  some other charset, none of which survive a UTF-8 decode."
   [conn acc max-bytes recv! idle-recv!]
   (let [buf (ffi/alloc socket/bufsize)]
     (try
       ;; scanned: how far into acc the head-terminator search already ran.
-      ;; frame: the whole request's length in octets, resolved once the head
-      ;; is complete (not re-parsed on every trickle of the body).
-      (loop [^bytes acc acc, scanned 0, frame nil]
-        (let [have  (alength acc)
-              frame (or frame
-                        (when-let [he (head-end acc scanned)]
-                          (let [f (body-framing (String. acc 0 he "UTF-8"))]
-                            (if (number? f) (+ he 4 f) f))))]
+      ;; framing: {:head s :from i :to i} — where the body starts and ends in
+      ;; acc — resolved once the head is complete, so the head is neither
+      ;; re-scanned nor re-parsed on every trickle of the body.
+      (loop [^bytes acc acc, scanned 0, framing nil]
+        (let [have    (alength acc)
+              framing (or framing
+                          (when-let [he (head-end acc scanned)]
+                            (let [head (String. acc 0 he "UTF-8")
+                                  f (body-framing head)]
+                              (if (number? f)
+                                {:head head :from (+ he 4) :to (+ he 4 f)}
+                                f))))]
           (cond
-            (keyword? frame) frame          ; :bad -> 400, :unsupported -> 501
+            (keyword? framing) framing      ; :bad -> 400, :unsupported -> 501
 
-            (nil? frame)                    ; head still incomplete
+            (nil? framing)                  ; head still incomplete
             (if (> have max-bytes)
               :headers-too-big              ; headers never ended -> 431
               (let [n ((if (zero? have) idle-recv! recv!) conn buf)]
@@ -125,31 +132,30 @@
                   (zero? have) :closed
                   :else :bad)))
 
-            (> frame max-bytes) :too-big    ; declared request exceeds the cap -> 413
+            ;; declared request exceeds the cap -> 413
+            (> (:to framing) max-bytes) :too-big
 
-            (>= have frame)
-            {:text (String. acc 0 frame "UTF-8")
-             :leftover (if (= have frame)
-                         no-bytes
-                         (java.util.Arrays/copyOfRange acc frame have))}
+            (>= have (:to framing))
+            (let [{:keys [head from to]} framing]
+              {:head head
+               :body (if (= from to) no-bytes (java.util.Arrays/copyOfRange acc from to))
+               :leftover (if (= have to) no-bytes (java.util.Arrays/copyOfRange acc to have))})
 
             :else
             (let [n (recv! conn buf)]
               (if (pos? n)
-                (recur (append-bytes acc buf n) scanned frame)
+                (recur (append-bytes acc buf n) scanned framing)
                 :bad)))))
       (finally (ffi/free buf)))))
 
 ;; --- request -> Ring map ----------------------------------------------------
 (defn request->ring
-  "Parse raw request text into {:request ring-map}, or {:error response} when
-  the request is malformed (400) or speaks an unsupported HTTP version (505).
-  HTTP/1.1 requests must carry a Host header (RFC 7230 §5.4)."
-  [text port]
-  (let [blank (str/index-of text "\r\n\r\n")
-        head (if blank (subs text 0 blank) text)
-        body (if blank (subs text (+ blank 4)) "")
-        lines (str/split head #"\r\n")
+  "Parse a request head (as read-request framed it) and its body octets into
+  {:request ring-map}, or {:error response} when the request is malformed
+  (400) or speaks an unsupported HTTP version (505). HTTP/1.1 requests must
+  carry a Host header (RFC 7230 §5.4)."
+  [head ^bytes body port]
+  (let [lines (str/split head #"\r\n")
         parts (str/split (or (first lines) "") #" ")
         headers (reduce (fn [m line]
                           (let [i (str/index-of line ":")]
@@ -187,7 +193,11 @@
                    :request-method (keyword (str/lower-case (first parts)))
                    :protocol       (nth parts 2)
                    :headers        headers
-                   :body           (when (pos? (count body)) (java.io.StringReader. body))}}))))
+                   ;; an InputStream per the Ring spec, over the body's own
+                   ;; octets — a handler that wants text slurps it (UTF-8 by
+                   ;; default), one that wants bytes reads them unmangled
+                   :body           (when (pos? (alength body))
+                                     (java.io.ByteArrayInputStream. body))}}))))
 
 ;; --- Ring response -> the response string -----------------------------------
 (def ^:private status-text

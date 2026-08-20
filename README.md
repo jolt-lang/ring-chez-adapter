@@ -84,12 +84,19 @@ never frame a body. Malformed requests get `400`, unknown HTTP versions `505`,
 and a handler-supplied `Connection: close` header is honored (the connection
 closes after that response).
 
-Requests are framed in octets: the socket accumulates raw bytes and only the
-completed request is decoded as UTF-8, so a multibyte body matches its
-`Content-Length` and a codepoint split across two reads survives. A request
-whose `Content-Length` is missing is treated as bodyless; one that is not a
-single non-negative integer gets `400`. `Transfer-Encoding` is not decoded —
-such a request gets `501` rather than being framed by guesswork.
+Requests are framed in octets: the socket accumulates raw bytes, and only the
+head — which RFC 7230 restricts to ASCII — is decoded (as UTF-8). So a
+multibyte body matches its `Content-Length`, and a codepoint split across two
+reads survives. A request whose `Content-Length` is missing is treated as
+bodyless; one that is not a single non-negative integer gets `400`.
+`Transfer-Encoding` is not decoded — such a request gets `501` rather than
+being framed by guesswork.
+
+`:body` is a `java.io.InputStream` over the body's own octets (`nil` when the
+request has no body), so an upload stays byte-exact — an image, a gzip stream,
+or text in some charset other than UTF-8 all arrive as sent. `slurp` it for
+text (UTF-8 by default), or `clojure.java.io/copy` it for bytes. Note that
+`.readAllBytes` does not resolve under jolt; use `copy` or `.read`.
 
 ## Error handling
 

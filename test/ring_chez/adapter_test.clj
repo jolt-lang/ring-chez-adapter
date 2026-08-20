@@ -5,6 +5,7 @@
             [jolt.http-client :as http]
             [clojure.string :as str]
             [clojure.core.async :as a]
+            [clojure.java.io :as io]
             [jolt.ffi :as ffi]
             [jolt.io-poller :as poller]))
 
@@ -1350,6 +1351,59 @@
                  (ask "GET / HTTP/1.1\r\nHost: t\r\nX-Note: content-length: 9\r\n\r\n"))
       (finally (adapter/stop-server server)))))
 
+(defn- hex [bs]
+  (apply str (map #(format "%02x" (bit-and 0xff (long %))) bs)))
+
+;; bytes no UTF-8 decode survives: a lone continuation byte, a truncated
+;; two-byte sequence, NUL, 0xff — plus an embedded CRLFCRLF, which a body
+;; re-scanned as wire would mistake for the end of a head
+(def ^:private binary-body
+  [0x00 0xff 0xfe 0x41 0x0d 0x0a 0x0d 0x0a 0x80 0xc3 0x28 0x00])
+
+(defn- drain
+  "Every octet of a Ring body InputStream. (.readAllBytes does not resolve
+  under jolt; io/copy and .read do.)"
+  [in]
+  (let [out (java.io.ByteArrayOutputStream.)]
+    (io/copy in out)
+    (.toByteArray out)))
+
+(defn- binary-handler [req]
+  (let [bs (if-let [b (:body req)] (drain b) (byte-array 0))]
+    {:status 200
+     :headers {"Content-Type" "text/plain"
+               "X-Body-Hex" (hex bs)
+               "X-Body-Octets" (str (alength bs))
+               "X-Body-Nil" (str (nil? (:body req)))}
+     :body "ok"}))
+
+(defn test-binary-request-body []
+  ;; a body is opaque octets; decoding it as UTF-8 replaces every byte that
+  ;; is not valid UTF-8 with U+FFFD and the handler never sees what was sent
+  (let [server (adapter/run-server binary-handler
+                                   {:port 8452 :worker-threads 1
+                                    :keep-alive-timeout-ms 2000})]
+    (try
+      (Thread/sleep 250)
+      (let [head (str "POST /upload HTTP/1.1\r\nHost: t\r\n"
+                      "Content-Type: application/octet-stream\r\n"
+                      "Content-Length: " (count binary-body) "\r\n\r\n")
+            fd (client-connect 8452 3000)]
+        (t-send-bytes fd (concat (utf8-bytes head) binary-body))
+        (let [r (or (client-recv fd) "")]
+          (check-has "binary: octets delivered whole"
+                     (str "X-Body-Octets: " (count binary-body)) r)
+          (check-has "binary: bytes survive verbatim"
+                     (str "X-Body-Hex: " (hex binary-body)) r))
+        ;; the embedded CRLFCRLF must not have been read as a request
+        ;; boundary — the connection is still framed where we left it
+        (client-send fd "GET /after HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [r (or (client-recv fd) "")]
+          (check-has "binary: connection still framed" "200 OK" r)
+          (check-has "binary: bodyless request has nil :body" "X-Body-Nil: true" r))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
 (defn -main [& _]
   (println "ring adapter over jolt.ffi sockets")
 
@@ -1437,6 +1491,7 @@
   (test-utf8-large-body)
   (test-utf8-fiber-request-body)
   (test-unframeable-requests)
+  (test-binary-request-body)
 
   (if (zero? @failures)
     (println "all passed")
