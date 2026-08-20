@@ -47,12 +47,20 @@
       (ffi/free tv)
       r)))
 
+;; frame bytes buffered per client fd — TCP hands over whatever arrived, not
+;; what was asked for, so a 2-byte header read would otherwise swallow the
+;; rest of the frame. Keyed by fd, which the kernel reuses.
+(def t-pending (atom {}))
+
 (defn client-connect
   "Open a raw TCP connection to 127.0.0.1:port; returns fd. recv times out
   after rcvtimeo-ms so tests can't hang forever."
   [port & [rcvtimeo-ms]]
   (let [fd (t-socket 2 1 0)]
     (when (neg? fd) (throw (ex-info "client socket() failed" {})))
+    ;; the kernel reuses fd numbers, and t-pending is keyed by fd: anything a
+    ;; previous connection left buffered would be read as this one's frames
+    (swap! t-pending dissoc fd)
     (when rcvtimeo-ms (t-set-rcvtimeo! fd rcvtimeo-ms))
     (let [sa (t-sockaddr port)]
       (when (neg? (t-connect fd sa 16))
@@ -147,7 +155,9 @@
               (- (alength raw) from))]
     (java.util.Arrays/copyOfRange raw from (+ from len))))
 
-(defn client-close [fd] (t-close fd))
+(defn client-close [fd]
+  (swap! t-pending dissoc fd)
+  (t-close fd))
 
 ;; --- ws wire helpers (client side; all payloads ASCII so string ops are safe
 ;; only for headers — frames go through t-send-bytes / t-recv-n byte paths) ---
@@ -164,7 +174,6 @@
     (try (send-buf! fd buf n)
          (finally (ffi/free buf)))))
 
-(def t-pending (atom {}))
 
 (defn- t-fill! [fd]
   (let [buf (ffi/alloc 65536)]
@@ -257,6 +266,20 @@
   "client-recv-until-bytes decoded as UTF-8."
   [fd marker]
   (String. (client-recv-until-bytes fd marker) "UTF-8"))
+
+(defn ws-read-handshake!
+  "Read a response head off fd and hand whatever followed the blank line to the
+  frame buffer. The server may put its 101 and its first frame in one segment
+  — which is exactly what this suite tests the SERVER for — so a reader that
+  drops the surplus desynchronises every frame read after it. Returns the head."
+  [fd]
+  (let [^bytes bs (client-recv-until-bytes fd "\r\n\r\n")
+        view (latin1 bs)
+        end (+ (or (str/index-of view "\r\n\r\n") (- (alength bs) 4)) 4)]
+    (when (< end (alength bs))
+      (let [surplus (mapv #(bit-and 0xff (aget bs %)) (range end (alength bs)))]
+        (swap! t-pending update fd #(into surplus (vec %)))))
+    (subs view 0 end)))
 
 (defn dechunk
   "A chunked transfer body -> the octets it carries."
@@ -639,7 +662,7 @@
                              "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                              "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
                              "Sec-WebSocket-Version: 13\r\n\r\n"))
-        (let [hs (client-recv-until fd "\r\n\r\n")]
+        (let [hs (ws-read-handshake! fd)]
           (check-has "ws: 101 switching protocols" "101" hs)
           (check-has "ws: accept token (golden)"
                      "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=" hs))
@@ -1315,8 +1338,32 @@
                          "Upgrade: websocket\r\nConnection: Upgrade\r\n"
                          "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
                          "Sec-WebSocket-Version: 13\r\n\r\n"))
-    (client-recv-until fd "\r\n\r\n")
+    (ws-read-handshake! fd)
     fd))
+
+(defn test-harness-handshake-surplus []
+  ;; Harness self-test. ws-read-handshake! has to keep whatever followed the
+  ;; blank line, because a server may put its 101 and its first frame in one
+  ;; segment — which is the case test-ws-leftover-frame drives at the server.
+  ;; A reader that dropped the surplus read every later frame misaligned; that
+  ;; happened only where the segments coalesced, so it passed on macOS and
+  ;; failed on Linux CI. A small keep-alive response is the deterministic
+  ;; stand-in: head and body arrive together.
+  (let [server (adapter/run-server (fn [_] {:status 200 :body "surplus-body"})
+                                   {:port 8469 :worker-threads 2})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8469 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [head (ws-read-handshake! fd)
+              carried (apply str (map char (get @t-pending fd)))]
+          (check "harness: head stops at the blank line"
+                 true (str/ends-with? head "\r\n\r\n"))
+          (check "harness: bytes past the head are carried, not dropped"
+                 "surplus-body" carried))
+        (client-close fd)
+        (check "harness: buffer cleared on close" nil (get @t-pending fd)))
+      (finally (adapter/stop-server server)))))
 
 (defn test-ws-large-frame []
   ;; encode-frame had only the 7-bit and 16-bit length forms, so a payload of
@@ -1993,6 +2040,7 @@
   (test-write-timeout-zero-disables)
 
   ;; --- Round 2: RFC 6455 codec ---
+  (test-harness-handshake-surplus)
   (test-ws-large-frame)
   (test-ws-leftover-frame)
   (test-ws-fragmented-message)
