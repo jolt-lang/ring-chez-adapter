@@ -2075,16 +2075,26 @@
 ;; timeout (RFC-0008).
 (defn- stop-closes-live-conn [strategy port]
   (let [calls  (atom 0)
+        ;; the body names THIS server, so a response served by anyone else is
+        ;; identifiable rather than just an anonymous 200
+        token  (str "tok-" (name strategy) "-" port)
         h      (fn [_] (swap! calls inc)
-                 {:status 200 :headers {"Content-Type" "text/plain"} :body "ok"})
+                 {:status 200 :headers {"Content-Type" "text/plain"} :body token})
         server (adapter/run-server h {:port port :strategy strategy})
         label  (str (name strategy) " stop: ")]
     (Thread/sleep 250)
     (let [fd (client-connect port 3000)]
       (try
         (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
-        (check (str label "served before the stop") true
-               (str/starts-with? (or (client-recv fd) "") "HTTP/1.1 200"))
+        (let [first-resp (or (client-recv fd) "")]
+          (check (str label "served before the stop") true
+                 (str/starts-with? first-resp "HTTP/1.1 200"))
+          ;; whoever answered must be this server: a 200 carrying another
+          ;; server's token means the connection was served by a stale fiber
+          (check (str label "answered by this server") true
+                 (str/includes? first-resp token))
+          (when-not (str/includes? first-resp token)
+            (println "  [stop: fd" fd "wanted" token "got" (pr-str first-resp) "]")))
         (adapter/stop-server server)
         ;; the send itself may fail (RST on a closed peer) — that is the same
         ;; answer as reading EOF, so both count as "not served"
@@ -2100,6 +2110,67 @@
 
 (defn test-stop-closes-live-conn-fibers []
   (stop-closes-live-conn :fibers 8531))
+
+;; A stopped server must never answer anybody else's connection.
+;;
+;; conn-close! used to close(fd) and THEN poller/forget!, and forget! resumes
+;; every fiber parked on that fd — whose retry recv fiber-recv! assumed would
+;; answer EBADF. close() had already freed the fd NUMBER by then, and the
+;; resumed fiber does not run until the scheduler reaches it, so an acceptor
+;; could be handed that number first: the stale fiber's recv then read a LIVE
+;; connection belonging to somebody else and answered it out of its own,
+;; already-stopped server's handler. ~2.5% of responses on :fibers; :threads
+;; never showed it, because only the fibers path parks on the poller.
+;;
+;; Every server stamps its own token into every body, so a response carrying
+;; the wrong one names the bug instead of looking like an unexplained flake.
+(defn- serves-only-own-conns [strategy base]
+  (let [rounds 16
+        conns  8
+        bad    (atom [])]
+    (dotimes [i rounds]
+      (let [pa (+ base (* 2 (mod i 8)))
+            pb (inc pa)
+            ta (str "tok-A-" i)
+            tb (str "tok-B-" i)
+            a  (adapter/run-server (fn [_] {:status 200 :body ta})
+                                   {:port pa :strategy strategy})]
+        (Thread/sleep 60)
+        ;; live conns on A, left open so their fibers are parked on the poller
+        ;; when the stop below wakes them
+        (let [fds (doall (for [_ (range conns)]
+                           (let [fd (client-connect pa 2000)]
+                             (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+                             (client-recv fd)
+                             fd)))]
+          (adapter/stop-server a)
+          ;; release the client numbers too: the bigger the pool of
+          ;; just-freed fds, the likelier the acceptor below is handed one
+          (doseq [fd fds] (client-close fd)))
+        (let [b (adapter/run-server (fn [_] {:status 200 :body tb})
+                                    {:port pb :strategy strategy})]
+          (try
+            (Thread/sleep 60)
+            (let [fds (doall (for [_ (range conns)] (client-connect pb 2000)))]
+              (doseq [fd fds]
+                (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n"))
+              (doseq [fd fds]
+                (let [r (or (client-recv fd) "")]
+                  (when-not (str/includes? r tb)
+                    (swap! bad conj {:round i :wanted tb
+                                     :got (subs r 0 (min 120 (count r)))}))))
+              (doseq [fd fds] (client-close fd)))
+            (finally (adapter/stop-server b))))))
+    (doseq [b (take 3 @bad)]
+      (println "  [cross-serve:" (pr-str b) "]"))
+    (check (str (name strategy) " isolation: no conn served by a stopped server")
+           0 (count @bad))))
+
+(defn test-serves-only-own-conns-fibers []
+  (serves-only-own-conns :fibers 8600))
+
+(defn test-serves-only-own-conns-threads []
+  (serves-only-own-conns :threads 8620))
 
 ;; --- Round 6: operability ---------------------------------------------------------
 
@@ -3413,6 +3484,8 @@
   ;; --- Wave 2 round 1: stop-server closes live connections ---
   (run-test "test-stop-closes-live-conn-threads" test-stop-closes-live-conn-threads)
   (run-test "test-stop-closes-live-conn-fibers" test-stop-closes-live-conn-fibers)
+  (run-test "test-serves-only-own-conns-fibers" test-serves-only-own-conns-fibers)
+  (run-test "test-serves-only-own-conns-threads" test-serves-only-own-conns-threads)
 
   ;; --- Round 6: operability ---
   (run-test "test-graceful-drain" test-graceful-drain)
