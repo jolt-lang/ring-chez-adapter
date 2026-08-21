@@ -44,8 +44,10 @@
         (ffi/write salen :int 0 socket/sockaddr-size)
         (let [conn (socket/c-accept listen-fd sa salen)]
           (cond
-            ;; stopped between accept() returning and this check: nobody
-            ;; downstream will ever see this fd, so close it here or it leaks
+            ;; already stopped: nobody downstream will ever see this fd, so
+            ;; close it here or it leaks. This is only an early-out — the
+            ;; check that actually closes the race is inside serve!, which
+            ;; registers the conn BEFORE reading running? (see run-server).
             (not @running?) (when-not (neg? conn) (socket/c-close conn))
             ;; a failing accept that is retried immediately burns a core:
             ;; EMFILE persists until an fd is released, and nothing here
@@ -759,8 +761,22 @@
                               (fn [conn peer]
                                 (poller/nonblock! conn)
                                 (swap! (:open stats) inc)
-                                (fiber-serve (assoc base-info :remote-addr peer) cfg
-                                             (register-conn! conns conn peer true) conns))))
+                                ;; publish, THEN check — the order is the whole
+                                ;; interlock. stop-server clears running? before
+                                ;; it sweeps, so a conn is either already in
+                                ;; `conns` when the sweep reads it, or this read
+                                ;; sees false and cleans up here. Reading
+                                ;; running? first (serve-loop's cond, which is
+                                ;; where this used to be decided) let a conn land
+                                ;; in `conns` AFTER the sweep had passed over it,
+                                ;; with nobody left to take it down: a stopped
+                                ;; server went on serving it, and its fd leaked.
+                                (let [entry (register-conn! conns conn peer true)]
+                                  (if @running?
+                                    (fiber-serve (assoc base-info :remote-addr peer)
+                                                 cfg entry conns)
+                                    (when (claim-close! entry)
+                                      (conn-release! conns entry stats)))))))
           {:socket fd :port port :host host :running running? :conns conns :sweep sweep
            :handler handler-box :ws-handler ws-handler-box :stats stats})
         (let [work  (async/chan)  ; unbuffered: acceptor parks when all workers busy
@@ -782,7 +798,16 @@
                               (fn [conn peer]
                                 (swap! pending inc)
                                 (swap! (:open stats) inc)
-                                (async/>!! work (register-conn! conns conn peer false)))))
+                                ;; publish, then check — see the fibers arm. The
+                                ;; put is part of the same condition: >!! answers
+                                ;; false on a channel stop-server has closed, and
+                                ;; a conn nobody can take off it needs the same
+                                ;; cleanup as one accepted after the sweep.
+                                (let [entry (register-conn! conns conn peer false)]
+                                  (when-not (and @running? (async/>!! work entry))
+                                    (swap! pending dec)
+                                    (when (claim-close! entry)
+                                      (conn-release! conns entry stats)))))))
           {:socket fd :port port :host host :running running? :work work :conns conns
            :handler handler-box :ws-handler ws-handler-box :stats stats})))))
 

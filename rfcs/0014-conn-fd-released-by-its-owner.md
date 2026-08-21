@@ -16,6 +16,10 @@ two: `conn-down!` ends the connection with `shutdown(2)` and keeps the number
 reserved, and only the worker or fiber that owns the connection calls
 `close(2)`.
 
+A second, narrower hole in the same lifecycle: the acceptor read `running?`
+*before* it registered the connection, so one accepted as `stop-server` swept
+was never taken down at all. Register first, check after.
+
 ## Motivation
 
 `fiber-recv!` parks on the poller when a read would block, and its docstring
@@ -116,8 +120,62 @@ may perform each.
   its fd; the shutdown wakes the fiber, whose read answers EOF and whose
   `finally` does the release.
 
-No option, no API change. `stop-server`'s observable contract is unchanged:
-connections are dead before it returns.
+No option, no API change. `stop-server`'s observable contract is
+unchanged, and now actually holds in the one case where it did not:
+connections are dead before it returns, and none is left behind.
+
+## The second hole: a conn registered after the sweep
+
+`serve-loop` decided whether to serve by reading `running?` in its `cond`,
+*before* `serve!` published the entry into `conns`:
+
+```
+acceptor:     accept() returns, reads @running? -> true
+stop-server:  running? false; drain; sweep @conns    (conn not in it yet)
+acceptor:     serve! -> register-conn! -> entry lands AFTER the sweep
+```
+
+Nobody ever takes that connection down. On `:fibers` a fiber goes on serving
+it for a server that has stopped; on `:threads` it goes into a closed work
+channel and the fd leaks. This is the case RFC-0008 set out to eliminate,
+still open — and it is the reason `stop-server` could not be said to leave
+nothing behind.
+
+The fix is ordering, not locking: **publish, then check**. `serve!` registers
+the entry first and reads `running?` afterwards, which interlocks with
+`stop-server` clearing `running?` before it sweeps.
+
+| | outcome |
+|---|---|
+| register lands before the sweep | the sweep sees it and takes it down |
+| register lands after the sweep | `running?` was cleared before that sweep, so the read here returns false and the acceptor cleans up |
+| both race | `claim-close!` decides; the loser does nothing |
+
+Airtight given the two orderings that create it: `stop-server` sets
+`running?` before sweeping (it is the first statement), and `serve!`
+registers before reading it. The `running?` branch left in `serve-loop`'s
+`cond` is now only an early-out that avoids the work of `nonblock!` and
+`register-conn!` on an already-stopped server.
+
+The threads arm folds the channel put into the same condition, because
+`>!!` answers false on a channel `stop-server` has already closed and a conn
+nobody can take off it needs exactly the same cleanup. It also unwinds
+`pending`, which the worker's `(io :claim!)` would otherwise have done —
+leaving it high for the life of the server.
+
+### Measuring it
+
+The window is the handful of instructions between the check and the
+register, so it does not show up under ordinary stress: a storm of 20
+stop-during-connect rounds never hit it. Widening it with a `Thread/sleep 5`
+between the two makes it plain, and shows the fix closes the window rather
+than narrowing it — the delay stays in for the "after" column:
+
+```
+                          before      after
+:fibers   12 rounds       9 leaked    0 leaked
+:threads  12 rounds       --          0 leaked
+```
 
 ## Fixing the leaked poller registration
 
@@ -159,6 +217,11 @@ that: the owner is past all its parks by then.
 
 ## Test plan
 
+- `stop-leaves-nothing-behind`, both strategies: connections arriving in a
+  throttled storm while `stop-server` runs, with the clients held **open**
+  afterwards so a conn that missed the sweep keeps `:connections` above zero
+  rather than being reaped for going away. It holds the invariant; it is not
+  a reproducer, for the reason measured above.
 - `serves-only-own-conns`, run for **both** strategies: 16 rounds of start
   server A, open 8 connections, stop it, start server B and request from it;
   every server stamps its own token into every body, and no response may

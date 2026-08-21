@@ -2176,6 +2176,59 @@
 (defn test-serves-only-own-conns-threads []
   (serves-only-own-conns :threads 8620))
 
+;; stop-server must leave nothing behind even while connections are arriving as
+;; it runs. serve-loop read running? BEFORE register-conn! published the entry,
+;; so a conn accepted in that window landed in `conns` AFTER the sweep had
+;; passed over it — a stopped server went on serving it, and its fd leaked.
+;; serve! now registers first and checks after, which interlocks with
+;; stop-server clearing running? before it sweeps: the conn is either in `conns`
+;; when the sweep reads it, or the check sees false and cleans up on the spot.
+;;
+;; Honest about what this is: the window is a couple of microseconds, so this
+;; does not reproduce the bug on its own — a storm of 20 rounds never hit it.
+;; Widening the window to 5ms made it 9 rounds in 12, and 0 with the fix in.
+;; What this holds is the invariant, cheaply: the clients stay OPEN across the
+;; stop, so a connection that missed the sweep keeps the count above zero
+;; rather than being reaped for going away.
+(defn- stop-leaves-nothing-behind [strategy port]
+  (let [server (adapter/run-server (fn [_] {:status 200 :body "x"})
+                                   {:port port :strategy strategy})
+        held     (atom [])
+        stop?    (atom false)
+        ;; throttled and capped: this only needs a connect in flight when the
+        ;; stop lands, and an unbounded storm would run the suite out of fds
+        stormers (doall
+                   (for [_ (range 3)]
+                     (future
+                       (while (and (not @stop?) (< (count @held) 60))
+                         (try (let [fd (client-connect port 2000)]
+                                (swap! held conj fd)
+                                (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n"))
+                              (catch Throwable _ nil))
+                         (Thread/sleep 2)))))]
+    (try
+      (Thread/sleep 150)
+      (adapter/stop-server server)
+      (reset! stop? true)
+      (doseq [f stormers] (deref f 3000 :timeout))
+      ;; an owner may still be unwinding when stop-server returns, so poll
+      (let [give-up (+ (System/currentTimeMillis) 3000)
+            final   (loop []
+                      (let [c (:connections (adapter/server-stats server))]
+                        (if (or (zero? c) (> (System/currentTimeMillis) give-up))
+                          c
+                          (do (Thread/sleep 50) (recur)))))]
+        (check (str (name strategy) " stop: nothing left open afterwards") 0 final))
+      (finally
+        (reset! stop? true)
+        (doseq [fd @held] (try (client-close fd) (catch Throwable _ nil)))))))
+
+(defn test-stop-leaves-nothing-behind-fibers []
+  (stop-leaves-nothing-behind :fibers 8640))
+
+(defn test-stop-leaves-nothing-behind-threads []
+  (stop-leaves-nothing-behind :threads 8641))
+
 ;; --- Round 6: operability ---------------------------------------------------------
 
 (defn- echo-body-handler [req]
@@ -3490,6 +3543,8 @@
   (run-test "test-stop-closes-live-conn-fibers" test-stop-closes-live-conn-fibers)
   (run-test "test-serves-only-own-conns-fibers" test-serves-only-own-conns-fibers)
   (run-test "test-serves-only-own-conns-threads" test-serves-only-own-conns-threads)
+  (run-test "test-stop-leaves-nothing-behind-fibers" test-stop-leaves-nothing-behind-fibers)
+  (run-test "test-stop-leaves-nothing-behind-threads" test-stop-leaves-nothing-behind-threads)
 
   ;; --- Round 6: operability ---
   (run-test "test-graceful-drain" test-graceful-drain)
