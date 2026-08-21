@@ -6,8 +6,8 @@ Add the git dependency to `deps.edn`:
 {:deps
  {jolt-lang/ring-chez-adapter
   {:git/url "https://github.com/jolt-lang/ring-chez-adapter"
-   :git/tag "v0.5.0"
-   :git/sha "684a05b0e51521a497a05b9b2e68877430a3ffde"}}}
+   :git/tag "v0.6.0"
+   :git/sha "68b1e76aa7daf8c359e236c6e35999e18b2b167b"}}}
 ```
 
 Requires the `jolt` binary (Clojure on Chez Scheme, no JVM); the adapter
