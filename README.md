@@ -96,10 +96,24 @@ stop it or pass a different :port`) and `:errno-name "EADDRINUSE"` in
 `ex-data`.
 
 Keep-alive is HTTP/1.1 default, HTTP/1.0 opt-in via `Connection: keep-alive`;
-pipelined requests are handled via leftover carry. `204`/`304`/`HEAD` responses
-never frame a body. Malformed requests get `400`, unknown HTTP versions `505`,
-and a handler-supplied `Connection: close` header is honored (the connection
-closes after that response).
+`Connection` is a token list, so `keep-alive, close` means close. Pipelined
+requests are handled via leftover carry. Malformed requests get `400`, unknown
+HTTP versions `505`, and a handler-supplied `Connection: close` header is
+honored (the connection closes after that response).
+
+`1xx`, `204`, `304` and `HEAD` responses never write a body. They still carry
+the `Content-Length` a `GET` would have where the RFC allows it — a `HEAD` and a
+`304` do, `1xx` and `204` do not — so a client sizing a resource with `HEAD`
+learns something. When the length cannot be known without producing the body
+(a channel), the field is omitted, which is how RFC 9112 says to say "unknown".
+
+`:uri` is normalized once, here: `//` collapses and `.` / `..` resolve, without
+ever escaping the root. A router matches on segments and drops empty ones, so
+`//admin/x` routes exactly like `/admin/x` — while a guard written the obvious
+way, `(str/starts-with? (:uri req) "/admin")`, compares the raw string and does
+not match. Normalizing in the adapter closes that gap for middleware, routing
+and static serving alike. The target exactly as it arrived stays available as
+`:ring-chez/raw-uri`. Percent-decoding is left to middleware, as Ring expects.
 
 The server owns response framing. `Content-Length` always counts the octets
 that actually go on the wire, so a handler that declares a length disagreeing
@@ -158,6 +172,29 @@ a buffer to whatever the stream turns out to be.
 Channel bodies (see below) may yield strings or byte arrays; each chunk's
 size line counts its octets. Anything else on a channel throws, which closes
 that connection rather than writing garbage into the stream.
+
+## Running servers
+
+`run-server` returns a handle; besides `stop-server` it supports:
+
+```clojure
+(adapter/server-stats server)
+;; {:connections 12 :active 3 :requests 48122 :uptime-ms 903111}
+
+(adapter/swap-handler! server new-handler)      ; takes effect next request
+(adapter/swap-ws-handler! server new-ws-handler)
+
+(adapter/stop-server server)                       ; drains, then closes
+(adapter/stop-server server {:drain-timeout-ms 0}) ; closes immediately
+```
+
+`stop-server` stops accepting, then waits for in-flight requests to finish
+rather than cutting a response off mid-write, bounded by `:drain-timeout-ms`
+(default 5000) so a handler that never returns cannot stop it returning either.
+
+`swap-handler!` re-points a running server without a restart, including on
+connections already open — the handler is resolved per request, after the read
+that waits for it.
 
 ## Error handling
 
@@ -269,5 +306,5 @@ requests go to the Ring handler as usual.
 ## Test
 
 ```bash
-jolt -M:test   # 354 checks; drives the server over raw sockets + http-client
+jolt -M:test   # 386 checks; drives the server over raw sockets + http-client
 ```
