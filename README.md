@@ -296,6 +296,39 @@ specifies. A text field's value is a string; an upload is
 There is no temp-file store: the parser buffers in memory, so bound uploads
 with `:max-request-bytes` rather than assuming a large one spools to disk.
 
+### gzip
+
+jolt has no `java.util.zip`, so no existing Ring compression middleware can
+load. `ring-chez.middleware.gzip` is Igropyr's policy over zlib bound through
+`jolt.ffi`:
+
+```clojure
+(require '[ring-chez.middleware.gzip :as gzip])
+(def app (gzip/wrap-gzip handler))            ; outermost, so it sees the finished response
+(def app (gzip/wrap-gzip handler {:min-size 512 :level 9}))
+```
+
+A response is compressed when the client accepts gzip, the body is over
+`:min-size` (default 1024 — below that the gzip header costs more than it
+saves), the content type is compressible (`:types`, default `text/*` plus JSON,
+XML, JavaScript, EDN and SVG), and the handler did not set its own
+`Content-Encoding`. `Vary: Accept-Encoding` is added, and an `ETag` is given a
+distinct value (`"abc"` → `"abc-gz"`), since a gzipped body is a different
+entity.
+
+`Accept-Encoding` is parsed rather than searched: `gzip;q=0` means *no* — a
+client sends it precisely because it cannot decode gzip — and an explicit entry
+beats a wildcard, so `*;q=0, gzip` still compresses.
+
+In-memory bodies only (a string, a byte array, or a seq of those). A `File`, an
+`InputStream` or a channel body passes through uncompressed: compressing a
+stream means framing deflate output chunk by chunk, and the case where that
+clearly pays — static files — is better served by caching the compressed copy.
+
+zlib is bound lazily, from the running process first (the Chez runtime links
+one) and only then from a shared object. Where it cannot be bound the
+middleware is a no-op: uncompressed is always a correct answer.
+
 ## Streaming responses
 
 Return a `core.async` channel as `:body` and the response is sent with
