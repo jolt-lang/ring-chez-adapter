@@ -1,6 +1,7 @@
 (ns ring-chez.adapter-test
   (:require [ring-chez.adapter :as adapter]
             [ring-chez.sse :as sse]
+            [ring-chez.fault :as fault]
             [ring-chez.websocket :as ws]
             [jolt.http-client :as http]
             [clojure.string :as str]
@@ -1336,6 +1337,142 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+;; --- Wave 2 round 2: handler deadline --------------------------------------------
+
+;; Igropyr kills a worker stuck past stuck-ms and answers through on-failure.
+;; We cannot kill a thread, but we can stop waiting for one: the client is
+;; answered 503 and the worker goes back to serving (RFC-0009).
+(defn- deadline-handler [{:keys [uri]}]
+  (cond
+    (= uri "/hang")  (do @(promise) {:status 200 :body "never"})
+    (= uri "/slow")  (do (Thread/sleep 700)
+                         {:status 200 :headers {"Content-Type" "text/plain"} :body "slow done"})
+    (= uri "/throw-late") (do (Thread/sleep 600) (throw (ex-info "late" {})))
+    (= uri "/stream-long")
+    (let [ch (a/chan)]
+      (future (dotimes [i 4] (a/>!! ch (str "part" i)) (Thread/sleep 150))
+              (a/close! ch))
+      {:status 200 :headers {"Content-Type" "text/plain"} :body ch})
+    :else {:status 200 :headers {"Content-Type" "text/plain"} :body "ok"}))
+
+(defn- handler-deadline-reclaims [strategy port]
+  ;; one worker, so "the next request is served" can only mean the worker
+  ;; that was stuck on /hang is back
+  (let [server (adapter/run-server deadline-handler
+                                   {:port port :strategy strategy :worker-threads 1
+                                    :handler-timeout-ms 400})
+        label  (str (name strategy) " deadline: ")]
+    (try
+      (Thread/sleep 250)
+      (let [t0 (System/currentTimeMillis)
+            r  (http/get (str "http://127.0.0.1:" port "/hang")
+                         {:throw-exceptions false})]
+        (check (str label "hung handler answers 503") 503 (:status r))
+        (check (str label "answered near the deadline") true
+               (< (- (System/currentTimeMillis) t0) 4000)))
+      (check (str label "worker reclaimed") 200
+             (:status (http/get (str "http://127.0.0.1:" port "/"))))
+      (finally (adapter/stop-server server)))))
+
+(defn test-handler-deadline-threads [] (handler-deadline-reclaims :threads 8532))
+(defn test-handler-deadline-fibers  [] (handler-deadline-reclaims :fibers 8533))
+
+;; the deadline cuts what it should and nothing else: same handler, one
+;; server with the deadline under its runtime and one with it disabled
+(defn test-handler-deadline-bounds []
+  (let [cut  (adapter/run-server deadline-handler {:port 8534 :handler-timeout-ms 250})]
+    (try
+      (Thread/sleep 250)
+      (check "deadline: slow handler over the deadline is cut" 503
+             (:status (http/get "http://127.0.0.1:8534/slow" {:throw-exceptions false})))
+      (finally (adapter/stop-server cut))))
+  (let [off (adapter/run-server deadline-handler {:port 8535 :handler-timeout-ms 0})]
+    (try
+      (Thread/sleep 250)
+      (let [r (http/get "http://127.0.0.1:8535/slow")]
+        (check "deadline 0: slow handler runs to completion" 200 (:status r))
+        (check-has "deadline 0: its body is served" "slow done" (:body r)))
+      (finally (adapter/stop-server off))))
+  ;; and with room, the same handler is untouched
+  (let [ok (adapter/run-server deadline-handler {:port 8536 :handler-timeout-ms 5000})]
+    (try
+      (Thread/sleep 250)
+      (check "deadline: handler inside the deadline is untouched" 200
+             (:status (http/get "http://127.0.0.1:8536/slow")))
+      (finally (adapter/stop-server ok))))
+  ;; the DEFAULT is off: enforcing a deadline costs a thread handoff per
+  ;; request on this strategy (15-25%), which is not a toll to charge every
+  ;; server by default. Locked down here so it cannot drift back.
+  (let [dflt (adapter/run-server deadline-handler {:port 8558})]
+    (try
+      (Thread/sleep 250)
+      (let [r (http/get "http://127.0.0.1:8558/slow")]
+        (check "deadline: off by default" 200 (:status r))
+        (check-has "deadline: default runs the handler to completion" "slow done" (:body r)))
+      (finally (adapter/stop-server dflt)))))
+
+;; a channel body is returned immediately and streams for longer than the
+;; deadline — the deadline covers handler execution, not the stream
+(defn test-handler-deadline-spares-streams []
+  (let [server (adapter/run-server deadline-handler {:port 8537 :handler-timeout-ms 250})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8537 5000)]
+        (client-send fd "GET /stream-long HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [r (client-recv-until fd "0\r\n\r\n")]
+          (check-has "deadline: stream not cut (first part)" "part0" r)
+          (check-has "deadline: stream not cut (last part)" "part3" r)
+          (check-has "deadline: stream terminated" "0\r\n\r\n" r))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+;; what the hook is told, and that it is told once
+(def deadline-failures (atom []))
+
+(defn test-handler-deadline-hook []
+  (reset! deadline-failures [])
+  (let [server (adapter/run-server
+                 deadline-handler
+                 {:port 8538 :handler-timeout-ms 250
+                  :on-failure (fn [request t]
+                                (swap! deadline-failures conj
+                                       [(:ring-chez/failure request) (.getMessage t)])
+                                {:status 429 :headers {"Content-Type" "text/plain"}
+                                 :body "come back later"})})]
+    (try
+      (Thread/sleep 250)
+      (let [r (http/get "http://127.0.0.1:8538/hang" {:throw-exceptions false})]
+        (check "deadline hook: its response is served" 429 (:status r))
+        (check-has "deadline hook: its body is served" "come back later" (:body r)))
+      (let [[info _] (first @deadline-failures)]
+        (check "deadline hook: kind" :timeout (:kind info))
+        (check "deadline hook: elapsed-ms reported" true
+               (>= (or (:elapsed-ms info) 0) 250)))
+      ;; a handler that throws AFTER the deadline fired must not report twice
+      (reset! deadline-failures [])
+      (http/get "http://127.0.0.1:8538/throw-late" {:throw-exceptions false})
+      (Thread/sleep 700)
+      (check "deadline hook: one report per request" 1 (count @deadline-failures))
+      (finally (adapter/stop-server server)))))
+
+;; Igropyr's make-fault-handler, Ring-shaped
+(defn test-fault-handler-envelope []
+  (let [server (adapter/run-server deadline-handler
+                                   {:port 8539 :handler-timeout-ms 250
+                                    :on-failure (fault/fault-handler)})]
+    (try
+      (Thread/sleep 250)
+      (let [r (http/get "http://127.0.0.1:8539/hang" {:throw-exceptions false})]
+        (check "fault: status" 503 (:status r))
+        (check-has "fault: content-type" "application/json"
+                   (get-in r [:headers "content-type"] ""))
+        (check-has "fault: kind" "\"fault\":\"timeout\"" (:body r))
+        (check-has "fault: retryable" "\"retryable\":true" (:body r)))
+      ;; a crash reports as a crash, at the status the caller picked
+      (let [r (http/get "http://127.0.0.1:8539/nope" {:throw-exceptions false})]
+        (check "fault: non-failure request untouched" 200 (:status r)))
+      (finally (adapter/stop-server server)))))
+
 ;; --- Wave 2 round 1: stop-server closes live connections ---------------------------
 
 ;; "Stopped" has to mean the same thing on both strategies. The fibers path
@@ -2636,6 +2773,14 @@
   (test-ws-guard-throw-is-request-failure)
   (test-write-timeout-cuts-stalled-peer)
   (test-write-timeout-zero-disables)
+
+  ;; --- Wave 2 round 2: handler deadline ---
+  (test-handler-deadline-threads)
+  (test-handler-deadline-fibers)
+  (test-handler-deadline-bounds)
+  (test-handler-deadline-spares-streams)
+  (test-handler-deadline-hook)
+  (test-fault-handler-envelope)
 
   ;; --- Wave 2 round 1: stop-server closes live connections ---
   (test-stop-closes-live-conn-threads)
