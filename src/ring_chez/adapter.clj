@@ -39,15 +39,20 @@
   [listen-fd running? serve!]
   (let [[sa salen] (socket/alloc-peer-sockaddr)]
     (try
-      (loop []
+      (loop [backoff 0]
         (ffi/write salen :int 0 socket/sockaddr-size)
         (let [conn (socket/c-accept listen-fd sa salen)]
           (cond
             (not @running?) nil
-            (neg? conn) (when @running? (recur))
+            ;; a failing accept that is retried immediately burns a core:
+            ;; EMFILE persists until an fd is released, and nothing here
+            ;; releases one. Back off, capped, and reset on the next success.
+            (neg? conn) (when @running?
+                          (when (pos? backoff) (Thread/sleep backoff))
+                          (recur (min 100 (if (zero? backoff) 1 (* 2 backoff)))))
             :else
             (do (serve! conn (socket/peer-ip sa))
-                (recur)))))
+                (recur 0)))))
       (finally (ffi/free sa) (ffi/free salen)))))
 
 ;; Each worker parks on the work channel until a connection fd arrives, then
@@ -173,7 +178,7 @@
         :else {:status 403 :headers {"Content-Type" "text/plain"}
                :body "Forbidden"}))))
 
-(defn- connection-loop [conn handler conn-info ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io deadline]
+(defn- connection-loop [conn handler conn-info ka-ms ws-handler ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io deadline]
   (socket/set-rcvtimeo! conn ka-ms)
   (socket/set-sndtimeo! conn write-timeout-ms)
   (let [recv!      (:recv! io)
@@ -185,11 +190,24 @@
       ;; closes the conn past it (a parked read wakes as :closed). nil on the
       ;; threads strategy, where SO_RCVTIMEO already bounds every recv.
       (when deadline (reset! deadline (+ (System/currentTimeMillis) ka-ms)))
-      (let [r (http/read-request conn acc max-bytes recv! idle-recv!
-                                 ;; Expect: 100-continue — answered before the
-                                 ;; body is collected, or the client waits out
-                                 ;; its own timeout before sending it
-                                 #(send! conn "HTTP/1.1 100 Continue\r\n\r\n"))
+      (let [r (http/read-request
+                conn acc
+                {:max-bytes max-bytes
+                 :max-header-bytes max-header-bytes
+                 :recv! recv!
+                 :idle-recv! idle-recv!
+                 :request-timeout-ms request-timeout-ms
+                 ;; Expect: 100-continue — answered before the body is
+                 ;; collected, or the client waits out its own timeout first
+                 :continue! #(send! conn "HTTP/1.1 100 Continue\r\n\r\n")
+                 ;; fibers: a parked read ends only when the sweeper closes the
+                 ;; fd, so the deadline it enforces has to be the tighter of
+                 ;; the idle timeout and this request's own deadline
+                 :arm-read! (when deadline
+                              (fn [request-deadline]
+                                (reset! deadline
+                                        (min (+ (System/currentTimeMillis) ka-ms)
+                                             (or request-deadline Long/MAX_VALUE)))))})
             ;; the read is over: whatever happens next — a handler, a stream,
             ;; a websocket session, an error response — is not the peer
             ;; failing to send, so nothing below this point may be reaped for
@@ -208,6 +226,10 @@
                                                {:status 431 :headers {"Content-Type" "text/plain"
                                                                       "Connection" "close"}
                                                 :body "Request Header Fields Too Large"} false))
+          (= :timeout r) (send! conn (http/response->parts
+                                       {:status 408 :headers {"Content-Type" "text/plain"
+                                                              "Connection" "close"}
+                                        :body "Request Timeout"} false))
           (= :unsupported r) (send! conn (http/response->parts
                                            {:status 501 :headers {"Content-Type" "text/plain"
                                                                   "Connection" "close"}
@@ -293,7 +315,7 @@
                   (recur (:leftover r))))))
           :else nil)))))
 
-(defn- worker [handler base-info ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io work]
+(defn- worker [handler base-info ka-ms ws-handler ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io work]
   (loop []
     (when-let [[conn peer] (async/<!! work)]
       ;; claim at take-time: pending then counts only conns accepted but not
@@ -301,7 +323,7 @@
       ;; where a claimed conn still reads as pressure and over-retires
       ((io :claim!))
       (try
-        (connection-loop conn handler (assoc base-info :remote-addr peer) ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io nil)
+        (connection-loop conn handler (assoc base-info :remote-addr peer) ka-ms ws-handler ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io nil)
         ;; an escaping throwable must not kill the worker: a dead worker
         ;; shrinks the pool permanently and starves later connections
         (catch Throwable _)
@@ -352,7 +374,7 @@
   bound, and idle connections hold no thread. The spawn runs under
   *go-backend* :fiber: the default :thread backend runs go bodies on OS
   threads, where wait-ready would block the carrier instead of parking."
-  [handler conn-info ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms conn conns]
+  [handler conn-info ka-ms ws-handler ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms conn conns]
   (let [deadline (atom (+ (System/currentTimeMillis) ka-ms))
         entry {:conn conn :closed? (atom false) :deadline deadline}]
     (swap! conns conj entry)
@@ -360,7 +382,7 @@
       (async/go
         (try
           (connection-loop conn handler conn-info ka-ms ws-handler ws-guard on-failure
-                           max-bytes write-timeout-ms
+                           max-bytes max-header-bytes request-timeout-ms write-timeout-ms
                            (fiber-io conn deadline write-timeout-ms) deadline)
           (catch Throwable _ nil)
           (finally (conn-close! conns entry)))))))
@@ -395,6 +417,8 @@
      :worker-threads     (check-num :worker-threads 1 ##Inf)
      :ka-ms              (check-num :keep-alive-timeout-ms 1 ##Inf)
      :max-bytes          (check-num :max-request-bytes 1 ##Inf)
+     :max-header-bytes   (check-num :max-header-bytes 1 ##Inf)
+     :request-timeout-ms (check-num :request-timeout-ms 0 ##Inf)
      :on-failure         (check-ifn :on-failure)
      :ws-guard           (check-ifn :ws-guard)
      :write-timeout-ms   (check-num :write-timeout-ms 0 ##Inf)}))
@@ -437,6 +461,16 @@
           ws-guard (get opts :ws-guard)
           on-failure (get opts :on-failure)
           max-bytes (or (:max-bytes v) 1048576)
+          ;; the head is capped separately from the body (Igropyr header-limit,
+          ;; 8 KiB): a request may legitimately carry a megabyte of body, a
+          ;; head may not, and parsing one is not linear in its size
+          max-header-bytes (or (:max-header-bytes v) 8192)
+          ;; how long ONE request may take to arrive, however steadily it
+          ;; dribbles. The idle timeout only bounds the GAP between segments
+          ;; and re-arms on every one, so without this a client sending a byte
+          ;; just inside it holds a worker indefinitely — slowloris, at
+          ;; trivial cost to the attacker. 0 disables.
+          request-timeout-ms (or (:request-timeout-ms v) 60000)
           write-timeout-ms (or (:write-timeout-ms v) 30000)
           ;; loopback by default: Igropyr binds 0.0.0.0, but this is a library
           ;; and a version bump must not put a server that was private on the
@@ -451,7 +485,7 @@
           (future (serve-loop fd running?
                               (fn [conn peer]
                                 (poller/nonblock! conn)
-                                (fiber-serve handler (assoc base-info :remote-addr peer) ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms conn conns))))
+                                (fiber-serve handler (assoc base-info :remote-addr peer) ka-ms ws-handler ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms conn conns))))
           {:socket fd :port port :host host :running running? :conns conns :sweep sweep})
         (let [work (async/chan)   ; unbuffered: acceptor parks when all workers busy
               pending (atom 0)    ; conns accepted but not yet claimed by a worker
@@ -482,7 +516,7 @@
                                                    (and (>= now grace) (pos? @pending)) 0
                                                    :else (recur)))))
                                            (finally (ffi/free pfds))))))]
-           (dotimes [_ n] (async/thread (worker handler base-info ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io work)))
+           (dotimes [_ n] (async/thread (worker handler base-info ka-ms ws-handler ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io work)))
           (future (serve-loop fd running?
                               (fn [conn peer]
                                 (swap! pending inc)

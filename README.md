@@ -54,8 +54,16 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
 - `:keep-alive-timeout-ms` (default 30000) — idle keep-alive connections are
   dropped via `SO_RCVTIMEO`
 - `:max-request-bytes` (default 1048576) — headers + body combined; over the
-  cap the server answers 431 (run-on headers) or 413 (oversized body) and
-  closes instead of buffering without bound
+  cap the server answers 413 and closes instead of buffering without bound
+- `:max-header-bytes` (default 8192) — the head on its own, capped separately
+  because a request may legitimately carry a megabyte of body and a head may
+  not. Over it the server answers 431. Clamped by `:max-request-bytes` when
+  that is smaller.
+- `:request-timeout-ms` (default 60000, `0` disables) — how long one request
+  may take to *arrive*, however steadily it dribbles. `:keep-alive-timeout-ms`
+  only bounds the gap between segments and re-arms on every one, so without
+  this a client sending a byte just inside it holds a worker indefinitely.
+  Past the deadline the server answers `408` and closes.
 - `:ws-handler` — fn of a websocket session, run when an upgrade request
   arrives (below)
 - `:on-failure` — fn of `(request throwable)`, consulted for every abnormal
@@ -139,6 +147,13 @@ what actually goes on the wire, so serving a PNG is just:
  :headers {"Content-Type" "image/png"}
  :body (clojure.java.io/file "logo.png")}
 ```
+
+A `File` body is framed by its length on disk and streamed from there in
+bounded chunks, so serving something larger than memory does not require
+memory to match. An `InputStream` has no length until it ends: a short one is
+buffered and framed with `Content-Length`, and one that does not end within
+the first 64 KiB switches to `Transfer-Encoding: chunked` rather than growing
+a buffer to whatever the stream turns out to be.
 
 Channel bodies (see below) may yield strings or byte arrays; each chunk's
 size line counts its octets. Anything else on a channel throws, which closes
@@ -254,5 +269,5 @@ requests go to the Ring handler as usual.
 ## Test
 
 ```bash
-jolt -M:test   # 335 checks; drives the server over raw sockets + http-client
+jolt -M:test   # 354 checks; drives the server over raw sockets + http-client
 ```
