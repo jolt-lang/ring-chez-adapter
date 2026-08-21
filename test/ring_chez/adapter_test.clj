@@ -1328,6 +1328,170 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+;; --- Round 4: request framing ----------------------------------------------------
+
+(defn- echo-body-handler [req]
+  (let [body (if-let [b (:body req)] (slurp b) "")]
+    {:status 200
+     :headers {"Content-Type" "text/plain; charset=utf-8"
+               "X-Body-Octets" (str (alength (.getBytes ^String body "UTF-8")))
+               "X-Body-Chars" (str (count body))}
+     :body body}))
+
+(defn- framing-ask
+  "Send head (and body) on a fresh connection, read one response."
+  [port req]
+  (let [fd (client-connect port 3000)]
+    (client-send fd req)
+    (let [r (or (client-recv-until fd "\r\n\r\n") "")]
+      (client-close fd)
+      r)))
+
+(defn test-chunked-request-body []
+  ;; Transfer-Encoding: chunked was answered 501, so every streaming upload
+  ;; failed. Ported from Igropyr parse-chunked-body (http.sc:1428).
+  (let [server (adapter/run-server echo-body-handler
+                                   {:port 8500 :worker-threads 2
+                                    :keep-alive-timeout-ms 2000})]
+    (try
+      (Thread/sleep 250)
+      (let [r (framing-ask 8500 (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                                     "Transfer-Encoding: chunked\r\n\r\n"
+                                     "5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n"))]
+        (check-has "chunked: 200" "200" r)
+        (check-has "chunked: chunks reassembled" "X-Body-Octets: 11" r))
+      ;; chunk extensions on the size line are ignored, not fatal
+      (let [r (framing-ask 8500 (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                                     "Transfer-Encoding: chunked\r\n\r\n"
+                                     "5;foo=bar\r\nhello\r\n0\r\n\r\n"))]
+        (check-has "chunked: chunk extensions ignored" "X-Body-Octets: 5" r))
+      ;; trailers are validated and dropped
+      (let [r (framing-ask 8500 (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                                     "Transfer-Encoding: chunked\r\n\r\n"
+                                     "5\r\nhello\r\n0\r\nX-Note: done\r\n\r\n"))]
+        (check-has "chunked: trailers accepted" "X-Body-Octets: 5" r))
+      (let [r (framing-ask 8500 (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                                     "Transfer-Encoding: chunked\r\n\r\n"
+                                     "5\r\nhello\r\n0\r\nContent-Length: 5\r\n\r\n"))]
+        (check-has "chunked: forbidden trailer field is 400" "400" r))
+      ;; a body arriving one chunk per write still frames
+      (let [fd (client-connect 8500 3000)]
+        (client-send fd (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                             "Transfer-Encoding: chunked\r\n\r\n"))
+        (client-send fd "3\r\nabc\r\n")
+        (client-send fd "3\r\ndef\r\n")
+        (client-send fd "0\r\n\r\n")
+        (check-has "chunked: body split across writes" "X-Body-Octets: 6"
+                   (or (client-recv-until fd "\r\n\r\n") ""))
+        (client-close fd))
+      (let [r (framing-ask 8500 (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                                     "Transfer-Encoding: chunked\r\n\r\n"
+                                     "zz\r\nhello\r\n0\r\n\r\n"))]
+        (check-has "chunked: malformed chunk size is 400" "400" r))
+      (let [r (framing-ask 8500 (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                                     "Transfer-Encoding: gzip, chunked\r\n\r\n"
+                                     "0\r\n\r\n"))]
+        (check-has "chunked: an unimplemented coding is still 501" "501" r))
+      (finally (adapter/stop-server server)))))
+
+(defn test-chunked-body-cap []
+  (let [server (adapter/run-server echo-body-handler
+                                   {:port 8501 :worker-threads 2
+                                    :max-request-bytes 4096
+                                    :keep-alive-timeout-ms 2000})]
+    (try
+      (Thread/sleep 250)
+      (let [chunk (apply str (repeat 1000 "x"))
+            body (apply str (concat (repeat 8 (str "3e8\r\n" chunk "\r\n")) ["0\r\n\r\n"]))
+            r (framing-ask 8501 (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                                     "Transfer-Encoding: chunked\r\n\r\n" body))]
+        (check-has "chunked: past the cap is 413" "413" r))
+      (finally (adapter/stop-server server)))))
+
+(defn test-smuggling-guards []
+  (let [server (adapter/run-server echo-body-handler
+                                   {:port 8502 :worker-threads 2
+                                    :keep-alive-timeout-ms 1000})]
+    (try
+      (Thread/sleep 250)
+      (check-has "smuggling: Transfer-Encoding with Content-Length is 400"
+                 "400" (framing-ask 8502 (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                                              "Content-Length: 5\r\n"
+                                              "Transfer-Encoding: chunked\r\n\r\n"
+                                              "0\r\n\r\n")))
+      ;; chunked is HTTP/1.1 framing; an HTTP/1.0 request declaring it is one
+      ;; whose message boundary a 1.0 intermediary reads differently
+      (check-has "smuggling: chunked on HTTP/1.0 is 400"
+                 "400" (framing-ask 8502 (str "POST / HTTP/1.0\r\n"
+                                              "Transfer-Encoding: chunked\r\n\r\n"
+                                              "0\r\n\r\n")))
+      (check-has "smuggling: bare LF between headers is 400"
+                 "400" (framing-ask 8502 "GET / HTTP/1.1\r\nHost: t\nX-A: 1\r\n\r\n"))
+      (check-has "smuggling: stray CR in the head is 400"
+                 "400" (framing-ask 8502 "GET / HTTP/1.1\r\nHost: t\rX-A: 1\r\n\r\n"))
+      (check-has "smuggling: obs-fold continuation line is 400"
+                 "400" (framing-ask 8502 "GET / HTTP/1.1\r\nHost: t\r\nX-A: 1\r\n 2\r\n\r\n"))
+      (check-has "smuggling: non-token header name is 400"
+                 "400" (framing-ask 8502 "GET / HTTP/1.1\r\nHost: t\r\nX Bad: 1\r\n\r\n"))
+      (check-has "smuggling: signed Content-Length is 400"
+                 "400" (framing-ask 8502 (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                                              "Content-Length: +5\r\n\r\nhello")))
+      ;; a repeated value coalesces to one comma-joined field; identical
+      ;; repeats are legal (RFC 7230 §3.3.2), differing ones are not
+      (check-has "smuggling: identical repeated Content-Length is accepted"
+                 "X-Body-Octets: 5"
+                 (framing-ask 8502 (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                                        "Content-Length: 5, 5\r\n\r\nhello")))
+      (finally (adapter/stop-server server)))))
+
+(defn test-duplicate-request-headers []
+  ;; the header reduce used assoc, so repeats collapsed to the last value and
+  ;; everything before it was dropped — X-Forwarded-For chains silently lost
+  (let [server (adapter/run-server
+                 (fn [req] {:status 200 :body (str (get-in req [:headers "x-multi"]))})
+                 {:port 8503 :worker-threads 2})]
+    (try
+      (Thread/sleep 250)
+      (check-has "dup headers: repeats joined with a comma"
+                 "one,two,three"
+                 (framing-ask 8503 (str "GET / HTTP/1.1\r\nHost: t\r\nX-Multi: one\r\n"
+                                        "X-Multi: two\r\nX-Multi: three\r\n\r\n")))
+      (finally (adapter/stop-server server)))))
+
+(defn test-expect-100-continue []
+  ;; without the interim response a client that asked for it waits out its own
+  ;; timeout before sending the body (curl stalls ~1s)
+  (let [server (adapter/run-server echo-body-handler
+                                   {:port 8504 :worker-threads 2
+                                    :keep-alive-timeout-ms 2000})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8504 3000)]
+        (client-send fd (str "POST / HTTP/1.1\r\nHost: t\r\nContent-Length: 5\r\n"
+                             "Expect: 100-continue\r\n\r\n"))
+        (let [interim (or (client-recv-until fd "\r\n\r\n") "")]
+          (check-has "expect: 100 Continue sent before the body" "100 Continue" interim))
+        (client-send fd "hello")
+        (check-has "expect: body then answered" "X-Body-Octets: 5"
+                   (or (client-recv-until fd "\r\n\r\n") ""))
+        (client-close fd))
+      ;; chunked bodies get it too
+      (let [fd (client-connect 8504 3000)]
+        (client-send fd (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                             "Transfer-Encoding: chunked\r\nExpect: 100-continue\r\n\r\n"))
+        (check-has "expect: 100 Continue for a chunked body" "100 Continue"
+                   (or (client-recv-until fd "\r\n\r\n") ""))
+        (client-send fd "2\r\nhi\r\n0\r\n\r\n")
+        (check-has "expect: chunked body then answered" "X-Body-Octets: 2"
+                   (or (client-recv-until fd "\r\n\r\n") ""))
+        (client-close fd))
+      ;; a bodyless request must not get one
+      (let [r (framing-ask 8504 (str "GET / HTTP/1.1\r\nHost: t\r\n"
+                                     "Expect: 100-continue\r\n\r\n"))]
+        (check "expect: no interim for a bodyless request"
+               false (str/includes? r "100 Continue")))
+      (finally (adapter/stop-server server)))))
+
 ;; --- Round 3: bind address and peer -----------------------------------------------
 
 (defn test-bind-host-option []
@@ -1758,14 +1922,6 @@
 
 (def ^:private em-dash "\u2014")            ; 1 character, 3 UTF-8 octets
 
-(defn- echo-body-handler [req]
-  (let [body (if-let [b (:body req)] (slurp b) "")]
-    {:status 200
-     :headers {"Content-Type" "text/plain; charset=utf-8"
-               "X-Body-Octets" (str (alength (.getBytes ^String body "UTF-8")))
-               "X-Body-Chars" (str (count body))}
-     :body body}))
-
 (defn- utf8-request [path body]
   (str "POST " path " HTTP/1.1\r\nHost: t\r\n"
        "Content-Type: application/json\r\n"
@@ -1890,9 +2046,9 @@
       (check-has "framing: conflicting Content-Lengths are 400"
                  "400" (ask (str "POST / HTTP/1.1\r\nHost: t\r\n"
                                  "Content-Length: 5\r\nContent-Length: 7\r\n\r\nhello")))
-      (check-has "framing: Transfer-Encoding is 501"
+      (check-has "framing: an unimplemented Transfer-Encoding is 501"
                  "501" (ask (str "POST / HTTP/1.1\r\nHost: t\r\n"
-                                 "Transfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n0\r\n\r\n")))
+                                 "Transfer-Encoding: deflate\r\n\r\n5\r\nhello\r\n0\r\n\r\n")))
       ;; a header whose *value* mentions content-length must not be mistaken
       ;; for framing — that request has no body at all
       (check-has "framing: content-length in a value is not framing"
@@ -2119,6 +2275,13 @@
   (test-ws-guard-throw-is-request-failure)
   (test-write-timeout-cuts-stalled-peer)
   (test-write-timeout-zero-disables)
+
+  ;; --- Round 4: request framing ---
+  (test-chunked-request-body)
+  (test-chunked-body-cap)
+  (test-smuggling-guards)
+  (test-duplicate-request-headers)
+  (test-expect-100-continue)
 
   ;; --- Round 3: bind address and peer ---
   (test-bind-host-option)

@@ -23,41 +23,248 @@
         (let [e (or (str/index-of head "\r\n" i) n)]
           (recur (+ e 2) (conj out (subs head i e))))))))
 
+(defn- tchar?
+  "RFC 7230 §3.2.6 token character. A header name is a token and nothing else:
+   a space before the colon (\"Host : t\") is not a fussy detail but a
+   smuggling wedge, since parsers disagree about whether to trim it."
+  [c]
+  (or (<= (int \a) (int c) (int \z))
+      (<= (int \A) (int c) (int \Z))
+      (<= (int \0) (int c) (int \9))
+      (contains? #{\! \# \$ \% \& \' \* \+ \- \. \^ \_ \` \| \~} c)))
+
+(defn head-malformed?
+  "True when the head breaks the rules a framing decision has to be able to
+   rely on (Igropyr parse-headers, http.sc:401). Every line ends CRLF — a bare
+   LF is the classic smuggling wedge, since this parser would split on it while
+   a CRLF-strict proxy in front reads the same bytes as one folded value, and
+   the two then disagree about which Content-Length the request has. A stray CR
+   goes the same way, and would hand a control character to handlers and to
+   token matchers besides. obs-fold continuation lines are gone from HTTP/1.1
+   and are rejected rather than guessed at, and a header name must be a token.
+
+   The head as read-request hands it over excludes the terminating CRLFCRLF, so
+   the last line legitimately has no CRLF of its own."
+  [head]
+  (let [n (count head)]
+    (or
+      ;; no bare LF, no stray CR
+      (loop [i 0]
+        (cond
+          (>= i n) false
+          (= \newline (.charAt ^String head i))
+          (if (and (pos? i) (= \return (.charAt ^String head (dec i)))) (recur (inc i)) true)
+          (= \return (.charAt ^String head i))
+          (if (and (< (inc i) n) (= \newline (.charAt ^String head (inc i)))) (recur (inc i)) true)
+          :else (recur (inc i))))
+      (boolean
+        (some (fn [line]
+                (let [i (str/index-of line ":")]
+                  (or (zero? (count line))
+                      (contains? #{\space \tab} (.charAt ^String line 0))   ; obs-fold
+                      (not (and i (pos? i)))
+                      (not (every? tchar? (subs line 0 i))))))
+              (head-lines head))))))
+
+(defn- head-version
+  "The HTTP version token off the request line, or nil."
+  [head]
+  (let [e (or (str/index-of head "\r\n") (count head))
+        line (subs head 0 e)
+        i (str/last-index-of line " ")]
+    (when (and i (< (inc i) (count line))) (subs line (inc i)))))
+
 (defn- framing-headers
-  "The head's Content-Length / Transfer-Encoding values, keyed by field name.
-   Reading the field name off each line — rather than scanning the whole head
-   for \"content-length:\" — keeps a value like \"X-Note: content-length: 9\"
-   from being mistaken for framing."
+  "The head's Content-Length / Transfer-Encoding / Expect values, keyed by
+   field name. Reading the field name off each line — rather than scanning the
+   whole head for \"content-length:\" — keeps a value like \"X-Note:
+   content-length: 9\" from being mistaken for framing."
   [head]
   (reduce (fn [m line]
             (let [i (str/index-of line ":")]
               (if-not (and i (pos? i))
                 m
                 (let [k (str/lower-case (str/trim (subs line 0 i)))]
-                  (if (or (= k "content-length") (= k "transfer-encoding"))
+                  (if (contains? #{"content-length" "transfer-encoding" "expect"} k)
                     (update m k (fnil conj []) (str/trim (subs line (inc i))))
                     m)))))
           {} (head-lines head)))
 
-(defn- body-framing
-  "Octets of body the head declares: 0 when it carries no Content-Length,
-   :bad when the framing is unrecoverable (a Content-Length that is not a
-   single non-negative integer — RFC 7230 §3.3.3), :unsupported when it
-   declares a Transfer-Encoding. Chunked decoding is not implemented, and
-   framing such a request by its Content-Length (or as bodyless) would let
-   the undecoded body through as a second, forged request."
-  [head]
-  (let [named (framing-headers head)
-        cls (get named "content-length")
-        lens (map #(let [n (parse-long %)] (when (and n (not (neg? n))) n)) cls)]
+(defn- comma-parts [vals]
+  (mapcat #(map str/trim (str/split % #"," -1)) vals))
+
+(defn- all-digits? [s]
+  (and (pos? (count s)) (every? #(<= (int \0) (int %) (int \9)) s)))
+
+(defn- content-length-value
+  "The declared body length: :absent, :bad, or a non-negative integer. Repeats
+   coalesce into one comma-joined field, so a valid value is one or more
+   IDENTICAL digit strings (RFC 7230 §3.3.2) — \"5, 5\" is legal, \"5, 7\" is
+   not, and neither is \"+5\", which parse-long would otherwise accept."
+  [vals]
+  (let [parts (comma-parts vals)]
     (cond
-      (contains? named "transfer-encoding") :unsupported
-      (empty? cls) 0
-      (some nil? lens) :bad
-      (apply = lens) (first lens)
-      :else :bad)))
+      (empty? parts) :absent
+      (not (every? all-digits? parts)) :bad
+      :else (let [ns (map parse-long parts)]
+              (if (apply = ns) (first ns) :bad)))))
+
+(defn- transfer-encoding-value
+  "The only transfer coding this server decodes is a single final \"chunked\".
+   Anything else is refused rather than falling back to Content-Length and
+   disagreeing with an upstream proxy about where the message ends."
+  [vals]
+  (if (empty? vals)
+    :absent
+    (if (= ["chunked"] (map str/lower-case (comma-parts vals))) :chunked :unsupported)))
+
+(defn- expect-continue? [named]
+  (boolean (some #(= "100-continue" (str/lower-case %)) (get named "expect"))))
+
+(defn- body-framing
+  "How the head says its body is delimited: a non-negative octet count, or
+   :chunked, or :bad / :unsupported.
+
+   :bad covers a head that is malformed at all (above), a Content-Length that
+   is not one or more identical non-negative integers, a request that declares
+   both Content-Length and Transfer-Encoding — two framings, and the peer at
+   each end may believe a different one, which is the whole mechanism of
+   request smuggling — and chunked on HTTP/1.0, which is HTTP/1.1 framing an
+   HTTP/1.0 intermediary would read differently. :unsupported is a transfer
+   coding this server does not implement (501, per RFC 9112 §7)."
+  [head]
+  (if (head-malformed? head)
+    :bad
+    (let [named (framing-headers head)
+          te (transfer-encoding-value (get named "transfer-encoding"))
+          cl (content-length-value (get named "content-length"))]
+      (cond
+        (= :bad cl) :bad
+        (= :unsupported te) :unsupported
+        (and (= :chunked te) (not= :absent cl)) :bad
+        (and (= :chunked te) (= "HTTP/1.0" (head-version head))) :bad
+        (= :chunked te) :chunked
+        (= :absent cl) 0
+        :else cl))))
 
 (def no-bytes (byte-array 0))
+
+(defn- concat-bytes
+  "One byte array from several."
+  [arrays]
+  (let [total (loop [as (seq arrays), n 0]
+                (if as (recur (next as) (+ n (alength ^bytes (first as)))) n))
+        out (byte-array total)]
+    (loop [as (seq arrays), off 0]
+      (if-not as
+        out
+        (let [^bytes a (first as)]
+          (System/arraycopy a 0 out off (alength a))
+          (recur (next as) (+ off (alength a))))))))
+
+
+;; --- chunked request bodies (Igropyr parse-chunked-body, http.sc:1428) --------
+;; Bounds are what make this safe to run against a hostile peer: a chunk-size
+;; line four kilobytes long is malformed however large the body may be, the
+;; per-chunk overhead is capped so a body of one-byte chunks cannot cost more
+;; framing than payload, and the chunk count is capped so the same body cannot
+;; cost an unbounded number of allocations.
+(def ^:private chunk-line-limit 4096)
+(def ^:private chunk-overhead-limit 65536)
+(def ^:private trailer-limit 8192)
+
+(defn- chunk-count-limit [max-bytes] (max 16384 (quot max-bytes 64)))
+
+;; A trailer may not carry a field that changes how the message was framed or
+;; routed — it arrives after the decision has been made.
+(def ^:private forbidden-trailer-fields
+  #{"transfer-encoding" "content-length" "host" "connection" "trailer" "upgrade"})
+
+(defn- crlf-index
+  "Index of the CRLF at or after from, within bs[0,have), or nil."
+  [^bytes bs from have]
+  (loop [i from]
+    (cond
+      (>= (inc i) have) nil
+      (and (= 13 (aget bs i)) (= 10 (aget bs (inc i)))) i
+      :else (recur (inc i)))))
+
+(defn- parse-chunk-size
+  "The hex chunk size on bs[start,end), stopping at a ';' chunk extension;
+   nil if malformed. Promoting arithmetic on purpose: an absurd hex size must
+   grow into a bignum and be rejected by the body cap, not wrap a long."
+  [^bytes bs start end]
+  (loop [i start, v 0, any false]
+    (if (= i end)
+      (when any v)
+      (let [b (bit-and 0xff (aget bs i))]
+        (cond
+          (= b 59) (when any v)                                  ; ';'
+          (<= 48 b 57)  (recur (inc i) (+' (*' v 16) (- b 48)) true)
+          (<= 97 b 102) (recur (inc i) (+' (*' v 16) (- b 87)) true)
+          (<= 65 b 70)  (recur (inc i) (+' (*' v 16) (- b 55)) true)
+          :else nil)))))
+
+(defn- valid-trailer-line? [^bytes bs start end]
+  (let [line (String. bs start (- end start) "UTF-8")
+        i (str/index-of line ":")]
+    (and i (pos? i)
+         (every? tchar? (subs line 0 i))
+         (not (contains? forbidden-trailer-fields (str/lower-case (subs line 0 i)))))))
+
+(defn- parse-chunked-body
+  "Try to decode a complete chunked body out of bs[body-start,have). state is
+   nil for a fresh parse or the resume state from a previous :more — chunks
+   already extracted are never re-parsed and never re-copied, so a body
+   drip-fed in tiny segments costs each byte once instead of O(segments)
+   rescans.
+
+   -> [:done body end] | [:more state] | [:too-large] | [:bad]
+    | [:trailers-too-large]"
+  [^bytes bs body-start have state max-bytes]
+  (loop [pos    (or (:pos state) body-start)
+         chunks (or (:chunks state) [])
+         len    (or (:len state) 0)
+         cnt    (or (:count state) 0)]
+    (let [eol (crlf-index bs pos have)
+          resume {:pos pos :chunks chunks :len len :count cnt}]
+      (cond
+        (> (- pos body-start) (+ max-bytes chunk-overhead-limit)) [:too-large]
+        (nil? eol) (if (> (- have pos) chunk-line-limit) [:too-large] [:more resume])
+        (> (- eol pos) chunk-line-limit) [:too-large]
+        :else
+        (let [size (parse-chunk-size bs pos eol)]
+          (cond
+            (nil? size) [:bad]
+            (> (+ len size) max-bytes) [:too-large]
+
+            (zero? size)
+            ;; the last chunk; optional trailers, then a blank line
+            (let [trailer-start (+ eol 2)]
+              (loop [p trailer-start]
+                (let [e2 (crlf-index bs p have)]
+                  (cond
+                    (nil? e2) (if (> (- have trailer-start) trailer-limit)
+                                [:trailers-too-large]
+                                [:more resume])
+                    (> (- (+ e2 2) trailer-start) trailer-limit) [:trailers-too-large]
+                    (= e2 p) [:done (concat-bytes chunks) (+ p 2)]
+                    (valid-trailer-line? bs p e2) (recur (+ e2 2))
+                    :else [:bad]))))
+
+            (>= cnt (chunk-count-limit max-bytes)) [:too-large]
+
+            :else
+            (let [dstart (+ eol 2)]
+              (if (< have (+ dstart size 2))
+                [:more resume]
+                (if-not (and (= 13 (aget bs (+ dstart size)))
+                             (= 10 (aget bs (+ dstart size 1))))
+                  [:bad]
+                  (recur (+ dstart size 2)
+                         (conj chunks (java.util.Arrays/copyOfRange bs dstart (+ dstart size)))
+                         (+ len size)
+                         (inc cnt)))))))))))
 
 (defn- ensure-capacity
   "acc, with room for n more bytes past have. Grows by DOUBLING: a body that
@@ -81,19 +288,6 @@
   ;; jolt.ffi/read-array allocates the chunk and we copy it in; jolt.ffi's
   ;; read-into! (unreleased) reads straight into acc and drops this copy.
   (System/arraycopy (ffi/read-array buf n) 0 acc off n))
-
-(defn- concat-bytes
-  "One byte array from several."
-  [arrays]
-  (let [total (loop [as (seq arrays), n 0]
-                (if as (recur (next as) (+ n (alength ^bytes (first as)))) n))
-        out (byte-array total)]
-    (loop [as (seq arrays), off 0]
-      (if-not as
-        out
-        (let [^bytes a (first as)]
-          (System/arraycopy a 0 out off (alength a))
-          (recur (next as) (+ off (alength a))))))))
 
 (defn- head-end
   "Index of the \r\n\r\n that ends the request head within bs[0,have), or nil.
@@ -123,14 +317,37 @@
 ;; recv timed out) before sending anything, :bad on EOF/timeout mid-request
 ;; or an unframeable head, :unsupported for a Transfer-Encoding we do not
 ;; decode.
+(defn- resolve-framing
+  "The framing decision for a complete head: {:head :from :to} for a
+  Content-Length body, {:head :from :chunked? true} for a chunked one, or the
+  keyword body-framing refused it with. :expect? marks a body the client is
+  waiting for a 100 Continue before sending."
+  [^bytes acc scanned have]
+  (when-let [he (head-end acc scanned have)]
+    (let [head (String. acc 0 he "UTF-8")
+          f (body-framing head)
+          from (+ he 4)
+          expect? (expect-continue? (framing-headers head))]
+      (cond
+        (= :chunked f) {:head head :from from :chunked? true :expect? expect?}
+        (number? f) {:head head :from from :to (+ from f)
+                     :expect? (and expect? (pos? f))}
+        :else f))))
+
 (defn read-request
-  "Reads one request (head + content-length body). Accumulation is capped at
-  max-bytes — a client that never terminates (or ships an oversized request)
-  gets :too-big instead of exhausting memory. acc, :body and :leftover are
-  byte arrays; only :head — which RFC 7230 restricts to ASCII — is decoded.
-  The body stays opaque octets: it may be an image, a gzip stream, or text in
-  some other charset, none of which survive a UTF-8 decode."
-  [conn acc max-bytes recv! idle-recv!]
+  "Reads one request (head + body). Accumulation is capped at max-bytes — a
+  client that never terminates (or ships an oversized request) gets :too-big
+  instead of exhausting memory. acc, :body and :leftover are byte arrays; only
+  :head — which RFC 7230 restricts to ASCII — is decoded. The body stays opaque
+  octets: it may be an image, a gzip stream, or text in some other charset,
+  none of which survive a UTF-8 decode.
+
+  continue! is called once, before the body is collected, when the head asked
+  for `Expect: 100-continue` and declares a body — a client that asked and is
+  not answered waits out its own timeout first (curl stalls about a second)."
+  ([conn acc max-bytes recv! idle-recv!]
+   (read-request conn acc max-bytes recv! idle-recv! nil))
+  ([conn acc max-bytes recv! idle-recv! continue!]
   (let [buf (ffi/alloc socket/bufsize)]
     (try
       ;; acc is a capacity buffer, valid over [0,have) — it is not sliced to
@@ -141,30 +358,46 @@
       ;; the body. A read can overshoot :to (the next pipelined request rode
       ;; along), which is why the buffer keeps room past it rather than being
       ;; sized to the frame exactly.
-      (loop [^bytes acc acc, have (alength acc), scanned 0, framing nil]
-        (let [framing (or framing
-                          (when-let [he (head-end acc scanned have)]
-                            (let [head (String. acc 0 he "UTF-8")
-                                  f (body-framing head)]
-                              (if (number? f)
-                                {:head head :from (+ he 4) :to (+ he 4 f)}
-                                f))))
+      (loop [^bytes acc acc, have (alength acc), scanned 0, framing nil, state nil]
+        (let [fresh   (when (nil? framing) (resolve-framing acc scanned have))
+              ;; fire the interim response exactly once, as the head resolves
+              _       (when (and (map? fresh) (:expect? fresh) continue!) (continue!))
+              framing (or framing fresh)
               ;; map? not framing? — an unframeable head is a KEYWORD here, and
               ;; (:to :bad) is nil
-              limit   (+ (if (map? framing) (:to framing) max-bytes) socket/bufsize)]
+              limit   (+ (cond
+                           (not (map? framing)) max-bytes
+                           (:chunked? framing) (+ max-bytes chunk-overhead-limit)
+                           :else (:to framing))
+                         socket/bufsize)
+              more!   (fn [acc have scanned framing state]
+                        (let [n ((if (zero? have) idle-recv! recv!) conn buf)]
+                          (cond
+                            (pos? n) (let [acc (ensure-capacity acc have n limit)]
+                                       (fill! acc have buf n)
+                                       [acc (+ have n) scanned framing state])
+                            (zero? have) :closed
+                            :else :bad)))]
           (cond
             (keyword? framing) framing      ; :bad -> 400, :unsupported -> 501
 
             (nil? framing)                  ; head still incomplete
             (if (> have max-bytes)
               :headers-too-big              ; headers never ended -> 431
-              (let [n ((if (zero? have) idle-recv! recv!) conn buf)]
-                (cond
-                  (pos? n) (let [acc (ensure-capacity acc have n limit)]
-                             (fill! acc have buf n)
-                             (recur acc (+ have n) (max 0 (- have 3)) nil))
-                  (zero? have) :closed
-                  :else :bad)))
+              (let [r (more! acc have (max 0 (- have 3)) nil nil)]
+                (if (keyword? r) r (let [[a h sc fr st] r] (recur a h sc fr st)))))
+
+            (:chunked? framing)
+            (let [[status a b] (parse-chunked-body acc (:from framing) have state max-bytes)]
+              (case status
+                :done {:head (:head framing)
+                       :body a
+                       :leftover (if (= have b) no-bytes (java.util.Arrays/copyOfRange acc b have))}
+                :more (let [r (more! acc have scanned framing a)]
+                        (if (keyword? r) r (let [[a h sc fr st] r] (recur a h sc fr st))))
+                :too-large :too-big
+                :trailers-too-large :headers-too-big
+                :bad))
 
             ;; declared request exceeds the cap -> 413
             (> (:to framing) max-bytes) :too-big
@@ -176,13 +409,9 @@
                :leftover (if (= have to) no-bytes (java.util.Arrays/copyOfRange acc to have))})
 
             :else
-            (let [n (recv! conn buf)]
-              (if (pos? n)
-                (let [acc (ensure-capacity acc have n limit)]
-                  (fill! acc have buf n)
-                  (recur acc (+ have n) scanned framing))
-                :bad)))))
-      (finally (ffi/free buf)))))
+            (let [r (more! acc have scanned framing state)]
+              (if (keyword? r) r (let [[a h sc fr st] r] (recur a h sc fr st)))))))
+      (finally (ffi/free buf))))))
 
 ;; --- request -> Ring map ----------------------------------------------------
 (defn- host-name
@@ -209,10 +438,16 @@
   [head ^bytes body conn-info]
   (let [lines (str/split head #"\r\n")
         parts (str/split (or (first lines) "") #" ")
+        ;; repeats coalesce into one comma-joined field (RFC 7230 §3.2.2, and
+        ;; what Ring's other adapters do). Overwriting instead dropped every
+        ;; value but the last — an X-Forwarded-For chain silently lost all but
+        ;; its final hop.
         headers (reduce (fn [m line]
                           (let [i (str/index-of line ":")]
                             (if (and i (pos? i))
-                              (assoc m (str/lower-case (str/trim (subs line 0 i))) (str/trim (subs line (inc i))))
+                              (let [k (str/lower-case (str/trim (subs line 0 i)))
+                                    v (str/trim (subs line (inc i)))]
+                                (assoc m k (if-let [prev (get m k)] (str prev "," v) v)))
                               m)))
                         {} (rest lines))
         bad (fn [status msg] {:error {:status status
@@ -222,8 +457,10 @@
       (not= 3 (count parts))
       (bad 400 "Bad Request")
 
-      (not (every? (fn [line] (let [i (str/index-of line ":")] (and i (pos? i))))
-                   (rest lines)))
+      ;; bare LF, stray CR, obs-fold, a header name that is not a token: the
+      ;; framing decision already refused these, and this keeps the guarantee
+      ;; for anyone calling request->ring directly
+      (head-malformed? head)
       (bad 400 "Bad Request")
 
       (not (contains? #{"HTTP/1.1" "HTTP/1.0"} (nth parts 2)))

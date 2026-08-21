@@ -185,7 +185,11 @@
       ;; closes the conn past it (a parked read wakes as :closed). nil on the
       ;; threads strategy, where SO_RCVTIMEO already bounds every recv.
       (when deadline (reset! deadline (+ (System/currentTimeMillis) ka-ms)))
-      (let [r (http/read-request conn acc max-bytes recv! idle-recv!)
+      (let [r (http/read-request conn acc max-bytes recv! idle-recv!
+                                 ;; Expect: 100-continue — answered before the
+                                 ;; body is collected, or the client waits out
+                                 ;; its own timeout before sending it
+                                 #(send! conn "HTTP/1.1 100 Continue\r\n\r\n"))
             ;; the read is over: whatever happens next — a handler, a stream,
             ;; a websocket session, an error response — is not the peer
             ;; failing to send, so nothing below this point may be reaped for
