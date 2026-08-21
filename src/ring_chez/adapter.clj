@@ -215,7 +215,15 @@
         :else {:status 403 :headers {"Content-Type" "text/plain"}
                :body "Forbidden"}))))
 
-(defn- connection-loop [conn handler-box conn-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io deadline stats]
+;; cfg: everything about the server that does not vary per connection —
+;; the swappable handler boxes, the hooks, and every bound and timeout. It
+;; is built once in run-server and threaded through unchanged. It used to be
+;; fourteen positional arguments on connection-loop, worker and fiber-serve,
+;; which is why the last few options were miserable to add and why the call
+;; sites were unreadable.
+(defn- connection-loop [conn conn-info cfg io deadline]
+  (let [{:keys [handler-box ws-handler-box ws-guard on-failure ka-ms max-bytes
+                max-header-bytes request-timeout-ms write-timeout-ms stats]} cfg]
   (socket/set-rcvtimeo! conn ka-ms)
   (socket/set-sndtimeo! conn write-timeout-ms)
   (let [recv!      (:recv! io)
@@ -357,7 +365,7 @@
                 (let [reusable (try (http/send-response conn request resp (:take! io) send!)
                                     (finally (swap! (:active stats) dec)))]
                   (when reusable (recur (:leftover r)))))))
-          :else nil)))))
+          :else nil))))))
 
 (defn- register-conn!
   "Enter one accepted connection in the server's live set. Registered at
@@ -396,7 +404,7 @@
     (swap! (:open stats) dec))
   (swap! conns disj entry))
 
-(defn- worker [handler-box base-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io work conns stats]
+(defn- worker [base-info cfg io work conns]
   (loop []
     (when-let [entry (async/<!! work)]
       ;; claim at take-time: pending then counts only conns accepted but not
@@ -404,11 +412,11 @@
       ;; where a claimed conn still reads as pressure and over-retires
       ((io :claim!))
       (try
-        (connection-loop (:conn entry) handler-box (assoc base-info :remote-addr (:peer entry)) ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io nil stats)
+        (connection-loop (:conn entry) (assoc base-info :remote-addr (:peer entry)) cfg io nil)
         ;; an escaping throwable must not kill the worker: a dead worker
         ;; shrinks the pool permanently and starves later connections
         (catch Throwable _)
-        (finally (conn-close! conns entry stats)))
+        (finally (conn-close! conns entry (:stats cfg))))
       (recur))))
 
 (defn- start-sweeper!
@@ -435,18 +443,17 @@
   bound, and idle connections hold no thread. The spawn runs under
   *go-backend* :fiber: the default :thread backend runs go bodies on OS
   threads, where wait-ready would block the carrier instead of parking."
-  [handler-box conn-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms entry conns stats]
+  [conn-info cfg entry conns]
   (let [conn     (:conn entry)
         deadline (:deadline entry)]
-    (reset! deadline (+ (System/currentTimeMillis) ka-ms))
+    (reset! deadline (+ (System/currentTimeMillis) (:ka-ms cfg)))
     (binding [async/*go-backend* :fiber]
       (async/go
         (try
-          (connection-loop conn handler-box conn-info ka-ms ws-handler-box ws-guard on-failure
-                           max-bytes max-header-bytes request-timeout-ms write-timeout-ms
-                           (fiber-io conn deadline write-timeout-ms) deadline stats)
+          (connection-loop conn conn-info cfg
+                           (fiber-io conn deadline (:write-timeout-ms cfg)) deadline)
           (catch Throwable _ nil)
-          (finally (conn-close! conns entry stats)))))))
+          (finally (conn-close! conns entry (:stats cfg))))))))
 
 ;; Igropyr http.sc: bad config must crash HERE, at boot — deferred to request
 ;; time it raises inside the reader and the connection just drops. One error
@@ -544,6 +551,14 @@
           ws-handler-box (atom ws-handler)
           stats {:open (atom 0) :requests (atom 0) :active (atom 0)
                  :started (System/currentTimeMillis)}
+          ;; everything that does not vary per connection, built once and
+          ;; threaded through the serving path unchanged
+          cfg {:handler-box handler-box :ws-handler-box ws-handler-box
+               :ws-guard ws-guard :on-failure on-failure
+               :ka-ms ka-ms :max-bytes max-bytes :max-header-bytes max-header-bytes
+               :request-timeout-ms request-timeout-ms
+               :write-timeout-ms write-timeout-ms
+               :stats stats}
           fd     (socket/listen-socket host port)
           running? (atom true)]
       (if (= :fibers strategy)
@@ -553,7 +568,8 @@
                               (fn [conn peer]
                                 (poller/nonblock! conn)
                                 (swap! (:open stats) inc)
-                                (fiber-serve handler-box (assoc base-info :remote-addr peer) ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms (register-conn! conns conn peer true) conns stats))))
+                                (fiber-serve (assoc base-info :remote-addr peer) cfg
+                                             (register-conn! conns conn peer true) conns))))
           {:socket fd :port port :host host :running running? :conns conns :sweep sweep
            :handler handler-box :ws-handler ws-handler-box :stats stats})
         (let [work  (async/chan)  ; unbuffered: acceptor parks when all workers busy
@@ -570,7 +586,7 @@
                          ;; or a client mid-reuse would race a reset. Returns
                          ;; the recv contract (n>0 data, 0 closed/retire).
                          :idle-recv! #(idle-poll-recv! %1 %2 ka-ms pending))]
-           (dotimes [_ n] (async/thread (worker handler-box base-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io work conns stats)))
+           (dotimes [_ n] (async/thread (worker base-info cfg io work conns)))
           (future (serve-loop fd running?
                               (fn [conn peer]
                                 (swap! pending inc)
