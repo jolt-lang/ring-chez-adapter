@@ -596,11 +596,13 @@
                             (Connection: close) so queued connections never
                             starve
     :keep-alive-timeout-ms idle keep-alive timeout (default 30000)
-    :handler-timeout-ms    how long one handler call may take (default 60000,
-                           0 disables). Past it the request is answered
+    :handler-timeout-ms    how long one handler call may take (default 0 =
+                           no deadline). Past it the request is answered
                            through :on-failure, then a plain 503, and the
                            worker goes back to serving; the abandoned
-                           handler's thread is not reclaimed
+                           handler's thread is not reclaimed. Costs a thread
+                           handoff per request under :threads (~15-25%
+                           throughput), nothing under :fibers
     :max-request-bytes     request cap (default 1048576; 413/431 beyond)
     :ws-handler            fn of a ring-chez.websocket Session, run when a
                            websocket upgrade request arrives."
@@ -631,12 +633,16 @@
           ;; how long the HANDLER may take. Igropyr kills a worker stuck past
           ;; stuck-ms and replaces it; we cannot kill a thread, but we can
           ;; stop waiting for one — which reclaims the worker, the fd and the
-          ;; connection, and answers the client 503 instead of never. A minute
-          ;; rather than Igropyr's 30s because the abandoned thread is NOT
-          ;; reclaimed: a deadline that fires on merely-slow handlers would
-          ;; leak threads for a living. 0 disables (and keeps the handler on
-          ;; the worker thread, with no handoff).
-          handler-timeout-ms (or (:handler-timeout-ms v) 60000)
+          ;; connection, and answers the client 503 instead of never.
+          ;;
+          ;; OFF by default, because enforcing it means running the handler
+          ;; off the worker thread (it cannot be abandoned from its own
+          ;; stack) and that handoff measures 15-25% of throughput on the
+          ;; threads strategy — a cost every request pays for a failure most
+          ;; servers never have. Under :fibers the handler is already on a
+          ;; thread and the deadline measures free, so a fibers server can
+          ;; turn it on for nothing. See the README.
+          handler-timeout-ms (or (:handler-timeout-ms v) 0)
           ;; loopback by default: Igropyr binds 0.0.0.0, but this is a library
           ;; and a version bump must not put a server that was private on the
           ;; network. Opt in with :host "0.0.0.0".

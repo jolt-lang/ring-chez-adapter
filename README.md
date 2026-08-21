@@ -79,19 +79,26 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
   response map (e.g. `{:status 401 ...}`) to serve it instead — the peer
   never gets the socket and the connection stays keep-alive-usable; return
   nil/false for a bare `403 Forbidden`; a throw routes through `:on-failure`.
-- `:handler-timeout-ms` (default 60000, `0` disables) — how long one handler
-  call may take. Past it the adapter stops waiting: the request is answered
-  through `:on-failure` and then a plain `503`, and the connection and its
-  worker go back to serving. The abandoned handler's *thread* is not
-  reclaimed — jolt has no safe thread kill — so the default is a minute
-  rather than Igropyr's 30s: a deadline that fires on merely-slow handlers
-  would leak threads for a living. Enforcing it means running the handler off
-  the worker thread (it cannot be abandoned from its own stack), so `:threads`
-  pays a thread handoff per request; `0` keeps the handler inline and the
-  behavior of earlier versions. Under `:fibers` the handler was already on a
-  thread, so the deadline costs nothing there. It bounds handler *execution*,
-  not the response: a handler that returns a channel and streams for an hour
-  is untouched.
+- `:handler-timeout-ms` (default `0`, meaning no deadline) — how long one
+  handler call may take. Past it the adapter stops waiting: the request is
+  answered through `:on-failure` and then a plain `503`, and the connection and
+  its worker go back to serving. Without it a handler that never returns holds
+  its worker forever, and `:worker-threads` of them is a dead server.
+
+  **It costs throughput on `:threads`.** A handler cannot be abandoned from its
+  own stack, so enforcing a deadline means running it on another thread — a
+  handoff per request, measured at 15-25% (`ab -n 20000 -k /plaintext`: 8840 →
+  7112 rps at c=10, 8370 → 6611 at c=100). Under `:fibers` the handler is
+  already on a thread and the deadline measures free, so turn it on there
+  without hesitating. On `:threads` it is a trade: pay ~20% against a failure
+  mode you may never hit, or leave it off and make sure your handlers can't
+  hang (client timeouts on everything they call).
+
+  Whatever you set, the abandoned handler's *thread* is not reclaimed — jolt
+  has no safe thread kill — so keep the value generous enough that only a
+  genuinely stuck handler trips it. It bounds handler *execution*, not the
+  response: a handler that returns a channel and streams for an hour is
+  untouched.
 - `:write-timeout-ms` (default 30000, `0` disables) — `SO_SNDTIMEO` on every
   blocking send; a peer that stops draining mid-response gets the connection
   abandoned (truncated body = close) instead of pinning a worker forever.

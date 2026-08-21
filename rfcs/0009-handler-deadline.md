@@ -9,8 +9,8 @@
 
 ## Summary
 
-New opt `:handler-timeout-ms` (default 60000, `0` disables): a Ring handler
-that has not returned within it is abandoned, and the request is answered
+New opt `:handler-timeout-ms` (default `0` — no deadline; see Measured cost):
+a Ring handler that has not returned within it is abandoned, and the request is answered
 through the existing failure path — `:on-failure` first, then a plain
 `503`. Adds the context Igropyr's `info` alist carries, as
 `:ring-chez/failure` on the request the hook receives, and
@@ -60,8 +60,9 @@ the value, decides: a handler that legitimately returns `nil` delivers
 With a deadline configured the handler no longer runs on the worker thread
 — it cannot be abandoned from its own stack. Under `:fibers` this costs
 nothing: `:run!` already moved it to `async/thread`. Under `:threads` it is
-a thread handoff per request, which is why `0` is a supported answer and
-why the number is measured in the test plan rather than assumed.
+a thread handoff per request, which is why `0` is a supported answer, why
+the number was measured rather than assumed, and — once measured — why `0`
+is the default.
 
 ### Why keep-alive survives a timeout
 
@@ -73,9 +74,9 @@ usable, which is what makes Igropyr's fault envelope useful: the client
 resubmits on the same connection.
 
 The thread is not reclaimed. That is the honest cost of not being able to
-kill one, it is documented in the README, and it is why the default is a
-minute rather than a second: a deadline that fires on merely-slow handlers
-would leak threads for a living.
+kill one, it is documented in the README, and it is why the option should be
+set generously when it is set at all: a deadline that fires on merely-slow
+handlers would leak threads for a living.
 
 ### Only one hook call per request
 
@@ -126,12 +127,13 @@ produced by the adapter, so the string is built without a JSON dependency.
 
 ## Drawbacks
 
-- A thread handoff per request on `:threads` whenever the deadline is on.
+- A thread handoff per request on `:threads` whenever the deadline is on
+  (15-25%; off by default for that reason).
 - An abandoned handler's thread is never reclaimed. A server whose handlers
   routinely hang will run out of threads — later than it would have run out
   of workers, and with the difference that it keeps answering until then.
-- A legitimately slow handler (a report, a big export) now needs
-  `:handler-timeout-ms` raised or set to `0`.
+- A legitimately slow handler (a report, a big export) needs
+  `:handler-timeout-ms` raised or left at `0`.
 
 ## Test plan
 
@@ -167,7 +169,11 @@ Threads pays 15–25% for the handoff. Fibers pays nothing measurable, as
 predicted — the handler was already on a thread, and the deadline adds one
 timeout channel and an `alts!` per request.
 
-The default is still on, because a permanently dead worker is worse than a
-slower live one and the failure it prevents is unbounded. `0` is a
-one-word opt-out for anyone who would rather have the throughput, and it
-restores the previous behavior exactly.
+So the default is **off**. A 15-25% tax on every request of every server is
+too much to charge by default for a failure mode a given deployment may
+never have, particularly when the cheaper mitigation — client timeouts
+inside the handler — is the one that also stops the thread leaking.
+
+Under `:fibers` it is free and worth turning on. Under `:threads` it is a
+trade the operator makes with the number in front of them, which is why the
+number is in the README next to the flag.

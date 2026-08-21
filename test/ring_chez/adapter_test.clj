@@ -1399,7 +1399,17 @@
       (Thread/sleep 250)
       (check "deadline: handler inside the deadline is untouched" 200
              (:status (http/get "http://127.0.0.1:8536/slow")))
-      (finally (adapter/stop-server ok)))))
+      (finally (adapter/stop-server ok))))
+  ;; the DEFAULT is off: enforcing a deadline costs a thread handoff per
+  ;; request on this strategy (15-25%), which is not a toll to charge every
+  ;; server by default. Locked down here so it cannot drift back.
+  (let [dflt (adapter/run-server deadline-handler {:port 8558})]
+    (try
+      (Thread/sleep 250)
+      (let [r (http/get "http://127.0.0.1:8558/slow")]
+        (check "deadline: off by default" 200 (:status r))
+        (check-has "deadline: default runs the handler to completion" "slow done" (:body r)))
+      (finally (adapter/stop-server dflt)))))
 
 ;; a channel body is returned immediately and streams for longer than the
 ;; deadline — the deadline covers handler execution, not the stream
