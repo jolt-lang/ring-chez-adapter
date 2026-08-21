@@ -77,11 +77,16 @@
 
 (defn- send-buf!
   "Write all n bytes of buf to fd. A short send is normal and gets retried, and
-  so does EINTR — under a loaded suite send(2) is interrupted often enough to
-  matter. The old loop stopped on any non-positive return, which silently sent
-  a PARTIAL request (or none at all): the server then sat waiting for a body
-  that never arrived and closed on its idle timeout, and the test saw an empty
-  response with nothing to say why. Anything that is not a retry throws."
+  so does EINTR. The old loop stopped on any non-positive return, which
+  silently sent a PARTIAL request (or none at all): the server then sat
+  waiting for a body that never arrived and closed on its idle timeout, and
+  the test saw an empty response with nothing to say why. Anything that is not
+  a retry throws, with the errno, because that is the part the old loop threw
+  away — it is what finally identified EPIPE here rather than a signal.
+
+  The EINTR arm is defensive, not load-bearing: nothing in an automated run
+  delivers a signal that runs a handler (every disposition but SIGINT/SIGQUIT
+  is SIG_DFL, SIGPIPE is SIG_IGN), so it should never fire."
   [fd buf n]
   (loop [off 0]
     (when (< off n)
@@ -89,8 +94,11 @@
         (cond
           (pos? sent) (recur (+ off sent))
           (and (neg? sent) (or (poller/eintr?) (poller/eagain?))) (recur off)
-          :else (throw (ex-info "client send failed"
-                                {:sent sent :offset off :length n})))))))
+          :else (throw (ex-info (str "client send failed: errno " (ffi/errno)
+                                     " " (ffi/errno-message (ffi/errno)))
+                                {:sent sent :offset off :length n
+                                 :errno (ffi/errno)
+                                 :errno-message (ffi/errno-message (ffi/errno))})))))))
 
 (defn client-send [fd ^String s]
   (let [buf (ffi/alloc (max 1 (* 4 (count s))))
@@ -138,8 +146,25 @@
             acc
             (let [n (t-recv fd buf 65536 0)]
               (cond (pos? n)  (recur (bcat acc (ffi/read-array buf n)))
+                    ;; a clean EOF with nothing read is "" — which is what
+                    ;; several tests assert, so it is not worth announcing.
+                    ;; An errno below is: that one distinguishes a peer that
+                    ;; went away from a read that failed for another reason.
                     (zero? n) acc
-                    :else     (when (pos? (alength acc)) acc))))))
+                    ;; a signal is not the peer going away, and the three
+                    ;; ways a recv can answer non-positive mean opposite
+                    ;; things. Conflating them is what made `client-recv`
+                    ;; answer nil where the test wanted "" (the peer closed).
+                    ;; Defensive rather than load-bearing, like send-buf!'s:
+                    ;; no signal in an automated run has a handler to
+                    ;; interrupt anything. SO_RCVTIMEO's EAGAIN is NOT
+                    ;; retried: that one really is "nothing came", and
+                    ;; retrying it would hang the test.
+                    (poller/eintr?) (recur acc)
+                    :else     (do (when (zero? (alength acc))
+                                    (println "  [recv: error errno" (ffi/errno)
+                                             (ffi/errno-message (ffi/errno)) "fd" fd "]"))
+                                  (when (pos? (alength acc)) acc)))))))
       (finally (ffi/free buf)))))
 
 (defn client-recv
@@ -185,11 +210,19 @@
 (defn- t-fill! [fd]
   (let [buf (ffi/alloc 65536)]
     (try
-      (let [got (t-recv fd buf 65536 0)]
-        (when (pos? got)
-          (swap! t-pending update fd
-                 (fn [p] (into (vec p) (map #(ffi/read buf :uint8 %) (range got)))))
-          true))
+      ;; EINTR retries here for the same reason it does in client-recv-raw: a
+      ;; signal is not the end of the frame. Answering nil for one stopped
+      ;; t-recv-n's fill loop short of the bytes it was asked for, and a
+      ;; websocket frame parsed from a truncated buffer fails as a codec bug.
+      (loop []
+        (let [got (t-recv fd buf 65536 0)]
+          (cond
+            (pos? got)
+            (do (swap! t-pending update fd
+                       (fn [p] (into (vec p) (map #(ffi/read buf :uint8 %) (range got)))))
+                true)
+            (and (neg? got) (poller/eintr?)) (recur)
+            :else nil)))
       (finally (ffi/free buf)))))
 
 (defn t-recv-n
@@ -264,9 +297,14 @@
         (if (str/includes? (latin1 acc) needle)
           acc
           (let [n (t-recv fd buf 65536 0)]
-            (if (pos? n)
-              (recur (bcat acc (ffi/read-array buf n)))
-              acc))))
+            (cond
+              (pos? n) (recur (bcat acc (ffi/read-array buf n)))
+              ;; EINTR is not the end of the response — same reasoning as
+              ;; client-recv-raw. Returning acc here gave callers a partial (or
+              ;; empty) response that reads as the server having answered
+              ;; nothing: `uri: /a/b -> /a/b — no "..." in ""` was this.
+              (and (neg? n) (poller/eintr?)) (recur acc)
+              :else acc))))
       (finally (ffi/free buf)))))
 
 (defn client-recv-until
@@ -1287,6 +1325,8 @@
         (let [n (t-recv fd buf 65536 0)]
           (cond (pos? n) (recur (str acc (ffi/read-bytes buf n)))
                 (zero? n) acc
+                ;; a signal is not the close this is waiting for
+                (poller/eintr?) (recur acc)
                 :else (if (pos? (count acc)) acc ""))))
       (finally (ffi/free buf)))))
 
@@ -2039,16 +2079,26 @@
 ;; timeout (RFC-0008).
 (defn- stop-closes-live-conn [strategy port]
   (let [calls  (atom 0)
+        ;; the body names THIS server, so a response served by anyone else is
+        ;; identifiable rather than just an anonymous 200
+        token  (str "tok-" (name strategy) "-" port)
         h      (fn [_] (swap! calls inc)
-                 {:status 200 :headers {"Content-Type" "text/plain"} :body "ok"})
+                 {:status 200 :headers {"Content-Type" "text/plain"} :body token})
         server (adapter/run-server h {:port port :strategy strategy})
         label  (str (name strategy) " stop: ")]
     (Thread/sleep 250)
     (let [fd (client-connect port 3000)]
       (try
         (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
-        (check (str label "served before the stop") true
-               (str/starts-with? (or (client-recv fd) "") "HTTP/1.1 200"))
+        (let [first-resp (or (client-recv fd) "")]
+          (check (str label "served before the stop") true
+                 (str/starts-with? first-resp "HTTP/1.1 200"))
+          ;; whoever answered must be this server: a 200 carrying another
+          ;; server's token means the connection was served by a stale fiber
+          (check (str label "answered by this server") true
+                 (str/includes? first-resp token))
+          (when-not (str/includes? first-resp token)
+            (println "  [stop: fd" fd "wanted" token "got" (pr-str first-resp) "]")))
         (adapter/stop-server server)
         ;; the send itself may fail (RST on a closed peer) — that is the same
         ;; answer as reading EOF, so both count as "not served"
@@ -2064,6 +2114,120 @@
 
 (defn test-stop-closes-live-conn-fibers []
   (stop-closes-live-conn :fibers 8531))
+
+;; A stopped server must never answer anybody else's connection.
+;;
+;; conn-close! used to close(fd) and THEN poller/forget!, and forget! resumes
+;; every fiber parked on that fd — whose retry recv fiber-recv! assumed would
+;; answer EBADF. close() had already freed the fd NUMBER by then, and the
+;; resumed fiber does not run until the scheduler reaches it, so an acceptor
+;; could be handed that number first: the stale fiber's recv then read a LIVE
+;; connection belonging to somebody else and answered it out of its own,
+;; already-stopped server's handler. ~2.5% of responses on :fibers; :threads
+;; never showed it, because only the fibers path parks on the poller.
+;;
+;; Every server stamps its own token into every body, so a response carrying
+;; the wrong one names the bug instead of looking like an unexplained flake.
+(defn- serves-only-own-conns [strategy base]
+  (let [rounds 16
+        conns  8
+        bad    (atom [])]
+    (dotimes [i rounds]
+      (let [pa (+ base (* 2 (mod i 8)))
+            pb (inc pa)
+            ta (str "tok-A-" i)
+            tb (str "tok-B-" i)
+            a  (adapter/run-server (fn [_] {:status 200 :body ta})
+                                   {:port pa :strategy strategy})]
+        (Thread/sleep 60)
+        ;; live conns on A, left open so their fibers are parked on the poller
+        ;; when the stop below wakes them
+        (let [fds (doall (for [_ (range conns)]
+                           (let [fd (client-connect pa 2000)]
+                             (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+                             (client-recv fd)
+                             fd)))]
+          (adapter/stop-server a)
+          ;; release the client numbers too: the bigger the pool of
+          ;; just-freed fds, the likelier the acceptor below is handed one
+          (doseq [fd fds] (client-close fd)))
+        (let [b (adapter/run-server (fn [_] {:status 200 :body tb})
+                                    {:port pb :strategy strategy})]
+          (try
+            (Thread/sleep 60)
+            (let [fds (doall (for [_ (range conns)] (client-connect pb 2000)))]
+              (doseq [fd fds]
+                (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n"))
+              (doseq [fd fds]
+                (let [r (or (client-recv fd) "")]
+                  (when-not (str/includes? r tb)
+                    (swap! bad conj {:round i :wanted tb
+                                     :got (subs r 0 (min 120 (count r)))}))))
+              (doseq [fd fds] (client-close fd)))
+            (finally (adapter/stop-server b))))))
+    (doseq [b (take 3 @bad)]
+      (println "  [cross-serve:" (pr-str b) "]"))
+    (check (str (name strategy) " isolation: no conn served by a stopped server")
+           0 (count @bad))))
+
+(defn test-serves-only-own-conns-fibers []
+  (serves-only-own-conns :fibers 8600))
+
+(defn test-serves-only-own-conns-threads []
+  (serves-only-own-conns :threads 8620))
+
+;; stop-server must leave nothing behind even while connections are arriving as
+;; it runs. serve-loop read running? BEFORE register-conn! published the entry,
+;; so a conn accepted in that window landed in `conns` AFTER the sweep had
+;; passed over it — a stopped server went on serving it, and its fd leaked.
+;; serve! now registers first and checks after, which interlocks with
+;; stop-server clearing running? before it sweeps: the conn is either in `conns`
+;; when the sweep reads it, or the check sees false and cleans up on the spot.
+;;
+;; Honest about what this is: the window is a couple of microseconds, so this
+;; does not reproduce the bug on its own — a storm of 20 rounds never hit it.
+;; Widening the window to 5ms made it 9 rounds in 12, and 0 with the fix in.
+;; What this holds is the invariant, cheaply: the clients stay OPEN across the
+;; stop, so a connection that missed the sweep keeps the count above zero
+;; rather than being reaped for going away.
+(defn- stop-leaves-nothing-behind [strategy port]
+  (let [server (adapter/run-server (fn [_] {:status 200 :body "x"})
+                                   {:port port :strategy strategy})
+        held     (atom [])
+        stop?    (atom false)
+        ;; throttled and capped: this only needs a connect in flight when the
+        ;; stop lands, and an unbounded storm would run the suite out of fds
+        stormers (doall
+                   (for [_ (range 3)]
+                     (future
+                       (while (and (not @stop?) (< (count @held) 60))
+                         (try (let [fd (client-connect port 2000)]
+                                (swap! held conj fd)
+                                (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n"))
+                              (catch Throwable _ nil))
+                         (Thread/sleep 2)))))]
+    (try
+      (Thread/sleep 150)
+      (adapter/stop-server server)
+      (reset! stop? true)
+      (doseq [f stormers] (deref f 3000 :timeout))
+      ;; an owner may still be unwinding when stop-server returns, so poll
+      (let [give-up (+ (System/currentTimeMillis) 3000)
+            final   (loop []
+                      (let [c (:connections (adapter/server-stats server))]
+                        (if (or (zero? c) (> (System/currentTimeMillis) give-up))
+                          c
+                          (do (Thread/sleep 50) (recur)))))]
+        (check (str (name strategy) " stop: nothing left open afterwards") 0 final))
+      (finally
+        (reset! stop? true)
+        (doseq [fd @held] (try (client-close fd) (catch Throwable _ nil)))))))
+
+(defn test-stop-leaves-nothing-behind-fibers []
+  (stop-leaves-nothing-behind :fibers 8640))
+
+(defn test-stop-leaves-nothing-behind-threads []
+  (stop-leaves-nothing-behind :threads 8641))
 
 ;; --- Round 6: operability ---------------------------------------------------------
 
@@ -3251,6 +3415,17 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+(defn run-test
+  "Run one test, attributing a throw to it instead of ending the run. A test
+  that dies on a socket error — an EPIPE from a peer that closed a beat early,
+  say — used to abort -main where it stood, and the sixty tests after it never
+  ran, so a transient fault in one read as silence from all of them."
+  [nm f]
+  (try (f)
+       (catch Throwable t
+         (swap! failures inc)
+         (println "  FAIL" nm "— threw" (str t)))))
+
 (defn -main [& _]
   (println "ring adapter over jolt.ffi sockets")
 
@@ -3270,165 +3445,169 @@
       (finally (adapter/stop-server server))))
 
   ;; --- Protocol correctness (adopted from capra) ---
-  (test-status-reasons)
-  (test-connection-header-list)
-  (test-handler-connection-close)
-  (test-vector-header-values)
-  (test-bad-request-lines)
-  (test-header-cap-is-431)
+  (run-test "test-status-reasons" test-status-reasons)
+  (run-test "test-connection-header-list" test-connection-header-list)
+  (run-test "test-handler-connection-close" test-handler-connection-close)
+  (run-test "test-vector-header-values" test-vector-header-values)
+  (run-test "test-bad-request-lines" test-bad-request-lines)
+  (run-test "test-header-cap-is-431" test-header-cap-is-431)
 
   ;; --- Phase 1 ---
-  (test-concurrent-slow-requests)
-  (test-single-worker-queues)
-  (test-stop-is-prompt)
+  (run-test "test-concurrent-slow-requests" test-concurrent-slow-requests)
+  (run-test "test-single-worker-queues" test-single-worker-queues)
+  (run-test "test-stop-is-prompt" test-stop-is-prompt)
 
   ;; --- Phase 2 ---
-  (test-keep-alive-two-requests)
-  (test-connection-close-honored)
-  (test-keep-alive-idle-timeout)
-  (test-pipelined-requests)
+  (run-test "test-keep-alive-two-requests" test-keep-alive-two-requests)
+  (run-test "test-connection-close-honored" test-connection-close-honored)
+  (run-test "test-keep-alive-idle-timeout" test-keep-alive-idle-timeout)
+  (run-test "test-pipelined-requests" test-pipelined-requests)
 
   ;; --- Phase 3 ---
-  (test-stream-chunked)
-  (test-stream-client-disconnect-aborts)
-  (test-stream-http10-close-delimited)
-  (test-stream-204-no-framing)
+  (run-test "test-stream-chunked" test-stream-chunked)
+  (run-test "test-stream-client-disconnect-aborts" test-stream-client-disconnect-aborts)
+  (run-test "test-stream-http10-close-delimited" test-stream-http10-close-delimited)
+  (run-test "test-stream-204-no-framing" test-stream-204-no-framing)
 
   ;; --- Phase 4 ---
-  (test-sse)
+  (run-test "test-sse" test-sse)
 
   ;; --- Phase 5 ---
-  (test-websocket)
+  (run-test "test-websocket" test-websocket)
 
   ;; --- Phase 6 ---
-  (test-max-request-size)
-  (test-worker-survives-bad-chunk)
-  (test-keep-alive-fairness)
-  (test-pipelined-under-pressure)
+  (run-test "test-max-request-size" test-max-request-size)
+  (run-test "test-worker-survives-bad-chunk" test-worker-survives-bad-chunk)
+  (run-test "test-keep-alive-fairness" test-keep-alive-fairness)
+  (run-test "test-pipelined-under-pressure" test-pipelined-under-pressure)
 
   ;; --- concurrency strategies ---
-  (test-rebind-same-port-after-stop)
-  (test-fiber-basic)
-  (test-fiber-idle-connections-do-not-pin)
-  (test-fiber-keep-alive-and-pipelining)
-  (test-fiber-streaming)
-  (test-fiber-idle-timeout)
-  (test-fiber-stop-wakes-parked-conns)
-  (test-fiber-restart-leaves-poller-clean)
-  (test-bad-strategy-throws)
-  (test-bind-failure-carries-errno)
-  (test-string-content-length-keep-alive)
-  (test-bind-eaddrinuse-friendly)
-  (test-boot-validation)
-  (test-on-failure-hook)
-  (test-on-failure-hook-throw-falls-back)
-  (test-nil-response-is-500)
-  (test-ws-failure-notifies-hook)
-  (test-ws-guard-accepts)
-  (test-ws-guard-rejects-with-response)
-  (test-ws-guard-nil-is-403)
-  (test-ws-guard-throw-is-request-failure)
-  (test-write-timeout-cuts-stalled-peer)
-  (test-write-timeout-zero-disables)
+  (run-test "test-rebind-same-port-after-stop" test-rebind-same-port-after-stop)
+  (run-test "test-fiber-basic" test-fiber-basic)
+  (run-test "test-fiber-idle-connections-do-not-pin" test-fiber-idle-connections-do-not-pin)
+  (run-test "test-fiber-keep-alive-and-pipelining" test-fiber-keep-alive-and-pipelining)
+  (run-test "test-fiber-streaming" test-fiber-streaming)
+  (run-test "test-fiber-idle-timeout" test-fiber-idle-timeout)
+  (run-test "test-fiber-stop-wakes-parked-conns" test-fiber-stop-wakes-parked-conns)
+  (run-test "test-fiber-restart-leaves-poller-clean" test-fiber-restart-leaves-poller-clean)
+  (run-test "test-bad-strategy-throws" test-bad-strategy-throws)
+  (run-test "test-bind-failure-carries-errno" test-bind-failure-carries-errno)
+  (run-test "test-string-content-length-keep-alive" test-string-content-length-keep-alive)
+  (run-test "test-bind-eaddrinuse-friendly" test-bind-eaddrinuse-friendly)
+  (run-test "test-boot-validation" test-boot-validation)
+  (run-test "test-on-failure-hook" test-on-failure-hook)
+  (run-test "test-on-failure-hook-throw-falls-back" test-on-failure-hook-throw-falls-back)
+  (run-test "test-nil-response-is-500" test-nil-response-is-500)
+  (run-test "test-ws-failure-notifies-hook" test-ws-failure-notifies-hook)
+  (run-test "test-ws-guard-accepts" test-ws-guard-accepts)
+  (run-test "test-ws-guard-rejects-with-response" test-ws-guard-rejects-with-response)
+  (run-test "test-ws-guard-nil-is-403" test-ws-guard-nil-is-403)
+  (run-test "test-ws-guard-throw-is-request-failure" test-ws-guard-throw-is-request-failure)
+  (run-test "test-write-timeout-cuts-stalled-peer" test-write-timeout-cuts-stalled-peer)
+  (run-test "test-write-timeout-zero-disables" test-write-timeout-zero-disables)
 
   ;; --- Wave 2 round 6: reuse-port and trusted-proxy addressing ---
-  (test-reuse-port)
-  (test-trusted-proxy-addr)
+  (run-test "test-reuse-port" test-reuse-port)
+  (run-test "test-trusted-proxy-addr" test-trusted-proxy-addr)
 
   ;; --- Wave 2 round 5: static files ---
-  (test-static-serves)
-  (test-static-conditional)
-  (test-static-gzip)
-  (test-static-large-file)
-  (test-static-path-safety)
-  (test-static-cache-window)
+  (run-test "test-static-serves" test-static-serves)
+  (run-test "test-static-conditional" test-static-conditional)
+  (run-test "test-static-gzip" test-static-gzip)
+  (run-test "test-static-large-file" test-static-large-file)
+  (run-test "test-static-path-safety" test-static-path-safety)
+  (run-test "test-static-cache-window" test-static-cache-window)
 
   ;; --- Wave 2 round 4: gzip ---
-  (test-gzip-compresses)
-  (test-gzip-negotiation)
-  (test-gzip-skips)
-  (test-gzip-etag)
+  (run-test "test-gzip-compresses" test-gzip-compresses)
+  (run-test "test-gzip-negotiation" test-gzip-negotiation)
+  (run-test "test-gzip-skips" test-gzip-skips)
+  (run-test "test-gzip-etag" test-gzip-etag)
 
   ;; --- Wave 2 round 3: multipart uploads ---
-  (test-multipart-upload)
-  (test-multipart-large-chunked)
-  (test-multipart-truncated)
-  (test-multipart-passthrough)
+  (run-test "test-multipart-upload" test-multipart-upload)
+  (run-test "test-multipart-large-chunked" test-multipart-large-chunked)
+  (run-test "test-multipart-truncated" test-multipart-truncated)
+  (run-test "test-multipart-passthrough" test-multipart-passthrough)
 
   ;; --- Wave 2 round 2: handler deadline ---
-  (test-handler-deadline-threads)
-  (test-handler-deadline-fibers)
-  (test-handler-deadline-bounds)
-  (test-handler-deadline-spares-streams)
-  (test-handler-deadline-hook)
-  (test-fault-handler-envelope)
+  (run-test "test-handler-deadline-threads" test-handler-deadline-threads)
+  (run-test "test-handler-deadline-fibers" test-handler-deadline-fibers)
+  (run-test "test-handler-deadline-bounds" test-handler-deadline-bounds)
+  (run-test "test-handler-deadline-spares-streams" test-handler-deadline-spares-streams)
+  (run-test "test-handler-deadline-hook" test-handler-deadline-hook)
+  (run-test "test-fault-handler-envelope" test-fault-handler-envelope)
 
   ;; --- Wave 2 round 1: stop-server closes live connections ---
-  (test-stop-closes-live-conn-threads)
-  (test-stop-closes-live-conn-fibers)
+  (run-test "test-stop-closes-live-conn-threads" test-stop-closes-live-conn-threads)
+  (run-test "test-stop-closes-live-conn-fibers" test-stop-closes-live-conn-fibers)
+  (run-test "test-serves-only-own-conns-fibers" test-serves-only-own-conns-fibers)
+  (run-test "test-serves-only-own-conns-threads" test-serves-only-own-conns-threads)
+  (run-test "test-stop-leaves-nothing-behind-fibers" test-stop-leaves-nothing-behind-fibers)
+  (run-test "test-stop-leaves-nothing-behind-threads" test-stop-leaves-nothing-behind-threads)
 
   ;; --- Round 6: operability ---
-  (test-graceful-drain)
-  (test-drain-timeout)
-  (test-server-stats)
-  (test-handler-hot-swap)
-  (test-uri-normalization)
-  (test-head-and-status-framing)
-  (test-http10-keep-alive-and-close)
+  (run-test "test-graceful-drain" test-graceful-drain)
+  (run-test "test-drain-timeout" test-drain-timeout)
+  (run-test "test-server-stats" test-server-stats)
+  (run-test "test-handler-hot-swap" test-handler-hot-swap)
+  (run-test "test-uri-normalization" test-uri-normalization)
+  (run-test "test-head-and-status-framing" test-head-and-status-framing)
+  (run-test "test-http10-keep-alive-and-close" test-http10-keep-alive-and-close)
 
   ;; --- Round 5: resource bounds ---
-  (test-request-deadline)
-  (test-request-deadline-fibers)
-  (test-header-limit)
-  (test-header-limit-configurable)
-  (test-large-file-response)
-  (test-input-stream-response-framing)
+  (run-test "test-request-deadline" test-request-deadline)
+  (run-test "test-request-deadline-fibers" test-request-deadline-fibers)
+  (run-test "test-header-limit" test-header-limit)
+  (run-test "test-header-limit-configurable" test-header-limit-configurable)
+  (run-test "test-large-file-response" test-large-file-response)
+  (run-test "test-input-stream-response-framing" test-input-stream-response-framing)
 
   ;; --- Round 4: request framing ---
-  (test-chunked-request-body)
-  (test-chunked-body-cap)
-  (test-smuggling-guards)
-  (test-duplicate-request-headers)
-  (test-expect-100-continue)
+  (run-test "test-chunked-request-body" test-chunked-request-body)
+  (run-test "test-chunked-body-cap" test-chunked-body-cap)
+  (run-test "test-smuggling-guards" test-smuggling-guards)
+  (run-test "test-duplicate-request-headers" test-duplicate-request-headers)
+  (run-test "test-expect-100-continue" test-expect-100-continue)
 
   ;; --- Round 3: bind address and peer ---
-  (test-bind-host-option)
-  (test-peer-ip-formatting)
-  (test-request-addressing)
-  (test-fiber-request-addressing)
+  (run-test "test-bind-host-option" test-bind-host-option)
+  (run-test "test-peer-ip-formatting" test-peer-ip-formatting)
+  (run-test "test-request-addressing" test-request-addressing)
+  (run-test "test-fiber-request-addressing" test-fiber-request-addressing)
 
   ;; --- Round 2: RFC 6455 codec ---
-  (test-harness-handshake-surplus)
-  (test-ws-large-frame)
-  (test-ws-leftover-frame)
-  (test-ws-fragmented-message)
-  (test-ws-unmasked-client-frame-rejected)
-  (test-ws-rsv-bits-rejected)
-  (test-ws-invalid-utf8-is-1007)
-  (test-ws-close-code-echoed)
-  (test-ws-bad-close-code-is-1002)
-  (test-ws-oversized-frame-rejected)
-  (test-ws-binary-round-trip)
-  (test-ws-handshake-validation)
+  (run-test "test-harness-handshake-surplus" test-harness-handshake-surplus)
+  (run-test "test-ws-large-frame" test-ws-large-frame)
+  (run-test "test-ws-leftover-frame" test-ws-leftover-frame)
+  (run-test "test-ws-fragmented-message" test-ws-fragmented-message)
+  (run-test "test-ws-unmasked-client-frame-rejected" test-ws-unmasked-client-frame-rejected)
+  (run-test "test-ws-rsv-bits-rejected" test-ws-rsv-bits-rejected)
+  (run-test "test-ws-invalid-utf8-is-1007" test-ws-invalid-utf8-is-1007)
+  (run-test "test-ws-close-code-echoed" test-ws-close-code-echoed)
+  (run-test "test-ws-bad-close-code-is-1002" test-ws-bad-close-code-is-1002)
+  (run-test "test-ws-oversized-frame-rejected" test-ws-oversized-frame-rejected)
+  (run-test "test-ws-binary-round-trip" test-ws-binary-round-trip)
+  (run-test "test-ws-handshake-validation" test-ws-handshake-validation)
 
   ;; --- Round 1: correctness fixes ---
-  (test-timeout-granularity)
-  (test-fiber-slow-handler-not-reaped)
-  (test-fiber-long-stream-not-reaped)
-  (test-header-crlf-is-dropped)
-  (test-content-length-follows-body)
+  (run-test "test-timeout-granularity" test-timeout-granularity)
+  (run-test "test-fiber-slow-handler-not-reaped" test-fiber-slow-handler-not-reaped)
+  (run-test "test-fiber-long-stream-not-reaped" test-fiber-long-stream-not-reaped)
+  (run-test "test-header-crlf-is-dropped" test-header-crlf-is-dropped)
+  (run-test "test-content-length-follows-body" test-content-length-follows-body)
 
   ;; --- UTF-8 request framing ---
-  (test-utf8-request-body)
-  (test-utf8-split-across-reads)
-  (test-utf8-pipelined)
-  (test-utf8-large-body)
-  (test-utf8-fiber-request-body)
-  (test-unframeable-requests)
-  (test-binary-request-body)
-  (test-binary-response-body)
-  (test-binary-response-chunks)
-  (test-binary-round-trip)
+  (run-test "test-utf8-request-body" test-utf8-request-body)
+  (run-test "test-utf8-split-across-reads" test-utf8-split-across-reads)
+  (run-test "test-utf8-pipelined" test-utf8-pipelined)
+  (run-test "test-utf8-large-body" test-utf8-large-body)
+  (run-test "test-utf8-fiber-request-body" test-utf8-fiber-request-body)
+  (run-test "test-unframeable-requests" test-unframeable-requests)
+  (run-test "test-binary-request-body" test-binary-request-body)
+  (run-test "test-binary-response-body" test-binary-response-body)
+  (run-test "test-binary-response-chunks" test-binary-response-chunks)
+  (run-test "test-binary-round-trip" test-binary-round-trip)
 
   (if (zero? @failures)
     (println "all passed")

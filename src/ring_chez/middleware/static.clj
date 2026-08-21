@@ -166,7 +166,7 @@
 ;;
 ;; Keyed by the REQUEST path, not the resolved file: a hit inside the stat
 ;; window must not touch the filesystem at all, and resolving the file is
-;; itself several syscalls (isFile, canRead, two getCanonicalPath). That is
+;; itself several syscalls (isFile, canRead, two toRealPath). That is
 ;; the whole difference from wrap-file.
 ;;
 ;; entry: {:file :size :mtime :etag :content-type :bytes :gzip :checked-at
@@ -270,7 +270,7 @@
 
   A hit inside the stat window returns without a single filesystem call,
   which is the point: resolving the file is itself several syscalls (isFile,
-  canRead, two getCanonicalPath) before anything is read. Past the window one
+  canRead, two toRealPath) before anything is read. Past the window one
   stat decides between renewing the entry and rebuilding it. Misses are not
   cached — a file that appears after a 404 must be served, not remembered as
   absent."
