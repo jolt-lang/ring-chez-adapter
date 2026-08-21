@@ -138,8 +138,26 @@
             acc
             (let [n (t-recv fd buf 65536 0)]
               (cond (pos? n)  (recur (bcat acc (ffi/read-array buf n)))
-                    (zero? n) acc
-                    :else     (when (pos? (alength acc)) acc))))))
+                    (zero? n) (do (when (zero? (alength acc))
+                                    ;; the peer closed having sent nothing. Say
+                                    ;; so: a check that reports only "" cannot
+                                    ;; be told from a timeout, and the two mean
+                                    ;; opposite things about who went away.
+                                    (println "  [recv: clean EOF, no bytes, fd" fd "]"))
+                                  acc)
+                    ;; a signal is not the peer going away. Under a loaded
+                    ;; suite recv(2) is interrupted often enough to matter —
+                    ;; send-buf! already retries for the same reason — and
+                    ;; treating EINTR as "nothing came" made every assertion
+                    ;; that tells EOF from error flaky: `client-recv` answered
+                    ;; nil where the test wanted "" (the peer closed).
+                    ;; SO_RCVTIMEO's EAGAIN is NOT retried: that one really is
+                    ;; "nothing came", and retrying it would hang the test.
+                    (poller/eintr?) (recur acc)
+                    :else     (do (when (zero? (alength acc))
+                                    (println "  [recv: error errno" (ffi/errno)
+                                             (ffi/errno-message (ffi/errno)) "fd" fd "]"))
+                                  (when (pos? (alength acc)) acc)))))))
       (finally (ffi/free buf)))))
 
 (defn client-recv
@@ -185,11 +203,19 @@
 (defn- t-fill! [fd]
   (let [buf (ffi/alloc 65536)]
     (try
-      (let [got (t-recv fd buf 65536 0)]
-        (when (pos? got)
-          (swap! t-pending update fd
-                 (fn [p] (into (vec p) (map #(ffi/read buf :uint8 %) (range got)))))
-          true))
+      ;; EINTR retries here for the same reason it does in client-recv-raw: a
+      ;; signal is not the end of the frame. Answering nil for one stopped
+      ;; t-recv-n's fill loop short of the bytes it was asked for, and a
+      ;; websocket frame parsed from a truncated buffer fails as a codec bug.
+      (loop []
+        (let [got (t-recv fd buf 65536 0)]
+          (cond
+            (pos? got)
+            (do (swap! t-pending update fd
+                       (fn [p] (into (vec p) (map #(ffi/read buf :uint8 %) (range got)))))
+                true)
+            (and (neg? got) (poller/eintr?)) (recur)
+            :else nil)))
       (finally (ffi/free buf)))))
 
 (defn t-recv-n
@@ -1287,6 +1313,8 @@
         (let [n (t-recv fd buf 65536 0)]
           (cond (pos? n) (recur (str acc (ffi/read-bytes buf n)))
                 (zero? n) acc
+                ;; a signal is not the close this is waiting for
+                (poller/eintr?) (recur acc)
                 :else (if (pos? (count acc)) acc ""))))
       (finally (ffi/free buf)))))
 
@@ -3251,6 +3279,17 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+(defn run-test
+  "Run one test, attributing a throw to it instead of ending the run. A test
+  that dies on a socket error — an EPIPE from a peer that closed a beat early,
+  say — used to abort -main where it stood, and the sixty tests after it never
+  ran, so a transient fault in one read as silence from all of them."
+  [nm f]
+  (try (f)
+       (catch Throwable t
+         (swap! failures inc)
+         (println "  FAIL" nm "— threw" (str t)))))
+
 (defn -main [& _]
   (println "ring adapter over jolt.ffi sockets")
 
@@ -3270,165 +3309,165 @@
       (finally (adapter/stop-server server))))
 
   ;; --- Protocol correctness (adopted from capra) ---
-  (test-status-reasons)
-  (test-connection-header-list)
-  (test-handler-connection-close)
-  (test-vector-header-values)
-  (test-bad-request-lines)
-  (test-header-cap-is-431)
+  (run-test "test-status-reasons" test-status-reasons)
+  (run-test "test-connection-header-list" test-connection-header-list)
+  (run-test "test-handler-connection-close" test-handler-connection-close)
+  (run-test "test-vector-header-values" test-vector-header-values)
+  (run-test "test-bad-request-lines" test-bad-request-lines)
+  (run-test "test-header-cap-is-431" test-header-cap-is-431)
 
   ;; --- Phase 1 ---
-  (test-concurrent-slow-requests)
-  (test-single-worker-queues)
-  (test-stop-is-prompt)
+  (run-test "test-concurrent-slow-requests" test-concurrent-slow-requests)
+  (run-test "test-single-worker-queues" test-single-worker-queues)
+  (run-test "test-stop-is-prompt" test-stop-is-prompt)
 
   ;; --- Phase 2 ---
-  (test-keep-alive-two-requests)
-  (test-connection-close-honored)
-  (test-keep-alive-idle-timeout)
-  (test-pipelined-requests)
+  (run-test "test-keep-alive-two-requests" test-keep-alive-two-requests)
+  (run-test "test-connection-close-honored" test-connection-close-honored)
+  (run-test "test-keep-alive-idle-timeout" test-keep-alive-idle-timeout)
+  (run-test "test-pipelined-requests" test-pipelined-requests)
 
   ;; --- Phase 3 ---
-  (test-stream-chunked)
-  (test-stream-client-disconnect-aborts)
-  (test-stream-http10-close-delimited)
-  (test-stream-204-no-framing)
+  (run-test "test-stream-chunked" test-stream-chunked)
+  (run-test "test-stream-client-disconnect-aborts" test-stream-client-disconnect-aborts)
+  (run-test "test-stream-http10-close-delimited" test-stream-http10-close-delimited)
+  (run-test "test-stream-204-no-framing" test-stream-204-no-framing)
 
   ;; --- Phase 4 ---
-  (test-sse)
+  (run-test "test-sse" test-sse)
 
   ;; --- Phase 5 ---
-  (test-websocket)
+  (run-test "test-websocket" test-websocket)
 
   ;; --- Phase 6 ---
-  (test-max-request-size)
-  (test-worker-survives-bad-chunk)
-  (test-keep-alive-fairness)
-  (test-pipelined-under-pressure)
+  (run-test "test-max-request-size" test-max-request-size)
+  (run-test "test-worker-survives-bad-chunk" test-worker-survives-bad-chunk)
+  (run-test "test-keep-alive-fairness" test-keep-alive-fairness)
+  (run-test "test-pipelined-under-pressure" test-pipelined-under-pressure)
 
   ;; --- concurrency strategies ---
-  (test-rebind-same-port-after-stop)
-  (test-fiber-basic)
-  (test-fiber-idle-connections-do-not-pin)
-  (test-fiber-keep-alive-and-pipelining)
-  (test-fiber-streaming)
-  (test-fiber-idle-timeout)
-  (test-fiber-stop-wakes-parked-conns)
-  (test-fiber-restart-leaves-poller-clean)
-  (test-bad-strategy-throws)
-  (test-bind-failure-carries-errno)
-  (test-string-content-length-keep-alive)
-  (test-bind-eaddrinuse-friendly)
-  (test-boot-validation)
-  (test-on-failure-hook)
-  (test-on-failure-hook-throw-falls-back)
-  (test-nil-response-is-500)
-  (test-ws-failure-notifies-hook)
-  (test-ws-guard-accepts)
-  (test-ws-guard-rejects-with-response)
-  (test-ws-guard-nil-is-403)
-  (test-ws-guard-throw-is-request-failure)
-  (test-write-timeout-cuts-stalled-peer)
-  (test-write-timeout-zero-disables)
+  (run-test "test-rebind-same-port-after-stop" test-rebind-same-port-after-stop)
+  (run-test "test-fiber-basic" test-fiber-basic)
+  (run-test "test-fiber-idle-connections-do-not-pin" test-fiber-idle-connections-do-not-pin)
+  (run-test "test-fiber-keep-alive-and-pipelining" test-fiber-keep-alive-and-pipelining)
+  (run-test "test-fiber-streaming" test-fiber-streaming)
+  (run-test "test-fiber-idle-timeout" test-fiber-idle-timeout)
+  (run-test "test-fiber-stop-wakes-parked-conns" test-fiber-stop-wakes-parked-conns)
+  (run-test "test-fiber-restart-leaves-poller-clean" test-fiber-restart-leaves-poller-clean)
+  (run-test "test-bad-strategy-throws" test-bad-strategy-throws)
+  (run-test "test-bind-failure-carries-errno" test-bind-failure-carries-errno)
+  (run-test "test-string-content-length-keep-alive" test-string-content-length-keep-alive)
+  (run-test "test-bind-eaddrinuse-friendly" test-bind-eaddrinuse-friendly)
+  (run-test "test-boot-validation" test-boot-validation)
+  (run-test "test-on-failure-hook" test-on-failure-hook)
+  (run-test "test-on-failure-hook-throw-falls-back" test-on-failure-hook-throw-falls-back)
+  (run-test "test-nil-response-is-500" test-nil-response-is-500)
+  (run-test "test-ws-failure-notifies-hook" test-ws-failure-notifies-hook)
+  (run-test "test-ws-guard-accepts" test-ws-guard-accepts)
+  (run-test "test-ws-guard-rejects-with-response" test-ws-guard-rejects-with-response)
+  (run-test "test-ws-guard-nil-is-403" test-ws-guard-nil-is-403)
+  (run-test "test-ws-guard-throw-is-request-failure" test-ws-guard-throw-is-request-failure)
+  (run-test "test-write-timeout-cuts-stalled-peer" test-write-timeout-cuts-stalled-peer)
+  (run-test "test-write-timeout-zero-disables" test-write-timeout-zero-disables)
 
   ;; --- Wave 2 round 6: reuse-port and trusted-proxy addressing ---
-  (test-reuse-port)
-  (test-trusted-proxy-addr)
+  (run-test "test-reuse-port" test-reuse-port)
+  (run-test "test-trusted-proxy-addr" test-trusted-proxy-addr)
 
   ;; --- Wave 2 round 5: static files ---
-  (test-static-serves)
-  (test-static-conditional)
-  (test-static-gzip)
-  (test-static-large-file)
-  (test-static-path-safety)
-  (test-static-cache-window)
+  (run-test "test-static-serves" test-static-serves)
+  (run-test "test-static-conditional" test-static-conditional)
+  (run-test "test-static-gzip" test-static-gzip)
+  (run-test "test-static-large-file" test-static-large-file)
+  (run-test "test-static-path-safety" test-static-path-safety)
+  (run-test "test-static-cache-window" test-static-cache-window)
 
   ;; --- Wave 2 round 4: gzip ---
-  (test-gzip-compresses)
-  (test-gzip-negotiation)
-  (test-gzip-skips)
-  (test-gzip-etag)
+  (run-test "test-gzip-compresses" test-gzip-compresses)
+  (run-test "test-gzip-negotiation" test-gzip-negotiation)
+  (run-test "test-gzip-skips" test-gzip-skips)
+  (run-test "test-gzip-etag" test-gzip-etag)
 
   ;; --- Wave 2 round 3: multipart uploads ---
-  (test-multipart-upload)
-  (test-multipart-large-chunked)
-  (test-multipart-truncated)
-  (test-multipart-passthrough)
+  (run-test "test-multipart-upload" test-multipart-upload)
+  (run-test "test-multipart-large-chunked" test-multipart-large-chunked)
+  (run-test "test-multipart-truncated" test-multipart-truncated)
+  (run-test "test-multipart-passthrough" test-multipart-passthrough)
 
   ;; --- Wave 2 round 2: handler deadline ---
-  (test-handler-deadline-threads)
-  (test-handler-deadline-fibers)
-  (test-handler-deadline-bounds)
-  (test-handler-deadline-spares-streams)
-  (test-handler-deadline-hook)
-  (test-fault-handler-envelope)
+  (run-test "test-handler-deadline-threads" test-handler-deadline-threads)
+  (run-test "test-handler-deadline-fibers" test-handler-deadline-fibers)
+  (run-test "test-handler-deadline-bounds" test-handler-deadline-bounds)
+  (run-test "test-handler-deadline-spares-streams" test-handler-deadline-spares-streams)
+  (run-test "test-handler-deadline-hook" test-handler-deadline-hook)
+  (run-test "test-fault-handler-envelope" test-fault-handler-envelope)
 
   ;; --- Wave 2 round 1: stop-server closes live connections ---
-  (test-stop-closes-live-conn-threads)
-  (test-stop-closes-live-conn-fibers)
+  (run-test "test-stop-closes-live-conn-threads" test-stop-closes-live-conn-threads)
+  (run-test "test-stop-closes-live-conn-fibers" test-stop-closes-live-conn-fibers)
 
   ;; --- Round 6: operability ---
-  (test-graceful-drain)
-  (test-drain-timeout)
-  (test-server-stats)
-  (test-handler-hot-swap)
-  (test-uri-normalization)
-  (test-head-and-status-framing)
-  (test-http10-keep-alive-and-close)
+  (run-test "test-graceful-drain" test-graceful-drain)
+  (run-test "test-drain-timeout" test-drain-timeout)
+  (run-test "test-server-stats" test-server-stats)
+  (run-test "test-handler-hot-swap" test-handler-hot-swap)
+  (run-test "test-uri-normalization" test-uri-normalization)
+  (run-test "test-head-and-status-framing" test-head-and-status-framing)
+  (run-test "test-http10-keep-alive-and-close" test-http10-keep-alive-and-close)
 
   ;; --- Round 5: resource bounds ---
-  (test-request-deadline)
-  (test-request-deadline-fibers)
-  (test-header-limit)
-  (test-header-limit-configurable)
-  (test-large-file-response)
-  (test-input-stream-response-framing)
+  (run-test "test-request-deadline" test-request-deadline)
+  (run-test "test-request-deadline-fibers" test-request-deadline-fibers)
+  (run-test "test-header-limit" test-header-limit)
+  (run-test "test-header-limit-configurable" test-header-limit-configurable)
+  (run-test "test-large-file-response" test-large-file-response)
+  (run-test "test-input-stream-response-framing" test-input-stream-response-framing)
 
   ;; --- Round 4: request framing ---
-  (test-chunked-request-body)
-  (test-chunked-body-cap)
-  (test-smuggling-guards)
-  (test-duplicate-request-headers)
-  (test-expect-100-continue)
+  (run-test "test-chunked-request-body" test-chunked-request-body)
+  (run-test "test-chunked-body-cap" test-chunked-body-cap)
+  (run-test "test-smuggling-guards" test-smuggling-guards)
+  (run-test "test-duplicate-request-headers" test-duplicate-request-headers)
+  (run-test "test-expect-100-continue" test-expect-100-continue)
 
   ;; --- Round 3: bind address and peer ---
-  (test-bind-host-option)
-  (test-peer-ip-formatting)
-  (test-request-addressing)
-  (test-fiber-request-addressing)
+  (run-test "test-bind-host-option" test-bind-host-option)
+  (run-test "test-peer-ip-formatting" test-peer-ip-formatting)
+  (run-test "test-request-addressing" test-request-addressing)
+  (run-test "test-fiber-request-addressing" test-fiber-request-addressing)
 
   ;; --- Round 2: RFC 6455 codec ---
-  (test-harness-handshake-surplus)
-  (test-ws-large-frame)
-  (test-ws-leftover-frame)
-  (test-ws-fragmented-message)
-  (test-ws-unmasked-client-frame-rejected)
-  (test-ws-rsv-bits-rejected)
-  (test-ws-invalid-utf8-is-1007)
-  (test-ws-close-code-echoed)
-  (test-ws-bad-close-code-is-1002)
-  (test-ws-oversized-frame-rejected)
-  (test-ws-binary-round-trip)
-  (test-ws-handshake-validation)
+  (run-test "test-harness-handshake-surplus" test-harness-handshake-surplus)
+  (run-test "test-ws-large-frame" test-ws-large-frame)
+  (run-test "test-ws-leftover-frame" test-ws-leftover-frame)
+  (run-test "test-ws-fragmented-message" test-ws-fragmented-message)
+  (run-test "test-ws-unmasked-client-frame-rejected" test-ws-unmasked-client-frame-rejected)
+  (run-test "test-ws-rsv-bits-rejected" test-ws-rsv-bits-rejected)
+  (run-test "test-ws-invalid-utf8-is-1007" test-ws-invalid-utf8-is-1007)
+  (run-test "test-ws-close-code-echoed" test-ws-close-code-echoed)
+  (run-test "test-ws-bad-close-code-is-1002" test-ws-bad-close-code-is-1002)
+  (run-test "test-ws-oversized-frame-rejected" test-ws-oversized-frame-rejected)
+  (run-test "test-ws-binary-round-trip" test-ws-binary-round-trip)
+  (run-test "test-ws-handshake-validation" test-ws-handshake-validation)
 
   ;; --- Round 1: correctness fixes ---
-  (test-timeout-granularity)
-  (test-fiber-slow-handler-not-reaped)
-  (test-fiber-long-stream-not-reaped)
-  (test-header-crlf-is-dropped)
-  (test-content-length-follows-body)
+  (run-test "test-timeout-granularity" test-timeout-granularity)
+  (run-test "test-fiber-slow-handler-not-reaped" test-fiber-slow-handler-not-reaped)
+  (run-test "test-fiber-long-stream-not-reaped" test-fiber-long-stream-not-reaped)
+  (run-test "test-header-crlf-is-dropped" test-header-crlf-is-dropped)
+  (run-test "test-content-length-follows-body" test-content-length-follows-body)
 
   ;; --- UTF-8 request framing ---
-  (test-utf8-request-body)
-  (test-utf8-split-across-reads)
-  (test-utf8-pipelined)
-  (test-utf8-large-body)
-  (test-utf8-fiber-request-body)
-  (test-unframeable-requests)
-  (test-binary-request-body)
-  (test-binary-response-body)
-  (test-binary-response-chunks)
-  (test-binary-round-trip)
+  (run-test "test-utf8-request-body" test-utf8-request-body)
+  (run-test "test-utf8-split-across-reads" test-utf8-split-across-reads)
+  (run-test "test-utf8-pipelined" test-utf8-pipelined)
+  (run-test "test-utf8-large-body" test-utf8-large-body)
+  (run-test "test-utf8-fiber-request-body" test-utf8-fiber-request-body)
+  (run-test "test-unframeable-requests" test-unframeable-requests)
+  (run-test "test-binary-request-body" test-binary-request-body)
+  (run-test "test-binary-response-body" test-binary-response-body)
+  (run-test "test-binary-response-chunks" test-binary-response-chunks)
+  (run-test "test-binary-round-trip" test-binary-round-trip)
 
   (if (zero? @failures)
     (println "all passed")
