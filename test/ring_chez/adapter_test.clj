@@ -77,11 +77,16 @@
 
 (defn- send-buf!
   "Write all n bytes of buf to fd. A short send is normal and gets retried, and
-  so does EINTR — under a loaded suite send(2) is interrupted often enough to
-  matter. The old loop stopped on any non-positive return, which silently sent
-  a PARTIAL request (or none at all): the server then sat waiting for a body
-  that never arrived and closed on its idle timeout, and the test saw an empty
-  response with nothing to say why. Anything that is not a retry throws."
+  so does EINTR. The old loop stopped on any non-positive return, which
+  silently sent a PARTIAL request (or none at all): the server then sat
+  waiting for a body that never arrived and closed on its idle timeout, and
+  the test saw an empty response with nothing to say why. Anything that is not
+  a retry throws, with the errno, because that is the part the old loop threw
+  away — it is what finally identified EPIPE here rather than a signal.
+
+  The EINTR arm is defensive, not load-bearing: nothing in an automated run
+  delivers a signal that runs a handler (every disposition but SIGINT/SIGQUIT
+  is SIG_DFL, SIGPIPE is SIG_IGN), so it should never fire."
   [fd buf n]
   (loop [off 0]
     (when (< off n)
@@ -148,14 +153,15 @@
                                     ;; opposite things about who went away.
                                     (println "  [recv: clean EOF, no bytes, fd" fd "]"))
                                   acc)
-                    ;; a signal is not the peer going away. Under a loaded
-                    ;; suite recv(2) is interrupted often enough to matter —
-                    ;; send-buf! already retries for the same reason — and
-                    ;; treating EINTR as "nothing came" made every assertion
-                    ;; that tells EOF from error flaky: `client-recv` answered
-                    ;; nil where the test wanted "" (the peer closed).
-                    ;; SO_RCVTIMEO's EAGAIN is NOT retried: that one really is
-                    ;; "nothing came", and retrying it would hang the test.
+                    ;; a signal is not the peer going away, and the three
+                    ;; ways a recv can answer non-positive mean opposite
+                    ;; things. Conflating them is what made `client-recv`
+                    ;; answer nil where the test wanted "" (the peer closed).
+                    ;; Defensive rather than load-bearing, like send-buf!'s:
+                    ;; no signal in an automated run has a handler to
+                    ;; interrupt anything. SO_RCVTIMEO's EAGAIN is NOT
+                    ;; retried: that one really is "nothing came", and
+                    ;; retrying it would hang the test.
                     (poller/eintr?) (recur acc)
                     :else     (do (when (zero? (alength acc))
                                     (println "  [recv: error errno" (ffi/errno)

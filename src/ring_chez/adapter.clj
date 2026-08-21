@@ -109,7 +109,13 @@
   difference: at the start of a request a non-positive return is :closed —
   the connection is dropped with no response — and mid-request it is :bad, a
   400 on a request that was fine. fiber-recv! and send-window! have always
-  retried it; these paths did not, and the disagreement was the bug.
+  retried it; these paths did not, and the paths should agree.
+
+  Defensive, not load-bearing. Nothing in an ordinary run delivers a signal
+  that runs a handler — every disposition but SIGINT/SIGQUIT is SIG_DFL and
+  SIGPIPE is SIG_IGN — so this arm should never fire outside a program that
+  installs its own handlers. It is not what was behind the intermittent
+  failures; RFC-0014 is.
 
   EAGAIN is deliberately NOT retried: with SO_RCVTIMEO that is the idle
   timeout firing, which is exactly what read-request should read as a peer
