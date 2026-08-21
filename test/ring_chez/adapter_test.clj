@@ -1328,7 +1328,7 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
-;; --- Round 5: resource bounds -----------------------------------------------------
+;; --- Round 6: operability ---------------------------------------------------------
 
 (defn- echo-body-handler [req]
   (let [body (if-let [b (:body req)] (slurp b) "")]
@@ -1337,6 +1337,7 @@
                "X-Body-Octets" (str (alength (.getBytes ^String body "UTF-8")))
                "X-Body-Chars" (str (count body))}
      :body body}))
+
 
 
 (defn- framing-ask
@@ -1348,6 +1349,165 @@
       (client-close fd)
       r)))
 
+
+
+(defn test-graceful-drain []
+  ;; stop-server used to slam every connection, including one mid-response.
+  ;; It now stops accepting and waits for in-flight requests to finish
+  ;; (Igropyr http-shutdown!, http.sc:1842).
+  (let [server (adapter/run-server
+                 (fn [_] (Thread/sleep 800) {:status 200 :body "finished"})
+                 {:port 8520 :worker-threads 2})
+        result (atom nil)]
+    (Thread/sleep 250)
+    (let [fd (client-connect 8520 6000)]
+      (client-send fd "GET /slow HTTP/1.1\r\nHost: t\r\n\r\n")
+      ;; give the handler time to start, then stop mid-request
+      (Thread/sleep 200)
+      (let [t0 (System/currentTimeMillis)]
+        (future (reset! result (client-recv fd)))
+        (adapter/stop-server server)
+        (check "drain: stop waited for the in-flight request"
+               true (>= (- (System/currentTimeMillis) t0) 400)))
+      (Thread/sleep 300)
+      (check-has "drain: in-flight request was answered" "finished" (or @result ""))
+      (client-close fd))
+    ;; and the port is free straight after
+    (let [s2 (adapter/run-server handler {:port 8520 :worker-threads 1})]
+      (Thread/sleep 150)
+      (try (check "drain: port rebindable after stop" 200
+                  (:status (http/get "http://127.0.0.1:8520/")))
+           (finally (adapter/stop-server s2))))))
+
+(defn test-drain-timeout []
+  ;; a handler that never returns must not stop stop-server returning
+  (let [server (adapter/run-server
+                 (fn [_] (Thread/sleep 30000) {:status 200 :body "never"})
+                 {:port 8521 :worker-threads 2})]
+    (Thread/sleep 250)
+    (let [fd (client-connect 8521 2000)]
+      (client-send fd "GET /stuck HTTP/1.1\r\nHost: t\r\n\r\n")
+      (Thread/sleep 200)
+      (let [t0 (System/currentTimeMillis)]
+        (adapter/stop-server server {:drain-timeout-ms 500})
+        (let [dt (- (System/currentTimeMillis) t0)]
+          (check (str "drain: bounded by :drain-timeout-ms (" dt "ms)")
+                 true (< dt 2500))))
+      (client-close fd))))
+
+(defn test-server-stats []
+  (let [server (adapter/run-server handler {:port 8522 :worker-threads 2})]
+    (try
+      (Thread/sleep 250)
+      (let [s0 (adapter/server-stats server)]
+        (check "stats: no requests yet" 0 (:requests s0))
+        (check "stats: uptime is a number" true (number? (:uptime-ms s0))))
+      (let [fd (client-connect 8522 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (client-recv fd)
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (client-recv fd)
+        (let [s1 (adapter/server-stats server)]
+          (check "stats: requests counted" 2 (:requests s1))
+          (check "stats: connection counted open" 1 (:connections s1))
+          (check "stats: nothing in flight between requests" 0 (:active s1)))
+        (client-close fd))
+      (Thread/sleep 300)
+      (check "stats: connection no longer open" 0 (:connections (adapter/server-stats server)))
+      (finally (adapter/stop-server server)))))
+
+(defn test-handler-hot-swap []
+  (let [server (adapter/run-server (fn [_] {:status 200 :body "first"})
+                                   {:port 8523 :worker-threads 2})]
+    (try
+      (Thread/sleep 250)
+      (check "swap: original handler" "first" (:body (http/get "http://127.0.0.1:8523/")))
+      (adapter/swap-handler! server (fn [_] {:status 200 :body "second"}))
+      (check "swap: replacement handler" "second" (:body (http/get "http://127.0.0.1:8523/")))
+      ;; and on a connection that was already open
+      (let [fd (client-connect 8523 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "swap: open keep-alive conn sees it too" "second" (client-recv fd))
+        (adapter/swap-handler! server (fn [_] {:status 200 :body "third"}))
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "swap: mid-connection swap" "third" (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-uri-normalization []
+  ;; the router matches on segments and drops empty ones, so "//admin/x"
+  ;; routes exactly like "/admin/x" — while a guard written as a prefix test
+  ;; on the raw string does not match. Normalizing once, here, closes that gap
+  ;; for middleware, routers and static serving alike (Igropyr normalize-path).
+  (let [server (adapter/run-server
+                 (fn [req] {:status 200 :body (str (:uri req) " raw=" (:ring-chez/raw-uri req))})
+                 {:port 8524 :worker-threads 2})]
+    (try
+      (Thread/sleep 250)
+      (doseq [[target expect] [["/a/b" "/a/b"]
+                               ["//admin/x" "/admin/x"]
+                               ["/a/./b" "/a/b"]
+                               ["/a/c/../b" "/a/b"]
+                               ["/../../etc/passwd" "/etc/passwd"]
+                               ["/a//b///c" "/a/b/c"]
+                               ["/" "/"]
+                               ["/a/" "/a"]]]
+        (check-has (str "uri: " target " -> " expect)
+                   (str "\r\n\r\n" expect " raw=")
+                   (framing-ask 8524 (str "GET " target " HTTP/1.1\r\nHost: t\r\n\r\n"))))
+      (check-has "uri: the raw target is still available"
+                 "raw=//admin/x"
+                 (framing-ask 8524 "GET //admin/x HTTP/1.1\r\nHost: t\r\n\r\n"))
+      ;; the query string is split off before normalization and is not part of
+      ;; the raw path either
+      (check-has "uri: normalized with a query string attached"
+                 "\r\n\r\n/a/b raw=/a//b"
+                 (framing-ask 8524 "GET /a//b?q=1 HTTP/1.1\r\nHost: t\r\n\r\n"))
+      (finally (adapter/stop-server server)))))
+
+(defn test-head-and-status-framing []
+  ;; RFC 9110 9.3.2: a HEAD response carries the same headers a GET would,
+  ;; Content-Length included — we sent none at all, so a client sizing a
+  ;; resource with HEAD learned nothing. 1xx and 204 forbid Content-Length;
+  ;; 304 MAY carry the length the corresponding 200 would have had.
+  (let [server (adapter/run-server
+                 (fn [req] (case (:uri req)
+                             "/ten" {:status 200 :headers {"Content-Type" "text/plain"}
+                                     :body "0123456789"}
+                             "/304" {:status 304 :headers {"ETag" "\"x\""} :body "0123456789"}
+                             "/204" {:status 204 :body "ignored"}
+                             {:status 200 :body "ok"}))
+                 {:port 8525 :worker-threads 2})]
+    (try
+      (Thread/sleep 250)
+      (let [r (framing-ask 8525 "HEAD /ten HTTP/1.1\r\nHost: t\r\n\r\n")]
+        (check-has "HEAD: carries the length a GET would" "Content-Length: 10" r)
+        (check "HEAD: and no body" true (str/ends-with? r "\r\n\r\n")))
+      (let [r (framing-ask 8525 "GET /204 HTTP/1.1\r\nHost: t\r\n\r\n")]
+        (check "204: no Content-Length" false
+               (str/includes? (str/lower-case r) "content-length")))
+      (let [r (framing-ask 8525 "GET /304 HTTP/1.1\r\nHost: t\r\n\r\n")]
+        (check-has "304: may carry the length" "Content-Length: 10" r)
+        (check "304: and no body" true (str/ends-with? r "\r\n\r\n")))
+      ;; connection still framed after all of those
+      (check-has "HEAD/304: connection still usable" "ok"
+                 (framing-ask 8525 "GET / HTTP/1.1\r\nHost: t\r\n\r\n"))
+      (finally (adapter/stop-server server)))))
+
+(defn test-http10-keep-alive-and-close []
+  ;; "Connection: keep-alive, close" is a token LIST and really does mean close
+  (let [server (adapter/run-server handler {:port 8526 :worker-threads 2})]
+    (try
+      (Thread/sleep 250)
+      (let [r (framing-ask 8526 (str "GET / HTTP/1.0\r\nHost: t\r\n"
+                                     "Connection: keep-alive, close\r\n\r\n"))]
+        (check-has "HTTP/1.0: keep-alive with close means close" "Connection: close" r))
+      (let [r (framing-ask 8526 (str "GET / HTTP/1.0\r\nHost: t\r\n"
+                                     "Connection: keep-alive\r\n\r\n"))]
+        (check-has "HTTP/1.0: plain keep-alive is honored" "Connection: keep-alive" r))
+      (finally (adapter/stop-server server)))))
+
+;; --- Round 5: resource bounds -----------------------------------------------------
 
 (defn test-request-deadline []
   ;; SO_RCVTIMEO re-arms on every recv and there was no cap on how long one
@@ -2433,6 +2593,15 @@
   (test-ws-guard-throw-is-request-failure)
   (test-write-timeout-cuts-stalled-peer)
   (test-write-timeout-zero-disables)
+
+  ;; --- Round 6: operability ---
+  (test-graceful-drain)
+  (test-drain-timeout)
+  (test-server-stats)
+  (test-handler-hot-swap)
+  (test-uri-normalization)
+  (test-head-and-status-framing)
+  (test-http10-keep-alive-and-close)
 
   ;; --- Round 5: resource bounds ---
   (test-request-deadline)

@@ -445,6 +445,26 @@
       (finally (ffi/free buf))))))
 
 ;; --- request -> Ring map ----------------------------------------------------
+(defn normalize-path
+  "Collapse \"//\", drop \".\" and resolve \"..\" (RFC 3986 remove_dot_segments),
+  so every layer sees the same path. A router matches on segments and silently
+  drops empty ones, so \"//admin/x\" routes exactly like \"/admin/x\" — while a
+  guard written the obvious way, (str/starts-with? (:uri req) \"/admin\"),
+  compares the raw string and does not match. That gap lets a request skip an
+  auth or rate-limit guard and still reach the guarded handler. Normalizing
+  once, here, closes it for middleware, routing and static serving alike
+  (Igropyr normalize-path).
+
+  \"..\" can never escape the root: it pops a segment only when there is one."
+  [path]
+  (let [segs (reduce (fn [acc seg]
+                       (cond
+                         (or (= "" seg) (= "." seg)) acc
+                         (= ".." seg) (if (seq acc) (pop acc) acc)
+                         :else (conj acc seg)))
+                     [] (str/split (str path) #"/" -1))]
+    (if (empty? segs) "/" (str "/" (str/join "/" segs)))))
+
 (defn- host-name
   "The name part of a Host header — the port, if it named one, is not part of
   the server name. Only a trailing \":digits\" is stripped, so an IPv6 literal
@@ -503,7 +523,8 @@
       :else
       (let [target (second parts)
             qi (str/index-of target "?")
-            [uri qs] (if qi [(subs target 0 qi) (subs target (inc qi))] [target nil])]
+            [raw-uri qs] (if qi [(subs target 0 qi) (subs target (inc qi))] [target nil])
+            uri (normalize-path raw-uri)]
         {:request {:server-port    (:server-port conn-info)
                    ;; Ring: the resolved server name. The Host header is what
                    ;; the client asked for and what virtual-host middleware
@@ -514,6 +535,9 @@
                                      (:server-name conn-info))
                    :remote-addr    (:remote-addr conn-info)
                    :uri            uri
+                   ;; the target exactly as it arrived, for anything that needs
+                   ;; to see what the client actually asked for
+                   :ring-chez/raw-uri raw-uri
                    :query-string   qs
                    :scheme         :http
                    :request-method (keyword (str/lower-case (first parts)))
@@ -643,7 +667,9 @@
 (defn keep-alive? [req]
   (let [c (get-in req [:headers "connection"])]
     (if (= "HTTP/1.0" (:protocol req))
-      (conn-token? "keep-alive" c)
+      ;; a token list, so "keep-alive, close" really does mean close — reading
+      ;; it as keep-alive would reuse a socket the peer is closing
+      (and (conn-token? "keep-alive" c) (not (conn-token? "close" c)))
       (not (conn-token? "close" c)))))
 
 (defn- response-conn-close?
@@ -808,21 +834,56 @@
                (recur)
                :else false))))))
 
+(defn- status-forbids-body?
+  "1xx, 204 and 304 are defined as bodyless: a client stops at the blank line
+  whatever follows it, so writing a body desynchronises a persistent connection
+  exactly the way a body on a HEAD does (RFC 9110 6.4.1 / 15.4.5)."
+  [status]
+  (or (<= 100 status 199) (= 204 status) (= 304 status)))
+
+(defn- status-forbids-length?
+  "Narrower than the above on purpose: Content-Length is forbidden on 1xx and
+  204, but a 304 MAY carry the length the corresponding 200 would have had — it
+  is metadata there, not framing (RFC 9110 8.6 / 15.4.5)."
+  [status]
+  (or (<= 100 status 199) (= 204 status)))
+
+(defn- body-length
+  "The octets a body would put on the wire, without writing them, or nil when
+  that cannot be known without reading it. Used for a HEAD, whose response must
+  carry the Content-Length its GET would have (RFC 9112 3.3.2) — and where 0 is
+  not a stand-in for \"unknown\", it means the resource is empty."
+  [b]
+  (cond
+    (nil? b) 0
+    (string? b) (alength (.getBytes ^String b "UTF-8"))
+    (bytes? b) (alength ^bytes b)
+    (instance? java.io.File b) (.length ^java.io.File b)
+    (or (seq? b) (vector? b)) (reduce (fn [n x] (some-> n (+ (or (body-length x) 0)))) 0 b)
+    :else nil))
+
 (defn send-response
   "Send resp for req on conn. Returns true when the connection may be reused."
   [conn req resp take! send!]
   (let [keep?     (and (keep-alive? req) (not (response-conn-close? resp)))
         status    (or (:status resp) 200)
-        bodyless? (or (contains? #{100 101 204 304} status)
-                      (= :head (:request-method req)))
+        head?     (= :head (:request-method req))
+        bodyless? (or (status-forbids-body? status) head?)
         b         (:body resp)
         ch        (when (async/chan? b) b)
-        http10?   (= "HTTP/1.0" (:protocol req))]
+        http10?   (= "HTTP/1.0" (:protocol req))
+        ;; what the head declares when no body follows it: nothing for a status
+        ;; that forbids a length, otherwise whatever a GET would have sent —
+        ;; and :none when that is unknowable, since omitting the field is how
+        ;; RFC 9112 says to say "unknown"
+        head-framing (fn [] (if (status-forbids-length? status)
+                              :none
+                              (or (body-length b) :none)))]
     (cond
       ;; channel body that must not be written at all
       (and ch bodyless?)
       (do (async/close! ch)
-          (and (send! conn (head->string resp keep? :none)) keep?))
+          (and (send! conn (head->string resp keep? (head-framing))) keep?))
 
       ;; channel body: stream it
       ch
@@ -836,7 +897,7 @@
              keep?))
 
       bodyless?
-      (and (send! conn (head->string resp keep? :none)) keep?)
+      (and (send! conn (head->string resp keep? (head-framing))) keep?)
 
       ;; a File knows its length without being read, so it is framed by
       ;; Content-Length and streamed from disk. It used to be copied into a

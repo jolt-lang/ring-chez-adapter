@@ -178,7 +178,7 @@
         :else {:status 403 :headers {"Content-Type" "text/plain"}
                :body "Forbidden"}))))
 
-(defn- connection-loop [conn handler conn-info ka-ms ws-handler ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io deadline]
+(defn- connection-loop [conn handler-box conn-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io deadline stats]
   (socket/set-rcvtimeo! conn ka-ms)
   (socket/set-sndtimeo! conn write-timeout-ms)
   (let [recv!      (:recv! io)
@@ -213,7 +213,12 @@
             ;; failing to send, so nothing below this point may be reaped for
             ;; taking longer than ka-ms. Writes re-arm it for themselves (see
             ;; fiber-io); the next iteration re-arms it for the next read.
-            _ (when deadline (reset! deadline no-deadline))]
+            _ (when deadline (reset! deadline no-deadline))
+            ;; resolved AFTER the read, not before: the read parks for as long
+            ;; as the peer is idle, and a swap during that wait must reach this
+            ;; request rather than the one after it
+            handler    @handler-box
+            ws-handler @ws-handler-box]
         (cond
           (= :bad r) (send! conn (http/response->parts
                                    {:status 400 :headers {"Content-Type" "text/plain"}
@@ -292,7 +297,8 @@
                                          (try (when on-failure (on-failure request t))
                                               (catch Throwable _ nil))))))))
               :else
-               (let [resp (let [r ((:run! io) #(try (handler request)
+               (let [_ (do (swap! (:requests stats) inc) (swap! (:active stats) inc))
+                     resp (let [r ((:run! io) #(try (handler request)
                                                     (catch Throwable t
                                                       (handle-failure on-failure request t))))]
                             ;; nil is a failure per Ring (Jetty answers 500),
@@ -311,11 +317,12 @@
                                   (zero? (alength ^bytes (:leftover r))))
                            (update resp :headers #(assoc (or % {}) "Connection" "close"))
                            resp)]
-                (when (http/send-response conn request resp (:take! io) send!)
-                  (recur (:leftover r))))))
+                (let [reusable (try (http/send-response conn request resp (:take! io) send!)
+                                    (finally (swap! (:active stats) dec)))]
+                  (when reusable (recur (:leftover r)))))))
           :else nil)))))
 
-(defn- worker [handler base-info ka-ms ws-handler ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io work]
+(defn- worker [handler-box base-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io work stats]
   (loop []
     (when-let [[conn peer] (async/<!! work)]
       ;; claim at take-time: pending then counts only conns accepted but not
@@ -323,13 +330,14 @@
       ;; where a claimed conn still reads as pressure and over-retires
       ((io :claim!))
       (try
-        (connection-loop conn handler (assoc base-info :remote-addr peer) ka-ms ws-handler ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io nil)
+        (connection-loop conn handler-box (assoc base-info :remote-addr peer) ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io nil stats)
         ;; an escaping throwable must not kill the worker: a dead worker
         ;; shrinks the pool permanently and starves later connections
         (catch Throwable _)
         ;; shutdown before close: on Linux close() alone does not deliver
         ;; FIN to the peer holding a blocked recv (same family as 791d5c4)
-        (finally (socket/c-shutdown conn 2)
+        (finally (swap! (:open stats) dec)
+                 (socket/c-shutdown conn 2)
                  (socket/c-close conn)))
       (recur))))
 
@@ -374,18 +382,19 @@
   bound, and idle connections hold no thread. The spawn runs under
   *go-backend* :fiber: the default :thread backend runs go bodies on OS
   threads, where wait-ready would block the carrier instead of parking."
-  [handler conn-info ka-ms ws-handler ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms conn conns]
+  [handler-box conn-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms conn conns stats]
   (let [deadline (atom (+ (System/currentTimeMillis) ka-ms))
         entry {:conn conn :closed? (atom false) :deadline deadline}]
     (swap! conns conj entry)
     (binding [async/*go-backend* :fiber]
       (async/go
         (try
-          (connection-loop conn handler conn-info ka-ms ws-handler ws-guard on-failure
+          (connection-loop conn handler-box conn-info ka-ms ws-handler-box ws-guard on-failure
                            max-bytes max-header-bytes request-timeout-ms write-timeout-ms
-                           (fiber-io conn deadline write-timeout-ms) deadline)
+                           (fiber-io conn deadline write-timeout-ms) deadline stats)
           (catch Throwable _ nil)
-          (finally (conn-close! conns entry)))))))
+          (finally (swap! (:open stats) dec)
+                   (conn-close! conns entry)))))))
 
 ;; Igropyr http.sc: bad config must crash HERE, at boot — deferred to request
 ;; time it raises inside the reader and the connection just drops. One error
@@ -477,6 +486,12 @@
           ;; network. Opt in with :host "0.0.0.0".
           host   (or (:host v) "127.0.0.1")
           base-info {:server-port port :server-name host}
+          ;; boxed so a running server can be re-pointed without a restart
+          ;; (Igropyr http-swap! / http-set-ws!) — REPL work is the whole point
+          handler-box (atom handler)
+          ws-handler-box (atom ws-handler)
+          stats {:open (atom 0) :requests (atom 0) :active (atom 0)
+                 :started (System/currentTimeMillis)}
           fd     (socket/listen-socket host port)
           running? (atom true)]
       (if (= :fibers strategy)
@@ -485,8 +500,10 @@
           (future (serve-loop fd running?
                               (fn [conn peer]
                                 (poller/nonblock! conn)
-                                (fiber-serve handler (assoc base-info :remote-addr peer) ka-ms ws-handler ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms conn conns))))
-          {:socket fd :port port :host host :running running? :conns conns :sweep sweep})
+                                (swap! (:open stats) inc)
+                                (fiber-serve handler-box (assoc base-info :remote-addr peer) ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms conn conns stats))))
+          {:socket fd :port port :host host :running running? :conns conns :sweep sweep
+           :handler handler-box :ws-handler ws-handler-box :stats stats})
         (let [work (async/chan)   ; unbuffered: acceptor parks when all workers busy
               pending (atom 0)    ; conns accepted but not yet claimed by a worker
                io (assoc threads-io
@@ -516,27 +533,69 @@
                                                    (and (>= now grace) (pos? @pending)) 0
                                                    :else (recur)))))
                                            (finally (ffi/free pfds))))))]
-           (dotimes [_ n] (async/thread (worker handler base-info ka-ms ws-handler ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io work)))
+           (dotimes [_ n] (async/thread (worker handler-box base-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io work stats)))
           (future (serve-loop fd running?
                               (fn [conn peer]
                                 (swap! pending inc)
+                                (swap! (:open stats) inc)
                                 (async/>!! work [conn peer]))))
-          {:socket fd :port port :host host :running running? :work work})))))
+          {:socket fd :port port :host host :running running? :work work
+           :handler handler-box :ws-handler ws-handler-box :stats stats})))))
+
+(defn swap-handler!
+  "Point a running server at a new Ring handler (Igropyr http-swap!). Takes
+  effect on the next request, including on connections already open."
+  [server handler]
+  (reset! (:handler server) handler)
+  server)
+
+(defn swap-ws-handler!
+  "Point a running server at a new websocket handler, or nil to stop offering
+  the upgrade (Igropyr http-set-ws!). Sessions already running are unaffected."
+  [server ws-handler]
+  (reset! (:ws-handler server) ws-handler)
+  server)
+
+(defn server-stats
+  "A snapshot of what the server is doing: :connections open right now,
+  :active requests in flight, :requests answered since boot, and :uptime-ms
+  (Igropyr http-stats)."
+  [server]
+  (let [{:keys [open requests active started]} (:stats server)]
+    {:connections @open
+     :active @active
+     :requests @requests
+     :uptime-ms (- (System/currentTimeMillis) started)}))
 
 (defn stop-server
-  "Stop the server: unblock + exit the accept loop and close the listen socket.
+  "Stop the server: unblock + exit the accept loop, wait for in-flight requests
+  to finish, then close the listen socket.
+
+  The drain is Igropyr's http-shutdown!: stop accepting, then let whatever is
+  already running answer, rather than cutting a response off mid-write. It is
+  bounded by :drain-timeout-ms (default 5000) so a handler that never returns
+  cannot stop this returning either.
+
   Fiber strategy: every live connection is closed and forgotten too —
   jolt.io-poller is process-global and never stops, so a parked fiber is
   released only by its fd going away (the woken read sees EBADF/EOF).
   shutdown(SHUT_RDWR) before close() is required on Linux: close() alone
   leaves the acceptor parked in accept() holding the port binding, so
   rebinding the same port fails with EADDRINUSE."
-  [server]
+  ([server] (stop-server server nil))
+  ([server {:keys [drain-timeout-ms] :or {drain-timeout-ms 5000}}]
   (reset! (:running server) false)
+  ;; stop accepting first, so the drain below is over a set that only shrinks
+  (when-let [active (get-in server [:stats :active])]
+    (let [give-up (+ (System/currentTimeMillis) drain-timeout-ms)]
+      (loop []
+        (when (and (pos? @active) (< (System/currentTimeMillis) give-up))
+          (Thread/sleep 20)
+          (recur)))))
   (when-let [sweep (:sweep server)] (reset! sweep true))
   (if-let [conns (:conns server)]
     (doseq [entry @conns] (conn-close! conns entry))
     (async/close! (:work server)))
   (socket/c-shutdown (:socket server) 2)        ; SHUT_RDWR: wake parked accept()
   (socket/c-close (:socket server))
-  nil)
+  nil))
