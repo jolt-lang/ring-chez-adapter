@@ -329,6 +329,36 @@ zlib is bound lazily, from the running process first (the Chez runtime links
 one) and only then from a shared object. Where it cannot be bound the
 middleware is a no-op: uncompressed is always a correct answer.
 
+### Static files
+
+`ring.middleware.file` runs under jolt, but it stats and re-opens the file on
+every request — and it decides containment with `getCanonicalPath`, which under
+jolt does not resolve symlinks (measured: it only absolutizes), so a symlink
+planted inside a served root hands out whatever it points at.
+
+`ring-chez.middleware.static` is Igropyr's static cache in Ring's shape:
+
+```clojure
+(require '[ring-chez.middleware.static :as static])
+(def app (static/wrap-static handler "public"))
+(def app (static/wrap-static handler "public" {:prefix "/assets"
+                                               :cache-control "public, max-age=3600"}))
+```
+
+A hot file is a map lookup — no `stat`, no read — with the file re-checked at
+most once a second (`:stat-window-ms`). Responses carry `Content-Type` and a
+weak `ETag`; `If-None-Match` gets a `304`, which for a large file costs no file
+operations at all because the validator is in the cached metadata. A gzip copy
+is compressed once and cached beside the plain bytes, with its own `-gz` ETag.
+Files over `:max-cache-file-bytes` (1 MiB) are handed to the adapter as a
+`File` body and streamed in bounded chunks with a real `Content-Length`.
+
+Paths are percent-decoded *before* they are validated (or `%2e%2e` walks past
+the `..` check), dotfiles are refused except `.well-known`, and symlinks out of
+the root are refused via `toRealPath`. A miss, an unsafe path, or any method
+other than GET/HEAD falls through to the wrapped handler, so a traversal
+attempt cannot tell a 403 from a 404.
+
 ## Streaming responses
 
 Return a `core.async` channel as `:body` and the response is sent with
