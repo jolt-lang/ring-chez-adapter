@@ -31,6 +31,39 @@
 (ffi/defcfn c-inet-pton  "inet_pton"  [:int :pointer :pointer] :int)
 
 (def POLLIN  0x001)
+(def ^:private POLLERR  0x008)
+(def ^:private POLLHUP  0x010)
+(def ^:private POLLNVAL 0x020)
+
+;; The conditions under which a recv answers immediately: data waiting, the
+;; peer hung up (0), or the fd is bad (-1). Anything else poll reports —
+;; writability above all — means a recv would BLOCK, for the whole
+;; SO_RCVTIMEO, on a socket with nothing to read.
+(def poll-readable (bit-or POLLIN POLLERR POLLHUP POLLNVAL))
+
+;; struct pollfd { int fd; short events; short revents; } — fd at 0, events at
+;; 4-5, revents at 6-7. There is no 16-bit FFI scalar, so the short fields go a
+;; byte at a time, little-endian (as make-sockaddr already assumes).
+(def pollfd-size 8)
+
+(defn init-pollfd!
+  "Zero a pollfd and arm it for events on fd. Zeroing matters: writing only the
+  LOW byte of events left the high byte holding whatever the allocator handed
+  over, and the POLLOUT-family bits all live up there (POLLWRNORM 0x100,
+  POLLWRBAND 0x200, POLLMSG 0x400). One of those set turns every poll on a
+  writable socket into an instant wake."
+  [pfds fd events]
+  (dotimes [i pollfd-size] (ffi/write pfds :uint8 i 0))
+  (ffi/write pfds :int 0 fd)
+  (ffi/write pfds :uint8 4 (bit-and 0xff events))
+  (ffi/write pfds :uint8 5 (bit-and 0xff (bit-shift-right events 8))))
+
+(defn pollfd-revents
+  "What poll actually reported. Acting on the return count alone treats a wake
+  for any reason as \"readable\"."
+  [pfds]
+  (bit-or (ffi/read pfds :uint8 6)
+          (bit-shift-left (ffi/read pfds :uint8 7) 8)))
 
 (def ^:private AF-INET 2)
 (def ^:private SOCK-STREAM 1)

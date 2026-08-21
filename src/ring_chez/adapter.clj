@@ -148,6 +148,41 @@
      :take! (fn [ch] (async/<! ch))
      :run!  (fn [f] (async/<! (async/thread (f))))}))
 
+(defn- idle-poll-recv!
+  "First read of the next request on an idle keep-alive connection (threads
+  strategy). Waits in poll(2) slices instead of parking a full keep-alive
+  recv, so it can enforce the keep-alive deadline itself and, under accept
+  pressure, retire the connection after a grace period of quiet — never
+  instantly, or a client mid-reuse would race a reset. Returns the recv
+  contract: n>0 data, 0 closed/retire.
+
+  Only recv when poll says the socket is READABLE. Acting on poll's return
+  count alone meant any wake led to a blocking recv, which on a socket with
+  nothing to read blocks for the whole SO_RCVTIMEO — pinning the worker, and
+  with it every connection queued behind it. A signal is likewise not the peer
+  going away: EINTR polls again rather than reporting the connection closed."
+  [conn buf ka-ms pending]
+  (let [pfds (ffi/alloc socket/pollfd-size)]
+    (try
+      (socket/init-pollfd! pfds conn socket/POLLIN)
+      (let [start    (System/currentTimeMillis)
+            deadline (+ start ka-ms)
+            grace    (+ start 2000)]
+        (loop []
+          (let [rc  (socket/c-poll pfds 1 250)
+                now (System/currentTimeMillis)]
+            (cond
+              (and (pos? rc)
+                   (pos? (bit-and (socket/pollfd-revents pfds) socket/poll-readable)))
+              (socket/c-recv conn buf socket/bufsize 0)
+
+              (and (neg? rc) (poller/eintr?)) (recur)
+              (neg? rc) 0
+              (>= now deadline) 0
+              (and (>= now grace) (pos? @pending)) 0
+              :else (recur)))))
+      (finally (ffi/free pfds)))))
+
 (defn- handle-failure
   "Every abnormal handler completion lands here (Igropyr's on-failure
    semantics). The hook gets one attempt: a throw or a non-map/nil return
@@ -516,23 +551,7 @@
                          ;; after a grace period of quiet — never instantly,
                          ;; or a client mid-reuse would race a reset. Returns
                          ;; the recv contract (n>0 data, 0 closed/retire).
-                         :idle-recv! (fn [conn buf]
-                                       (let [pfds (ffi/alloc 8)]
-                                         (ffi/write pfds :int 0 conn)
-                                         (ffi/write pfds :uint8 4 socket/POLLIN)
-                                         (try
-                                           (let [deadline (+ (System/currentTimeMillis) ka-ms)
-                                                 grace    (+ (System/currentTimeMillis) 2000)]
-                                             (loop []
-                                               (let [rc  (socket/c-poll pfds 1 250)
-                                                     now (System/currentTimeMillis)]
-                                                 (cond
-                                                   (pos? rc) (socket/c-recv conn buf socket/bufsize 0)
-                                                   (neg? rc) 0
-                                                   (>= now deadline) 0
-                                                   (and (>= now grace) (pos? @pending)) 0
-                                                   :else (recur)))))
-                                           (finally (ffi/free pfds))))))]
+                         :idle-recv! #(idle-poll-recv! %1 %2 ka-ms pending))]
            (dotimes [_ n] (async/thread (worker handler-box base-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io work stats)))
           (future (serve-loop fd running?
                               (fn [conn peer]
