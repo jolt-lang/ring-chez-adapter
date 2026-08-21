@@ -49,13 +49,22 @@
      :strerror (or (try (ffi/ptr->string (c-strerror n)) (catch Throwable _ nil)) "")}))
 
 ;; struct timeval { time_t tv_sec; suseconds_t tv_usec; } — 8 + (4 macOS | 8 Linux)
+;; tv_usec is MICROseconds: the sub-second part of a millisecond timeout is
+;; (* 1000 (rem ms 1000)). Writing the milliseconds straight in made every
+;; timeout lose that part — :keep-alive-timeout-ms 900 became 900µs and cut
+;; the connection in ~1ms, :write-timeout-ms 500 became a 500µs send timeout.
+;; Only multiples of 1000 came out right, which is why the defaults hid it.
+(defn- write-timeval! [tv ms]
+  (dotimes [i 16] (ffi/write tv :uint8 i 0))
+  (ffi/write tv :uint64 0 (quot ms 1000))
+  (let [usec (* 1000 (rem ms 1000))]
+    (if macos?
+      (ffi/write tv :uint 8 usec)
+      (ffi/write tv :uint64 8 usec))))
+
 (defn set-rcvtimeo! [fd ms]
   (let [tv (ffi/alloc 16)]
-    (dotimes [i 16] (ffi/write tv :uint8 i 0))
-    (ffi/write tv :uint64 0 (quot ms 1000))
-    (if macos?
-      (ffi/write tv :uint 8 (rem ms 1000))
-      (ffi/write tv :uint64 8 (rem ms 1000)))
+    (write-timeval! tv ms)
     (c-setsockopt fd sol-socket so-rcvtimeo tv 16)
     (ffi/free tv)))
 
@@ -67,11 +76,7 @@
 (defn set-sndtimeo! [fd ms]
   (when (pos? ms)
     (let [tv (ffi/alloc 16)]
-      (dotimes [i 16] (ffi/write tv :uint8 i 0))
-      (ffi/write tv :uint64 0 (quot ms 1000))
-      (if macos?
-        (ffi/write tv :uint 8 (rem ms 1000))
-        (ffi/write tv :uint64 8 (rem ms 1000)))
+      (write-timeval! tv ms)
       (c-setsockopt fd sol-socket so-sndtimeo tv 16)
       (ffi/free tv))))
 

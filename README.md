@@ -39,7 +39,9 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
     shared `poll(2)` io-poller thread; idle keep-alive connections pin no
     thread, so thousands can sit open without extra threads. Blocking work —
     the Ring handler and websocket sessions — still runs on threads, but only
-    while actually computing; `:keep-alive-timeout-ms` bounds each parked read.
+    while actually computing; `:keep-alive-timeout-ms` bounds each parked
+    read and `:write-timeout-ms` each parked write, so neither a handler nor
+    a long stream is bounded by the idle timeout.
     Anything other than `:threads`/`:fibers` throws.
 - `:worker-threads` (default: core count) — each worker runs one connection
   loop; when all are busy the acceptor parks and the kernel backlog queues
@@ -67,7 +69,9 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
 - `:write-timeout-ms` (default 30000, `0` disables) — `SO_SNDTIMEO` on every
   blocking send; a peer that stops draining mid-response gets the connection
   abandoned (truncated body = close) instead of pinning a worker forever.
-  Applies to the threads strategy and post-upgrade websocket sessions.
+  Applies to the threads strategy and post-upgrade websocket sessions; under
+  `:fibers` it bounds each park on writability instead (the poller has no
+  per-wait timeout, so the connection sweeper enforces it).
 
 All options are validated at boot: bad values (`:port 0`, non-fn
 `:on-failure`, negative `:write-timeout-ms`, …) throw before the listen
@@ -83,6 +87,14 @@ pipelined requests are handled via leftover carry. `204`/`304`/`HEAD` responses
 never frame a body. Malformed requests get `400`, unknown HTTP versions `505`,
 and a handler-supplied `Connection: close` header is honored (the connection
 closes after that response).
+
+The server owns response framing. `Content-Length` always counts the octets
+that actually go on the wire, so a handler that declares a length disagreeing
+with its body cannot desynchronise the connection; middleware that sets the
+header correctly (`wrap-content-length`) agrees with the count and loses
+nothing. Response header names and values carrying CR or LF are dropped
+rather than written, so a handler echoing user data into a header cannot
+inject headers of its own.
 
 Requests are framed in octets: the socket accumulates raw bytes, and only the
 head — which RFC 7230 restricts to ASCII — is decoded (as UTF-8). So a
@@ -206,5 +218,5 @@ the Ring handler as usual.
 ## Test
 
 ```bash
-jolt -M:test   # 214 checks; drives the server over raw sockets + http-client
+jolt -M:test   # 268 checks; drives the server over raw sockets + http-client
 ```

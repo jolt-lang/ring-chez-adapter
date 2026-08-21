@@ -1200,6 +1200,16 @@
       (ffi/free sa))
     fd))
 
+(defn- t-recv-some
+  "One recv: whatever has arrived, as a string. Blocks until there is
+  something (or the read times out)."
+  [fd]
+  (let [buf (ffi/alloc 65536)]
+    (try
+      (let [n (t-recv fd buf 65536 0)]
+        (if (pos? n) (ffi/read-bytes buf n) ""))
+      (finally (ffi/free buf)))))
+
 (defn- drain-until-eof [fd]
   ;; accumulate until the server closes (recv 0) or a read timeout
   (let [buf (ffi/alloc 65536)]
@@ -1224,13 +1234,22 @@
       (Thread/sleep 250)
       (let [fd (client-connect-tiny-rcvbuf 8442 8000)]
         (client-send fd "GET /big HTTP/1.1\r\nHost: t\r\n\r\n")
-        ;; stall — never read while the body is coming: the tiny rcvbuf and
-        ;; the server sndbuf fill, the blocking send times out at ~300ms,
-        ;; and the server abandons the response and closes
-        (Thread/sleep 1000)
-        (let [r (drain-until-eof fd)]
-          (check "write-timeout: body truncated" true (< (count r) 16777216))
-          (check "write-timeout: some bytes delivered first" true (pos? (count r))))
+        ;; Read just enough to know the send is under way, THEN stall. A fixed
+        ;; sleep is not enough: building a 16MB body and its send buffer can
+        ;; take longer than the stall window on a loaded machine, and a stall
+        ;; that opens before the first byte moves proves nothing — the client
+        ;; then drains at the server's pace and the whole body arrives. That
+        ;; is what made this flaky on CI.
+        (let [head (t-recv-some fd)]
+          (check "write-timeout: response started" true (pos? (count head)))
+          ;; now never read: the tiny rcvbuf and the server sndbuf fill, the
+          ;; blocking send times out at ~300ms, and the server abandons the
+          ;; response and closes
+          (Thread/sleep 1000)
+          (let [r (drain-until-eof fd)
+                total (+ (count head) (count r))]
+            (check "write-timeout: body truncated" true (< total 16777216))
+            (check "write-timeout: some bytes delivered first" true (pos? total))))
         (client-close fd))
       ;; the worker is free again: a fresh request is served promptly
       (let [fd (client-connect 8442 3000)
@@ -1251,6 +1270,123 @@
             _ (client-send fd "GET /big HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
             r (drain-until-eof fd)]
         (check "write-timeout off: full body delivered" true (<= 262144 (count r)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+;; --- Round 1: correctness fixes ------------------------------------------------
+
+(defn test-timeout-granularity []
+  ;; set-rcvtimeo!/set-sndtimeo! build a struct timeval, whose second field is
+  ;; MICROseconds. Writing (rem ms 1000) there made every timeout lose its
+  ;; sub-second part: ka=900 became 900us (closed in ~1ms) and ka=1500 became
+  ;; 1s. Only multiples of 1000 worked, which is why the defaults hid it.
+  (let [server (adapter/run-server handler {:port 8460 :worker-threads 2
+                                            :keep-alive-timeout-ms 900})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8460 10000)]
+        ;; a PARTIAL head: the mid-request read is bounded by SO_RCVTIMEO, so
+        ;; the server should sit on it for ~900ms before giving up with 400
+        (client-send fd "GET / HTTP/1.1\r\nHos")
+        (let [t0 (System/currentTimeMillis)
+              r  (client-recv fd)
+              dt (- (System/currentTimeMillis) t0)]
+          (check-has "timeval: partial head eventually 400s" "400" (or r ""))
+          (check (str "timeval: 900ms timeout waits ~900ms, not ~0 (got " dt "ms)")
+                 true (<= 700 dt 1600)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-fiber-slow-handler-not-reaped []
+  ;; The fibers sweeper armed one deadline per request and nothing refreshed
+  ;; it while the handler ran, so any handler slower than the keep-alive
+  ;; timeout had its connection closed under it and the client got nothing.
+  (let [server (adapter/run-server
+                 (fn [_] (Thread/sleep 1500) {:status 200 :body "slow-ok"})
+                 {:port 8461 :strategy :fibers :keep-alive-timeout-ms 600})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8461 8000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "fiber slow handler: answered despite ka < handler time"
+                   "slow-ok" (or (client-recv-until fd "slow-ok") ""))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-fiber-long-stream-not-reaped []
+  ;; Same deadline bug on the streaming path: a stream outliving the
+  ;; keep-alive timeout was cut mid-body, with no terminating chunk.
+  (let [server (adapter/run-server
+                 (fn [_] (let [ch (a/chan)]
+                           (a/go (dotimes [i 5]
+                                   (a/<! (a/timeout 250))
+                                   (a/>! ch (str "tick" i "\n")))
+                                 (a/close! ch))
+                           {:status 200 :headers {"Content-Type" "text/plain"}
+                            :body ch}))
+                 {:port 8462 :strategy :fibers :keep-alive-timeout-ms 600})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8462 8000)]
+        (client-send fd "GET /s HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [r (client-recv-until fd "0\r\n\r\n")]
+          (check-has "fiber long stream: first chunk" "tick0" r)
+          (check-has "fiber long stream: last chunk" "tick4" r)
+          (check-has "fiber long stream: terminator sent" "0\r\n\r\n" r))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-header-crlf-is-dropped []
+  ;; A header value carrying CRLF used to be written verbatim, so a handler
+  ;; echoing user data into a header injected whole headers into the response
+  ;; (Igropyr header-safe?, http.sc:677).
+  (let [server (adapter/run-server
+                 (fn [req] (if (= "/inject" (:uri req))
+                             {:status 200
+                              :headers {"X-Bad" "a\r\nSet-Cookie: pwned=1\r\nX-Tail: b"
+                                        "X-Fine" "ok"}
+                              :body "body"}
+                             {:status 200 :body "plain"}))
+                 {:port 8463 :worker-threads 2})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8463 3000)]
+        (client-send fd "GET /inject HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [r (client-recv fd)]
+          (check "crlf header: injected header not on the wire"
+                 false (str/includes? (str/lower-case r) "set-cookie"))
+          (check "crlf header: unsafe header dropped entirely"
+                 false (str/includes? r "X-Bad"))
+          (check-has "crlf header: safe headers still sent" "X-Fine: ok" r))
+        ;; framing survived, so the connection is still usable
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "crlf header: connection still framed" "plain" (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-content-length-follows-body []
+  ;; The codec preferred the handler's own Content-Length over the octets it
+  ;; actually wrote, so a wrong declaration desynced keep-alive permanently.
+  ;; Igropyr drops user framing headers and always emits its own.
+  (let [server (adapter/run-server
+                 (fn [req] (if (= "/lie" (:uri req))
+                             {:status 200 :headers {"Content-Length" "3"}
+                              :body "0123456789"}
+                             {:status 200 :body "second"}))
+                 {:port 8464 :worker-threads 2})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8464 3000)]
+        (client-send fd "GET /lie HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [r (client-recv fd)]
+          (check-has "lying CL: framed by actual octets" "Content-Length: 10" r)
+          (check "lying CL: only one Content-Length" 1
+                 (count (re-seq #"(?i)content-length" r))))
+        ;; the desync signature: the next response must arrive intact
+        (client-send fd "GET /x HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [r (client-recv fd)]
+          (check-has "lying CL: next response starts at a status line" "HTTP/1.1 200" r)
+          (check-has "lying CL: next response body intact" "second" r))
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
@@ -1619,6 +1755,13 @@
   (test-ws-guard-throw-is-request-failure)
   (test-write-timeout-cuts-stalled-peer)
   (test-write-timeout-zero-disables)
+
+  ;; --- Round 1: correctness fixes ---
+  (test-timeout-granularity)
+  (test-fiber-slow-handler-not-reaped)
+  (test-fiber-long-stream-not-reaped)
+  (test-header-crlf-is-dropped)
+  (test-content-length-follows-body)
 
   ;; --- UTF-8 request framing ---
   (test-utf8-request-body)

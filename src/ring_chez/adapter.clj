@@ -82,17 +82,40 @@
         (and (neg? n) (poller/eagain?)) (do (poller/wait-ready conn :read) (recur))
         :else n))))
 
+(def ^:private no-deadline Long/MAX_VALUE)
+
 (defn- fiber-io
   "Fiber-strategy io for one connection. Must only be used inside the owning
   fiber-backed go block (see fiber-serve): recv! parks the fiber on read
   readiness, send! parks on writability, and run! moves blocking work — the
   synchronous handler, the websocket session — onto a thread while the fiber
-  parks. Idle deadlines live in the sweeper, not here."
-  [conn]
-  {:recv! (fn [_ buf] (fiber-recv! conn buf))
-   :send! (fn [c s] (http/send-all c s #(poller/wait-ready c :write)))
-   :take! (fn [ch] (async/<! ch))
-   :run!  (fn [f] (async/<! (async/thread (f))))})
+  parks.
+
+  Deadlines are enforced by the sweeper, which only knows how to close an fd,
+  so what the deadline MEANS has to be set here, around each park. It is armed
+  for a read (the caller does that before read-request) and for a write park,
+  and suspended otherwise — a fiber that is not waiting on the peer is not
+  waiting on anything the peer can stall. Arming it once for the whole
+  exchange, as this used to, reaped connections out from under a handler
+  slower than :keep-alive-timeout-ms and cut streams that outlived it.
+
+  jolt.io-poller has no timeout on wait-ready, so parking on writability is
+  bounded the only way available: arm :write-timeout-ms before each park, and
+  let the sweeper's close wake the fiber (the woken send answers negative,
+  which send-all already reads as peer-gone). This is the fibers counterpart
+  of SO_SNDTIMEO on the threads strategy — per park rather than per syscall,
+  and 0 disables it there as here."
+  [conn deadline write-timeout-ms]
+  (let [suspend! #(reset! deadline no-deadline)
+        arm-write! (if (pos? write-timeout-ms)
+                     #(reset! deadline (+ (System/currentTimeMillis) write-timeout-ms))
+                     suspend!)]
+    {:recv! (fn [_ buf] (fiber-recv! conn buf))
+     :send! (fn [c s]
+              (try (http/send-all c s (fn [] (arm-write!) (poller/wait-ready c :write)))
+                   (finally (suspend!))))
+     :take! (fn [ch] (async/<! ch))
+     :run!  (fn [f] (async/<! (async/thread (f))))}))
 
 (defn- handle-failure
   "Every abnormal handler completion lands here (Igropyr's on-failure
@@ -131,12 +154,18 @@
         idle-recv! (or (:idle-recv! io) recv!)
         send!      (or (:send! io) http/send-all)]
     (loop [acc http/no-bytes]
-      ;; deadline: this request (idle wait or mid-request trickle) must finish
-      ;; within ka-ms of starting — the fibers-strategy sweeper closes the conn
-      ;; past it (a parked read wakes as :closed). nil on the threads strategy,
-      ;; where SO_RCVTIMEO already bounds every recv.
+      ;; deadline: the read of this request (idle wait or mid-request trickle)
+      ;; must finish within ka-ms of starting — the fibers-strategy sweeper
+      ;; closes the conn past it (a parked read wakes as :closed). nil on the
+      ;; threads strategy, where SO_RCVTIMEO already bounds every recv.
       (when deadline (reset! deadline (+ (System/currentTimeMillis) ka-ms)))
-      (let [r (http/read-request conn acc max-bytes recv! idle-recv!)]
+      (let [r (http/read-request conn acc max-bytes recv! idle-recv!)
+            ;; the read is over: whatever happens next — a handler, a stream,
+            ;; a websocket session, an error response — is not the peer
+            ;; failing to send, so nothing below this point may be reaped for
+            ;; taking longer than ka-ms. Writes re-arm it for themselves (see
+            ;; fiber-io); the next iteration re-arms it for the next read.
+            _ (when deadline (reset! deadline no-deadline))]
         (cond
           (= :bad r) (send! conn (http/response->parts
                                    {:status 400 :headers {"Content-Type" "text/plain"}
@@ -177,9 +206,9 @@
                                           (ws/accept-token (get-in request [:headers "sec-websocket-key"]))
                                           "\r\n\r\n"))
                      (socket/blocking! conn)
-                     ;; the session owns the fd now; its own SO_RCVTIMEO bounds an
-                     ;; idle peer, so the sweeper must not reap it mid-session
-                     (when deadline (reset! deadline Long/MAX_VALUE))
+                     ;; the session owns the fd now and bounds an idle peer with
+                     ;; its own SO_RCVTIMEO; the deadline is already suspended
+                     ;; for everything past the read, so the sweeper leaves it be
                      ;; post-101 there is no response to serve — close IS the
                      ;; truncation signal (Igropyr). on-failure still observes it.
                      ((:run! io) #(try (ws-handler (ws/make-session conn))
@@ -277,7 +306,8 @@
       (async/go
         (try
           (connection-loop conn handler port ka-ms ws-handler ws-guard on-failure
-                           max-bytes write-timeout-ms (fiber-io conn) deadline)
+                           max-bytes write-timeout-ms
+                           (fiber-io conn deadline write-timeout-ms) deadline)
           (catch Throwable _ nil)
           (finally (conn-close! conns entry)))))))
 
