@@ -1328,7 +1328,7 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
-;; --- Round 4: request framing ----------------------------------------------------
+;; --- Round 5: resource bounds -----------------------------------------------------
 
 (defn- echo-body-handler [req]
   (let [body (if-let [b (:body req)] (slurp b) "")]
@@ -1338,6 +1338,7 @@
                "X-Body-Chars" (str (count body))}
      :body body}))
 
+
 (defn- framing-ask
   "Send head (and body) on a fresh connection, read one response."
   [port req]
@@ -1346,6 +1347,163 @@
     (let [r (or (client-recv-until fd "\r\n\r\n") "")]
       (client-close fd)
       r)))
+
+
+(defn test-request-deadline []
+  ;; SO_RCVTIMEO re-arms on every recv and there was no cap on how long one
+  ;; request may take to ARRIVE, so a client dribbling a byte just inside the
+  ;; idle timeout held a worker indefinitely — with a fixed pool that is the
+  ;; whole server (Igropyr request-deadline-ms, http.sc:72-78).
+  (let [server (adapter/run-server handler {:port 8510 :worker-threads 2
+                                            :keep-alive-timeout-ms 1000
+                                            :request-timeout-ms 700})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8510 6000)
+            t0 (System/currentTimeMillis)]
+        ;; dribble: every write lands inside the idle timeout, so only a
+        ;; whole-request deadline can end this
+        (client-send fd "GET / HTTP/1.1\r\n")
+        (Thread/sleep 400)
+        (try (client-send fd "Host: t\r\n") (catch Throwable _ nil))
+        (Thread/sleep 400)
+        (try (client-send fd "X-A: 1\r\n") (catch Throwable _ nil))
+        (let [r (or (client-recv fd) "")
+              dt (- (System/currentTimeMillis) t0)]
+          (check-has "deadline: dribbled request gets 408" "408" r)
+          (check (str "deadline: cut near the deadline, not the idle timeout ("
+                      dt "ms)")
+                 true (< dt 2500)))
+        (client-close fd))
+      ;; the worker is free again
+      (let [r (http/get "http://127.0.0.1:8510/")]
+        (check "deadline: server still serving" 200 (:status r)))
+      (finally (adapter/stop-server server)))))
+
+(defn test-request-deadline-fibers []
+  (let [server (adapter/run-server handler {:port 8511 :strategy :fibers
+                                            :keep-alive-timeout-ms 1000
+                                            :request-timeout-ms 700})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8511 6000)]
+        (client-send fd "GET / HTTP/1.1\r\n")
+        (Thread/sleep 400)
+        (try (client-send fd "Host: t\r\n") (catch Throwable _ nil))
+        (Thread/sleep 600)
+        (check "deadline (fibers): dribbled request ended"
+               true (contains? #{"" nil} (let [r (client-recv fd)]
+                                           (if (and r (str/includes? r "408")) "" r))))
+        (client-close fd))
+      (let [r (http/get "http://127.0.0.1:8511/")]
+        (check "deadline (fibers): server still serving" 200 (:status r)))
+      (finally (adapter/stop-server server)))))
+
+(defn test-header-limit []
+  ;; the head used to share the 1 MiB request cap, so a head alone could be
+  ;; 1 MiB. Igropyr caps headers separately at 8 KiB (http.sc:61) and checks
+  ;; the size of a COMPLETE block too — the limit used to catch only a header
+  ;; still arriving, so a peer that sent 9 KiB in one go was never checked.
+  (let [server (adapter/run-server echo-body-handler
+                                   {:port 8512 :worker-threads 2
+                                    :keep-alive-timeout-ms 1000})]
+    (try
+      (Thread/sleep 250)
+      (let [pad (apply str (repeat 9000 "p"))]
+        (check-has "header limit: 9KB head in one write is 431"
+                   "431" (framing-ask 8512 (str "GET / HTTP/1.1\r\nHost: t\r\nX-Pad: "
+                                                pad "\r\n\r\n"))))
+      ;; a body well past the header limit is still fine: they are separate caps
+      (let [body (apply str (repeat 20000 "b"))]
+        (check-has "header limit: a large body is not a header"
+                   "X-Body-Octets: 20000"
+                   (framing-ask 8512 (str "POST / HTTP/1.1\r\nHost: t\r\n"
+                                          "Content-Length: 20000\r\n\r\n" body))))
+      (finally (adapter/stop-server server)))))
+
+(defn test-header-limit-configurable []
+  (let [server (adapter/run-server handler {:port 8513 :worker-threads 2
+                                            :max-header-bytes 32768
+                                            :keep-alive-timeout-ms 1000})]
+    (try
+      (Thread/sleep 250)
+      (let [pad (apply str (repeat 9000 "p"))]
+        (check-has "header limit: raised limit accepts a 9KB head"
+                   "200" (framing-ask 8513 (str "GET / HTTP/1.1\r\nHost: t\r\nX-Pad: "
+                                                pad "\r\n\r\n"))))
+      (finally (adapter/stop-server server))))
+  (try
+    (let [s (adapter/run-server handler {:port 8514 :max-header-bytes 0})]
+      (adapter/stop-server s)
+      (check "header limit: 0 rejected at boot" :threw :did-not-throw))
+    (catch Throwable t
+      (check "header limit: 0 rejected at boot" :threw :threw)
+      (check-has "header limit: names the key" ":max-header-bytes" (ex-message t)))))
+
+(defn test-large-file-response []
+  ;; a File body was copied into a ByteArrayOutputStream, then .toByteArray'd,
+  ;; then written into an FFI buffer sized to the whole thing — three copies
+  ;; resident at once. It is streamed from disk in bounded chunks now, framed
+  ;; by the length on disk.
+  (let [path (str (System/getProperty "java.io.tmpdir") "/ring-chez-big.bin")
+        size (* 8 1024 1024)
+        _ (spit path (apply str (repeat size "q")))
+        f (io/file path)
+        server (adapter/run-server (fn [_] {:status 200
+                                            :headers {"Content-Type" "application/octet-stream"}
+                                            :body f})
+                                   {:port 8515 :worker-threads 2})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8515 20000)]
+        (client-send fd "GET /big HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [raw (client-recv-raw fd)
+              body (response-body-bytes raw)]
+          (check-has "big file: framed by the length on disk"
+                     (str "Content-Length: " size) (latin1 raw))
+          (check "big file: all octets delivered" size (alength body))
+          (check "big file: octets are the file's" true
+                 (every? #(= (byte \q) %) (take 1000 body)))
+          (check "big file: last octet is the file's" (byte \q) (aget body (dec size))))
+        (client-close fd))
+      (finally (adapter/stop-server server) (.delete f)))))
+
+(defn test-input-stream-response-framing []
+  ;; an InputStream has no length until it ends. Small ones are buffered and
+  ;; framed by Content-Length as before; one too big to buffer switches to
+  ;; chunked rather than growing a buffer to whatever the stream turns out
+  ;; to be.
+  (let [small (byte-array (repeat 1000 (byte \s)))
+        big (byte-array (repeat 500000 (byte \g)))
+        server (adapter/run-server
+                 (fn [req] {:status 200
+                            :body (java.io.ByteArrayInputStream.
+                                    (if (= "/big" (:uri req)) big small))})
+                 {:port 8516 :worker-threads 2})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8516 20000)]
+        (client-send fd "GET /small HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [raw (client-recv-raw fd)]
+          (check-has "stream: a short stream keeps Content-Length"
+                     "Content-Length: 1000" (latin1 raw))
+          (check "stream: short body intact" 1000 (alength (response-body-bytes raw))))
+        (client-close fd))
+      (let [fd (client-connect 8516 20000)]
+        (client-send fd "GET /big HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [raw (client-recv-until-bytes fd "0\r\n\r\n")
+              view (latin1 raw)
+              hdr-end (str/index-of view "\r\n\r\n")
+              body (dechunk (java.util.Arrays/copyOfRange raw (+ hdr-end 4) (alength raw)))]
+          (check-has "stream: a long stream switches to chunked"
+                     "Transfer-Encoding: chunked" view)
+          (check "stream: long body intact" 500000 (alength body))
+          (check "stream: long body octets" true
+                 (every? #(= (byte \g) %) (take 1000 body))))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+;; --- Round 4: request framing ----------------------------------------------------
 
 (defn test-chunked-request-body []
   ;; Transfer-Encoding: chunked was answered 501, so every streaming upload
@@ -2275,6 +2433,14 @@
   (test-ws-guard-throw-is-request-failure)
   (test-write-timeout-cuts-stalled-peer)
   (test-write-timeout-zero-disables)
+
+  ;; --- Round 5: resource bounds ---
+  (test-request-deadline)
+  (test-request-deadline-fibers)
+  (test-header-limit)
+  (test-header-limit-configurable)
+  (test-large-file-response)
+  (test-input-stream-response-framing)
 
   ;; --- Round 4: request framing ---
   (test-chunked-request-body)

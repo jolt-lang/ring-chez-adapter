@@ -346,9 +346,22 @@
   for `Expect: 100-continue` and declares a body — a client that asked and is
   not answered waits out its own timeout first (curl stalls about a second)."
   ([conn acc max-bytes recv! idle-recv!]
-   (read-request conn acc max-bytes recv! idle-recv! nil))
-  ([conn acc max-bytes recv! idle-recv! continue!]
-  (let [buf (ffi/alloc socket/bufsize)]
+   (read-request conn acc {:max-bytes max-bytes :recv! recv! :idle-recv! idle-recv!}))
+  ([conn acc {:keys [max-bytes max-header-bytes recv! idle-recv! continue!
+                     request-timeout-ms arm-read!]
+              :or {max-header-bytes 8192 request-timeout-ms 0}}]
+  (let [buf (ffi/alloc socket/bufsize)
+        ;; a head can never be allowed past the whole-request cap either: with
+        ;; :max-request-bytes below the header limit the tighter one governs,
+        ;; or a run-on head would sit unchecked between the two
+        max-header-bytes (min max-header-bytes max-bytes)
+        ;; when the first octet of THIS request arrived. nil while the
+        ;; connection is idle between requests, which may last the whole
+        ;; keep-alive timeout and is not a request in progress.
+        started (volatile! (when (pos? (alength ^bytes acc)) (System/currentTimeMillis)))
+        deadline (fn [] (when (and (pos? request-timeout-ms) @started)
+                          (+ @started request-timeout-ms)))
+        expired? (fn [] (when-let [d (deadline)] (> (System/currentTimeMillis) d)))]
     (try
       ;; acc is a capacity buffer, valid over [0,have) — it is not sliced to
       ;; size until the request is framed. scanned: how far into it the
@@ -371,18 +384,36 @@
                            :else (:to framing))
                          socket/bufsize)
               more!   (fn [acc have scanned framing state]
-                        (let [n ((if (zero? have) idle-recv! recv!) conn buf)]
-                          (cond
-                            (pos? n) (let [acc (ensure-capacity acc have n limit)]
-                                       (fill! acc have buf n)
-                                       [acc (+ have n) scanned framing state])
-                            (zero? have) :closed
-                            :else :bad)))]
+                        (if (expired?)
+                          :timeout
+                          (do
+                            ;; the fibers sweeper is the only thing that can
+                            ;; end a parked read, so it has to know which
+                            ;; deadline applies to this one
+                            (when arm-read! (arm-read! (deadline)))
+                            (let [n ((if (zero? have) idle-recv! recv!) conn buf)]
+                              (cond
+                                (pos? n) (let [acc (ensure-capacity acc have n limit)]
+                                           (fill! acc have buf n)
+                                           (when-not @started
+                                             (vreset! started (System/currentTimeMillis)))
+                                           [acc (+ have n) scanned framing state])
+                                (zero? have) :closed
+                                (expired?) :timeout
+                                :else :bad)))))]
           (cond
             (keyword? framing) framing      ; :bad -> 400, :unsupported -> 501
 
+            ;; the head is capped separately from the body: a request may
+            ;; legitimately carry a megabyte, a HEAD may not. Checked here for
+            ;; a block still arriving and below for one that arrived whole —
+            ;; the completeness test used to win the cond, so a peer that sent
+            ;; an oversized head in a single write was never checked at all
+            ;; (Igropyr http.sc:1520).
+            (and (map? framing) (> (:from framing) max-header-bytes)) :headers-too-big
+
             (nil? framing)                  ; head still incomplete
-            (if (> have max-bytes)
+            (if (> have max-header-bytes)
               :headers-too-big              ; headers never ended -> 431
               (let [r (more! acc have (max 0 (- have 3)) nil nil)]
                 (if (keyword? r) r (let [[a h sc fr st] r] (recur a h sc fr st)))))
@@ -626,15 +657,31 @@
                      (some #(conn-token? "close" %) v)
                      (conn-token? "close" v))))))))
 
-(defn- part-capacity [p]
-  (if (string? p) (* 4 (count p)) (alength ^bytes p)))   ; UTF-8 worst case 4 bytes/char
+(def ^:private send-window
+  "Octets of native buffer a single send-all holds. Everything used to go into
+  one buffer sized to the whole payload — 4x the character count for a string,
+  worst case for UTF-8 — so serving a 100 MB body reserved 400 MB of native
+  memory the GC cannot even see. Parts are packed into a fixed window and
+  flushed as it fills, which also keeps a small head and its body in ONE send
+  rather than splitting them across segments."
+  65536)
 
-(defn- write-part!
-  "Encode p into buf at off; returns the octets written."
-  [buf off p]
-  (if (string? p)
-    (ffi/write-bytes (+ buf off) p)
-    (ffi/write-array (+ buf off) p)))
+(defn- ^bytes part-bytes [p]
+  (if (string? p) (.getBytes ^String p "UTF-8") p))
+
+(defn- send-window!
+  "Write n octets from buf; false when the peer is gone."
+  [conn buf n wait-write!]
+  (loop [off 0]
+    (if (< off n)
+      (let [sent (socket/c-send conn (+ buf off) (- n off) 0)]
+        (cond
+          (pos? sent) (recur (+ off sent))
+          (and (neg? sent) (poller/eintr?)) (recur off)
+          (and (neg? sent) wait-write! (poller/eagain?))
+          (do (wait-write!) (recur off))
+          :else false))
+      true)))
 
 (defn send-all
   "Write data to conn: a string (encoded as UTF-8), a byte array, or a vector
@@ -644,21 +691,28 @@
   sockets block instead of returning EAGAIN)."
   ([conn data] (send-all conn data nil))
   ([conn data wait-write!]
-   (let [parts (if (vector? data) data [data])
-         buf (ffi/alloc (max 1 (reduce (fn [n p] (+ n (part-capacity p))) 0 parts)))
-         n (reduce (fn [off p] (+ off (write-part! buf off p))) 0 parts)
-         ok (loop [off 0]
-              (if (< off n)
-                (let [sent (socket/c-send conn (+ buf off) (- n off) 0)]
-                  (cond
-                    (pos? sent) (recur (+ off sent))
-                    (and (neg? sent) (poller/eintr?)) (recur off)
-                    (and (neg? sent) wait-write! (poller/eagain?))
-                    (do (wait-write!) (recur off))
-                    :else false))
-                true))]
-     (ffi/free buf)
-     ok)))
+   (let [parts (mapv part-bytes (if (vector? data) data [data]))
+         buf (ffi/alloc send-window)]
+     ;; try/finally, not a free after the loop: a throw mid-write leaked the
+     ;; buffer and nothing ever gave it back
+     (try
+       ;; ps: parts still to write, off: how far into the head of ps, held:
+       ;; octets packed into buf and not yet sent
+       (loop [ps (seq parts), off 0, held 0]
+         (cond
+           (nil? ps) (or (zero? held) (send-window! conn buf held wait-write!))
+
+           (= off (alength ^bytes (first ps))) (recur (next ps) 0 held)
+
+           (= held send-window)
+           (if (send-window! conn buf held wait-write!) (recur ps off 0) false)
+
+           :else
+           (let [^bytes p (first ps)
+                 n (min (- (alength p) off) (- send-window held))]
+             (ffi/write-array (+ buf held) p off n)
+             (recur ps (+ off n) (+ held n)))))
+       (finally (ffi/free buf))))))
 
 (defn- chunk->bytes
   "One stream chunk's octets. Chunks are strings or byte arrays — anything
@@ -700,6 +754,60 @@
 
         :else (do (async/close! ch) false)))))
 
+(def ^:private stream-window
+  "Octets read from a File or InputStream body per write. A body that does not
+  fit in memory must not have to."
+  65536)
+
+(defn- pump-file!
+  "Stream f's octets onto conn, framed by the length already declared. false
+  once the peer is gone, or if the file turns out shorter than it said it was
+  — a short body is a truncated response, and the caller closes on false, which
+  is the only honest signal for one."
+  [conn ^java.io.File f len send!]
+  (with-open [in (java.io.FileInputStream. f)]
+    (let [buf (byte-array stream-window)]
+      (loop [remaining len]
+        (if (zero? remaining)
+          true
+          (let [n (.read in buf 0 (int (min stream-window remaining)))]
+            (if-not (pos? n)
+              false
+              (and (send! conn (if (= n stream-window)
+                                 buf
+                                 (java.util.Arrays/copyOfRange buf 0 n)))
+                   (recur (- remaining n))))))))))
+
+(defn- read-up-to
+  "Up to n octets from in. Returns [bytes eof?] — eof? true when the stream
+  ended within n, which is what makes the length known."
+  [^java.io.InputStream in n]
+  (let [buf (byte-array n)]
+    (loop [off 0]
+      (if (= off n)
+        [buf false]
+        (let [r (.read in buf off (- n off))]
+          (if (neg? r)
+            [(java.util.Arrays/copyOfRange buf 0 off) true]
+            (recur (+ off r))))))))
+
+(defn- pump-stream!
+  "Stream the rest of in onto conn after prefix, chunked (or bare, on
+  HTTP/1.0). The length was never known, so this is the framing that does not
+  require knowing it."
+  [conn ^java.io.InputStream in prefix http10? send!]
+  (let [buf (byte-array stream-window)
+        write (fn [^bytes bs]
+                (send! conn (if http10? bs (chunk-parts bs))))]
+    (and (or (zero? (alength ^bytes prefix)) (write prefix))
+         (loop []
+           (let [n (.read in buf 0 stream-window)]
+             (cond
+               (not (pos? n)) (if http10? true (send! conn "0\r\n\r\n"))
+               (write (if (= n stream-window) buf (java.util.Arrays/copyOfRange buf 0 n)))
+               (recur)
+               :else false))))))
+
 (defn send-response
   "Send resp for req on conn. Returns true when the connection may be reused."
   [conn req resp take! send!]
@@ -729,6 +837,35 @@
 
       bodyless?
       (and (send! conn (head->string resp keep? :none)) keep?)
+
+      ;; a File knows its length without being read, so it is framed by
+      ;; Content-Length and streamed from disk. It used to be copied into a
+      ;; ByteArrayOutputStream, toByteArray'd, and then written into a native
+      ;; buffer sized to the whole thing — three copies of the file resident to
+      ;; serve it once.
+      (instance? java.io.File b)
+      (let [^java.io.File f b
+            len (.length f)]
+        (and (send! conn (head->string resp keep? len))
+             (pump-file! conn f len send!)
+             keep?))
+
+      ;; an InputStream has no length until it ends. A short one is buffered
+      ;; and framed by Content-Length exactly as before; one that does not end
+      ;; within the first window switches to chunked rather than growing a
+      ;; buffer to whatever the stream turns out to be.
+      (instance? java.io.InputStream b)
+      (let [^java.io.InputStream in b
+            [^bytes prefix eof?] (read-up-to in stream-window)]
+        (if eof?
+          (and (send! conn [(head->string resp keep? (alength prefix)) prefix]) keep?)
+          (if http10?
+            (do (send! conn (head->string resp false :none))
+                (pump-stream! conn in prefix true send!)
+                false)
+            (and (send! conn (head->string resp keep? :chunked))
+                 (pump-stream! conn in prefix false send!)
+                 keep?))))
 
       :else
       (and (send! conn (response->parts resp keep?)) keep?))))
