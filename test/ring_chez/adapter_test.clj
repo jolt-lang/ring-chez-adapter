@@ -1336,6 +1336,41 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+;; --- Wave 2 round 1: stop-server closes live connections ---------------------------
+
+;; "Stopped" has to mean the same thing on both strategies. The fibers path
+;; closes every live conn; the threads path used to close only the listen fd,
+;; so a keep-alive connection opened before the stop was still served after
+;; stop-server returned — and its worker stayed on it for up to the idle
+;; timeout (RFC-0008).
+(defn- stop-closes-live-conn [strategy port]
+  (let [calls  (atom 0)
+        h      (fn [_] (swap! calls inc)
+                 {:status 200 :headers {"Content-Type" "text/plain"} :body "ok"})
+        server (adapter/run-server h {:port port :strategy strategy})
+        label  (str (name strategy) " stop: ")]
+    (Thread/sleep 250)
+    (let [fd (client-connect port 3000)]
+      (try
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check (str label "served before the stop") true
+               (str/starts-with? (or (client-recv fd) "") "HTTP/1.1 200"))
+        (adapter/stop-server server)
+        ;; the send itself may fail (RST on a closed peer) — that is the same
+        ;; answer as reading EOF, so both count as "not served"
+        (let [r (try (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+                     (or (client-recv fd) "")
+                     (catch Throwable _ ""))]
+          (check (str label "nothing served after") false (str/starts-with? r "HTTP")))
+        (check (str label "handler not re-entered") 1 @calls)
+        (finally (client-close fd))))))
+
+(defn test-stop-closes-live-conn-threads []
+  (stop-closes-live-conn :threads 8530))
+
+(defn test-stop-closes-live-conn-fibers []
+  (stop-closes-live-conn :fibers 8531))
+
 ;; --- Round 6: operability ---------------------------------------------------------
 
 (defn- echo-body-handler [req]
@@ -2601,6 +2636,10 @@
   (test-ws-guard-throw-is-request-failure)
   (test-write-timeout-cuts-stalled-peer)
   (test-write-timeout-zero-disables)
+
+  ;; --- Wave 2 round 1: stop-server closes live connections ---
+  (test-stop-closes-live-conn-threads)
+  (test-stop-closes-live-conn-fibers)
 
   ;; --- Round 6: operability ---
   (test-graceful-drain)

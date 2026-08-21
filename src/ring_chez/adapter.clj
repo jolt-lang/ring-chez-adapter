@@ -43,7 +43,9 @@
         (ffi/write salen :int 0 socket/sockaddr-size)
         (let [conn (socket/c-accept listen-fd sa salen)]
           (cond
-            (not @running?) nil
+            ;; stopped between accept() returning and this check: nobody
+            ;; downstream will ever see this fd, so close it here or it leaks
+            (not @running?) (when-not (neg? conn) (socket/c-close conn))
             ;; a failing accept that is retried immediately burns a core:
             ;; EMFILE persists until an fd is released, and nothing here
             ;; releases one. Back off, capped, and reset on the next success.
@@ -357,48 +359,64 @@
                   (when reusable (recur (:leftover r)))))))
           :else nil)))))
 
-(defn- worker [handler-box base-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io work stats]
+(defn- register-conn!
+  "Enter one accepted connection in the server's live set. Registered at
+  ACCEPT, not when a worker claims it: a conn still sitting in the work
+  channel when the server stops has no worker to close it, and used to leak
+  its fd. :closed? is what makes teardown idempotent — see conn-close!."
+  [conns conn peer poller?]
+  (let [entry (cond-> {:conn conn :peer peer :closed? (atom false)}
+                poller? (assoc :poller? true
+                               ;; the sweeper's deadline; armed by fiber-io
+                               :deadline (atom Long/MAX_VALUE)))]
+    (swap! conns conj entry)
+    entry))
+
+(defn- conn-close!
+  "Idempotent teardown for one live conn, shared by the serving worker/fiber's
+  finally, the fibers sweeper, and stop-server's sweep: shutdown -> close ->
+  forget!, exactly once (a second close() on an fd number the kernel already
+  handed to another socket would close the wrong one), then deregister from
+  the live set.
+
+  shutdown -> close: on Linux close() alone does not deliver FIN to the peer's
+  blocked recv. forget! after close: it wakes any fiber still parked on the
+  fd, and the woken read must see EBADF — forget-first lets it see EAGAIN,
+  re-park on a dead registration and hang. Only the fibers path has a poller
+  registration to forget.
+
+  The :open count is decremented here rather than in each caller's finally, so
+  it is exactly-once for the same reason the close is: a conn the stop sweep
+  closes before any worker claimed it never reaches a finally at all."
+  [conns entry stats]
+  (when (compare-and-set! (:closed? entry) false true)
+    (socket/c-shutdown (:conn entry) 2)
+    (socket/c-close (:conn entry))
+    (when (:poller? entry) (poller/forget! (:conn entry)))
+    (swap! (:open stats) dec))
+  (swap! conns disj entry))
+
+(defn- worker [handler-box base-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io work conns stats]
   (loop []
-    (when-let [[conn peer] (async/<!! work)]
+    (when-let [entry (async/<!! work)]
       ;; claim at take-time: pending then counts only conns accepted but not
       ;; yet claimed — decrementing in the acceptor after >!! leaves a window
       ;; where a claimed conn still reads as pressure and over-retires
       ((io :claim!))
       (try
-        (connection-loop conn handler-box (assoc base-info :remote-addr peer) ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io nil stats)
+        (connection-loop (:conn entry) handler-box (assoc base-info :remote-addr (:peer entry)) ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io nil stats)
         ;; an escaping throwable must not kill the worker: a dead worker
         ;; shrinks the pool permanently and starves later connections
         (catch Throwable _)
-        ;; shutdown before close: on Linux close() alone does not deliver
-        ;; FIN to the peer holding a blocked recv (same family as 791d5c4)
-        (finally (swap! (:open stats) dec)
-                 (socket/c-shutdown conn 2)
-                 (socket/c-close conn)))
+        (finally (conn-close! conns entry stats)))
       (recur))))
-
-(defn- conn-close!
-  "Idempotent teardown for one fiber-held conn, shared by the serving fiber's
-  finally and stop-server's sweep: shutdown -> close -> forget!, exactly once
-  (a second close() on an fd number the kernel already handed to another
-  socket would close the wrong one), then deregister from the live set.
-
-  shutdown -> close: on Linux close() alone does not deliver FIN to the peer's
-  blocked recv. forget! after close: it wakes any fiber still parked on the
-  fd, and the woken read must see EBADF — forget-first lets it see EAGAIN,
-  re-park on a dead registration and hang."
-  [conns entry]
-  (when (compare-and-set! (:closed? entry) false true)
-    (socket/c-shutdown (:conn entry) 2)
-    (socket/c-close (:conn entry))
-    (poller/forget! (:conn entry)))
-  (swap! conns disj entry))
 
 (defn- start-sweeper!
   "Fibers-strategy deadline enforcement (the counterpart of SO_RCVTIMEO on
   the threads strategy): every 100ms, close conns whose deadline passed.
   conn-close! wakes the fiber parked on the fd (forget! resumes registered
   waiters), so a parked read ends as :closed, not a hang."
-  [conns]
+  [conns stats]
   (let [stop? (atom false)]
     (future
       (loop []
@@ -407,7 +425,7 @@
           (let [now (System/currentTimeMillis)]
             (doseq [e @conns]
               (when (and (not @(e :closed?)) (< @(e :deadline) now))
-                (conn-close! conns e))))
+                (conn-close! conns e stats))))
           (recur))))
     stop?))
 
@@ -417,10 +435,10 @@
   bound, and idle connections hold no thread. The spawn runs under
   *go-backend* :fiber: the default :thread backend runs go bodies on OS
   threads, where wait-ready would block the carrier instead of parking."
-  [handler-box conn-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms conn conns stats]
-  (let [deadline (atom (+ (System/currentTimeMillis) ka-ms))
-        entry {:conn conn :closed? (atom false) :deadline deadline}]
-    (swap! conns conj entry)
+  [handler-box conn-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms entry conns stats]
+  (let [conn     (:conn entry)
+        deadline (:deadline entry)]
+    (reset! deadline (+ (System/currentTimeMillis) ka-ms))
     (binding [async/*go-backend* :fiber]
       (async/go
         (try
@@ -428,8 +446,7 @@
                            max-bytes max-header-bytes request-timeout-ms write-timeout-ms
                            (fiber-io conn deadline write-timeout-ms) deadline stats)
           (catch Throwable _ nil)
-          (finally (swap! (:open stats) dec)
-                   (conn-close! conns entry)))))))
+          (finally (conn-close! conns entry stats)))))))
 
 ;; Igropyr http.sc: bad config must crash HERE, at boot — deferred to request
 ;; time it raises inside the reader and the connection just drops. One error
@@ -531,15 +548,16 @@
           running? (atom true)]
       (if (= :fibers strategy)
         (let [conns (atom #{})   ; live conn entries; sweeper + stop sweep them
-              sweep (start-sweeper! conns)]
+              sweep (start-sweeper! conns stats)]
           (future (serve-loop fd running?
                               (fn [conn peer]
                                 (poller/nonblock! conn)
                                 (swap! (:open stats) inc)
-                                (fiber-serve handler-box (assoc base-info :remote-addr peer) ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms conn conns stats))))
+                                (fiber-serve handler-box (assoc base-info :remote-addr peer) ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms (register-conn! conns conn peer true) conns stats))))
           {:socket fd :port port :host host :running running? :conns conns :sweep sweep
            :handler handler-box :ws-handler ws-handler-box :stats stats})
-        (let [work (async/chan)   ; unbuffered: acceptor parks when all workers busy
+        (let [work  (async/chan)  ; unbuffered: acceptor parks when all workers busy
+              conns (atom #{})    ; live conn entries; the stop sweep closes them
               pending (atom 0)    ; conns accepted but not yet claimed by a worker
                io (assoc threads-io
                          :under-pressure? #(pos? @pending)
@@ -552,13 +570,13 @@
                          ;; or a client mid-reuse would race a reset. Returns
                          ;; the recv contract (n>0 data, 0 closed/retire).
                          :idle-recv! #(idle-poll-recv! %1 %2 ka-ms pending))]
-           (dotimes [_ n] (async/thread (worker handler-box base-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io work stats)))
+           (dotimes [_ n] (async/thread (worker handler-box base-info ka-ms ws-handler-box ws-guard on-failure max-bytes max-header-bytes request-timeout-ms write-timeout-ms io work conns stats)))
           (future (serve-loop fd running?
                               (fn [conn peer]
                                 (swap! pending inc)
                                 (swap! (:open stats) inc)
-                                (async/>!! work [conn peer]))))
-          {:socket fd :port port :host host :running running? :work work
+                                (async/>!! work (register-conn! conns conn peer false)))))
+          {:socket fd :port port :host host :running running? :work work :conns conns
            :handler handler-box :ws-handler ws-handler-box :stats stats})))))
 
 (defn swap-handler!
@@ -595,9 +613,18 @@
   bounded by :drain-timeout-ms (default 5000) so a handler that never returns
   cannot stop this returning either.
 
-  Fiber strategy: every live connection is closed and forgotten too —
-  jolt.io-poller is process-global and never stops, so a parked fiber is
-  released only by its fd going away (the woken read sees EBADF/EOF).
+  Then every live connection is closed, on both strategies: stopped has to
+  mean stopped. A keep-alive connection opened before the stop would
+  otherwise keep being served on the threads strategy — closing only the
+  listen fd leaves a worker on it until the peer goes away or
+  :keep-alive-timeout-ms fires (RFC-0008). The drain runs first, so what the
+  sweep closes is always a connection between requests, never a response
+  mid-write.
+
+  Fiber strategy: the same sweep also forgets each fd — jolt.io-poller is
+  process-global and never stops, so a parked fiber is released only by its
+  fd going away (the woken read sees EBADF/EOF).
+
   shutdown(SHUT_RDWR) before close() is required on Linux: close() alone
   leaves the acceptor parked in accept() holding the port binding, so
   rebinding the same port fails with EADDRINUSE."
@@ -612,9 +639,12 @@
           (Thread/sleep 20)
           (recur)))))
   (when-let [sweep (:sweep server)] (reset! sweep true))
-  (if-let [conns (:conns server)]
-    (doseq [entry @conns] (conn-close! conns entry))
-    (async/close! (:work server)))
+  ;; close the work channel first: idle workers leave their take loop, and the
+  ;; acceptor's parked put gives up instead of handing over a conn the sweep
+  ;; below has already closed
+  (when-let [work (:work server)] (async/close! work))
+  (let [conns (:conns server)]
+    (doseq [entry @conns] (conn-close! conns entry (:stats server))))
   (socket/c-shutdown (:socket server) 2)        ; SHUT_RDWR: wake parked accept()
   (socket/c-close (:socket server))
   nil))

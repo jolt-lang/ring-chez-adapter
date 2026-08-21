@@ -191,6 +191,9 @@ that connection rather than writing garbage into the stream.
 `stop-server` stops accepting, then waits for in-flight requests to finish
 rather than cutting a response off mid-write, bounded by `:drain-timeout-ms`
 (default 5000) so a handler that never returns cannot stop it returning either.
+After the drain every live connection is closed, on both strategies — once it
+returns, nothing is served, including on keep-alive connections opened before
+the stop.
 
 `swap-handler!` re-points a running server without a restart, including on
 connections already open — the handler is resolved per request, after the read
