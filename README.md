@@ -263,6 +263,39 @@ Slow peers are bounded separately by `:write-timeout-ms`: a client that stops
 draining mid-response gets the connection abandoned instead of pinning a
 worker. A slow *handler* is bounded by `:handler-timeout-ms`.
 
+## Middleware
+
+Ring's own middleware is pure Clojure and runs here unchanged — params,
+cookies, sessions, `ring-defaults`. The exceptions are the ones that reach for
+a JVM library; this repo ships those.
+
+### Multipart uploads
+
+`ring.middleware.multipart-params` is written against Apache
+commons-fileupload, so it cannot load under jolt and a Ring stack here has no
+way to accept a file upload. `ring-chez.middleware.multipart` is the same
+middleware over [jolt-lang/multipart](https://github.com/jolt-lang/multipart),
+an RFC 7578 parser in pure Clojure:
+
+```clojure
+(require '[ring-chez.middleware.multipart :as multipart])
+
+(def app
+  (multipart/wrap-multipart-params
+    (fn [{:keys [multipart-params]}]
+      (let [{:keys [filename content-type bytes size]} (get multipart-params "file")]
+        {:status 200 :body (str filename " (" size " bytes)")}))))
+```
+
+`:multipart-params` is added to the request and merged into `:params`, as Ring
+specifies. A text field's value is a string; an upload is
+`{:filename :content-type :bytes :size}` — Ring's `byte-array-store` shape plus
+`:size`. Repeated field names collect into a vector. Requests that are not
+`multipart/form-data` pass through untouched, `:body` included.
+
+There is no temp-file store: the parser buffers in memory, so bound uploads
+with `:max-request-bytes` rather than assuming a large one spools to disk.
+
 ## Streaming responses
 
 Return a `core.async` channel as `:body` and the response is sent with
