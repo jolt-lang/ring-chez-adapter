@@ -7,6 +7,7 @@
             [clojure.core.async :as a]
             [clojure.java.io :as io]
             [jolt.ffi :as ffi]
+            [ring-chez.socket :as socket]
             [jolt.io-poller :as poller]))
 
 ;; --- raw socket test client (keep-alive & later SSE/WS need wire control) ---
@@ -1327,6 +1328,86 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+;; --- Round 3: bind address and peer -----------------------------------------------
+
+(defn test-bind-host-option []
+  ;; make-sockaddr hardcoded 127.0.0.1, so the server could not be reached from
+  ;; anywhere but the box it ran on. :host picks the interface; the default
+  ;; stays loopback so an upgrade never exposes a server that was private.
+  (let [server (adapter/run-server handler {:port 8490 :host "0.0.0.0"})]
+    (try
+      (Thread/sleep 250)
+      (let [r (http/get "http://127.0.0.1:8490/")]
+        (check "host: 0.0.0.0 binds and serves" 200 (:status r)))
+      (finally (adapter/stop-server server))))
+  (let [server (adapter/run-server handler {:port 8491 :host "127.0.0.1"})]
+    (try
+      (Thread/sleep 250)
+      (let [r (http/get "http://127.0.0.1:8491/")]
+        (check "host: explicit loopback still serves" 200 (:status r)))
+      (finally (adapter/stop-server server))))
+  (doseq [bad ["" "not.an.address" "999.1.1.1" 42]]
+    (try
+      (let [s (adapter/run-server handler {:port 8492 :host bad})]
+        (adapter/stop-server s)
+        (check (str "host: " (pr-str bad) " rejected at boot") :threw :did-not-throw))
+      (catch Throwable t
+        (check (str "host: " (pr-str bad) " rejected at boot") :threw :threw)
+        (check-has (str "host: " (pr-str bad) " names :host") ":host" (ex-message t))))))
+
+(defn test-peer-ip-formatting []
+  ;; the conversion itself, fed a sockaddr_in built by hand: accept() fills one
+  ;; of these, and reading it is what replaced the hardcoded "127.0.0.1"
+  (let [sa (ffi/alloc 16)]
+    (try
+      (dotimes [i 16] (ffi/write sa :uint8 i 0))
+      (doseq [[a b c d] [[127 0 0 1] [10 1 2 3] [192 168 250 17] [255 255 255 255]]]
+        (ffi/write sa :uint8 4 a) (ffi/write sa :uint8 5 b)
+        (ffi/write sa :uint8 6 c) (ffi/write sa :uint8 7 d)
+        (check (str "peer-ip: " a "." b "." c "." d)
+               (str a "." b "." c "." d) (socket/peer-ip sa)))
+      (finally (ffi/free sa)))))
+
+(defn test-request-addressing []
+  ;; :remote-addr and :server-name were string literals. remote-addr now comes
+  ;; off the accepted socket, and server-name off the Host header the client
+  ;; actually sent (Ring: the resolved server name), port stripped.
+  (let [seen (atom nil)
+        server (adapter/run-server
+                 (fn [req] (reset! seen (select-keys req [:remote-addr :server-name
+                                                          :server-port]))
+                   {:status 200 :body "ok"})
+                 {:port 8493 :host "0.0.0.0"})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8493 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: example.test:8493\r\n\r\n")
+        (client-recv fd)
+        (check "addressing: remote-addr is the peer" "127.0.0.1" (:remote-addr @seen))
+        (check "addressing: server-name from Host" "example.test" (:server-name @seen))
+        (check "addressing: server-port is the listen port" 8493 (:server-port @seen))
+        (client-close fd))
+      ;; HTTP/1.0 without a Host header falls back to the bind address
+      (let [fd (client-connect 8493 3000)]
+        (client-send fd "GET / HTTP/1.0\r\n\r\n")
+        (client-recv fd)
+        (check "addressing: server-name falls back to the bind host"
+               "0.0.0.0" (:server-name @seen))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-fiber-request-addressing []
+  (let [seen (atom nil)
+        server (adapter/run-server
+                 (fn [req] (reset! seen (:remote-addr req)) {:status 200 :body "ok"})
+                 {:port 8494 :strategy :fibers})]
+    (try
+      (Thread/sleep 250)
+      (let [r (http/get "http://127.0.0.1:8494/")]
+        (check "addressing (fibers): served" 200 (:status r)))
+      (check "addressing (fibers): remote-addr is the peer" "127.0.0.1" @seen)
+      (finally (adapter/stop-server server)))))
+
 ;; --- Round 2: RFC 6455 codec ----------------------------------------------------
 
 (defn- ws-echo-server [port ws-handler]
@@ -2038,6 +2119,12 @@
   (test-ws-guard-throw-is-request-failure)
   (test-write-timeout-cuts-stalled-peer)
   (test-write-timeout-zero-disables)
+
+  ;; --- Round 3: bind address and peer ---
+  (test-bind-host-option)
+  (test-peer-ip-formatting)
+  (test-request-addressing)
+  (test-fiber-request-addressing)
 
   ;; --- Round 2: RFC 6455 codec ---
   (test-harness-handshake-surplus)

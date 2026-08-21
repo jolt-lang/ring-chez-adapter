@@ -1,7 +1,7 @@
 (ns ring-chez.adapter
   "A Ring adapter for jolt: a minimal HTTP/1.1 server over BSD sockets, bound
    directly through jolt.ffi (no jolt built-in, no JVM). Synchronous Ring 1.x
-   handlers. Serves loopback (127.0.0.1).
+   handlers. Binds loopback by default; :host picks the interface.
 
        (require '[ring-chez.adapter :as adapter])
        (def server (adapter/run-server my-handler {:port 3000}))
@@ -32,15 +32,23 @@
 ;; wakes the acceptor parked in accept() on both Linux and macOS (close()
 ;; alone does NOT wake it on Linux), then closes it; the loop sees `running?`
 ;; false and exits instead of spinning on the dead fd.
-(defn- serve-loop [listen-fd running? serve!]
-  (loop []
-    (let [conn (socket/c-accept listen-fd ffi/null ffi/null)]
-      (cond
-        (not @running?) nil
-        (neg? conn) (when @running? (recur))
-        :else
-        (do (serve! conn)
-            (recur))))))
+(defn- serve-loop
+  "Accept forever, handing each connection and its peer address to serve!.
+  accept() fills the sockaddr, which is where :remote-addr comes from — it
+  used to be passed ffi/null and the Ring field was a hardcoded literal."
+  [listen-fd running? serve!]
+  (let [[sa salen] (socket/alloc-peer-sockaddr)]
+    (try
+      (loop []
+        (ffi/write salen :int 0 socket/sockaddr-size)
+        (let [conn (socket/c-accept listen-fd sa salen)]
+          (cond
+            (not @running?) nil
+            (neg? conn) (when @running? (recur))
+            :else
+            (do (serve! conn (socket/peer-ip sa))
+                (recur)))))
+      (finally (ffi/free sa) (ffi/free salen)))))
 
 ;; Each worker parks on the work channel until a connection fd arrives, then
 ;; owns that connection: with keep-alive it serves requests until the client
@@ -165,7 +173,7 @@
         :else {:status 403 :headers {"Content-Type" "text/plain"}
                :body "Forbidden"}))))
 
-(defn- connection-loop [conn handler port ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io deadline]
+(defn- connection-loop [conn handler conn-info ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io deadline]
   (socket/set-rcvtimeo! conn ka-ms)
   (socket/set-sndtimeo! conn write-timeout-ms)
   (let [recv!      (:recv! io)
@@ -201,7 +209,7 @@
                                                                   "Connection" "close"}
                                             :body "Not Implemented"} false))
           (map? r)
-          (let [{:keys [request error]} (http/request->ring (:head r) (:body r) port)]
+          (let [{:keys [request error]} (http/request->ring (:head r) (:body r) conn-info)]
             (cond
               error (send! conn (http/response->parts error false))
                ;; A 101 ends HTTP framing: every byte after the head is read
@@ -281,15 +289,15 @@
                   (recur (:leftover r))))))
           :else nil)))))
 
-(defn- worker [handler port ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io work]
+(defn- worker [handler base-info ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io work]
   (loop []
-    (when-let [conn (async/<!! work)]
+    (when-let [[conn peer] (async/<!! work)]
       ;; claim at take-time: pending then counts only conns accepted but not
       ;; yet claimed — decrementing in the acceptor after >!! leaves a window
       ;; where a claimed conn still reads as pressure and over-retires
       ((io :claim!))
       (try
-        (connection-loop conn handler port ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io nil)
+        (connection-loop conn handler (assoc base-info :remote-addr peer) ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io nil)
         ;; an escaping throwable must not kill the worker: a dead worker
         ;; shrinks the pool permanently and starves later connections
         (catch Throwable _)
@@ -340,14 +348,14 @@
   bound, and idle connections hold no thread. The spawn runs under
   *go-backend* :fiber: the default :thread backend runs go bodies on OS
   threads, where wait-ready would block the carrier instead of parking."
-  [handler port ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms conn conns]
+  [handler conn-info ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms conn conns]
   (let [deadline (atom (+ (System/currentTimeMillis) ka-ms))
         entry {:conn conn :closed? (atom false) :deadline deadline}]
     (swap! conns conj entry)
     (binding [async/*go-backend* :fiber]
       (async/go
         (try
-          (connection-loop conn handler port ka-ms ws-handler ws-guard on-failure
+          (connection-loop conn handler conn-info ka-ms ws-handler ws-guard on-failure
                            max-bytes write-timeout-ms
                            (fiber-io conn deadline write-timeout-ms) deadline)
           (catch Throwable _ nil)
@@ -370,8 +378,16 @@
             (when (contains? opts k)
               (let [v (get opts k)]
                 (when-not (fn? v) (bad! k v "a function"))))
-            (get opts k))]
+            (get opts k))
+          (check-host []
+            (when (contains? opts :host)
+              (let [v (get opts :host)]
+                ;; inet_pton decides, so the message names what it rejected
+                (when-not (socket/ipv4->octets v)
+                  (bad! :host v "an IPv4 address (e.g. \"127.0.0.1\" or \"0.0.0.0\")"))))
+            (get opts :host))]
     {:port               (check-num :port 1 65535)
+     :host               (check-host)
      :worker-threads     (check-num :worker-threads 1 ##Inf)
      :ka-ms              (check-num :keep-alive-timeout-ms 1 ##Inf)
      :max-bytes          (check-num :max-request-bytes 1 ##Inf)
@@ -380,8 +396,10 @@
      :write-timeout-ms   (check-num :write-timeout-ms 0 ##Inf)}))
 
 (defn run-server
-  "Start the server; return a handle {:socket :port :running}. opts:
+  "Start the server; return a handle {:socket :port :host :running}. opts:
     :port                  listen port (default 3000)
+    :host                  interface to bind, as an IPv4 address (default
+                           \"127.0.0.1\"); \"0.0.0.0\" for every interface
     :strategy              :threads (default) — fixed worker pool, one thread
                            per busy connection, :worker-threads of them
                            (default = available processors); slow or idle
@@ -416,16 +434,21 @@
           on-failure (get opts :on-failure)
           max-bytes (or (:max-bytes v) 1048576)
           write-timeout-ms (or (:write-timeout-ms v) 30000)
-          fd     (socket/listen-socket port)
+          ;; loopback by default: Igropyr binds 0.0.0.0, but this is a library
+          ;; and a version bump must not put a server that was private on the
+          ;; network. Opt in with :host "0.0.0.0".
+          host   (or (:host v) "127.0.0.1")
+          base-info {:server-port port :server-name host}
+          fd     (socket/listen-socket host port)
           running? (atom true)]
       (if (= :fibers strategy)
         (let [conns (atom #{})   ; live conn entries; sweeper + stop sweep them
               sweep (start-sweeper! conns)]
           (future (serve-loop fd running?
-                              (fn [conn]
+                              (fn [conn peer]
                                 (poller/nonblock! conn)
-                                (fiber-serve handler port ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms conn conns))))
-          {:socket fd :port port :running running? :conns conns :sweep sweep})
+                                (fiber-serve handler (assoc base-info :remote-addr peer) ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms conn conns))))
+          {:socket fd :port port :host host :running running? :conns conns :sweep sweep})
         (let [work (async/chan)   ; unbuffered: acceptor parks when all workers busy
               pending (atom 0)    ; conns accepted but not yet claimed by a worker
                io (assoc threads-io
@@ -455,12 +478,12 @@
                                                    (and (>= now grace) (pos? @pending)) 0
                                                    :else (recur)))))
                                            (finally (ffi/free pfds))))))]
-           (dotimes [_ n] (async/thread (worker handler port ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io work)))
+           (dotimes [_ n] (async/thread (worker handler base-info ka-ms ws-handler ws-guard on-failure max-bytes write-timeout-ms io work)))
           (future (serve-loop fd running?
-                              (fn [conn]
+                              (fn [conn peer]
                                 (swap! pending inc)
-                                (async/>!! work conn))))
-          {:socket fd :port port :running running? :work work})))))
+                                (async/>!! work [conn peer]))))
+          {:socket fd :port port :host host :running running? :work work})))))
 
 (defn stop-server
   "Stop the server: unblock + exit the accept loop and close the listen socket.

@@ -31,6 +31,11 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
 `run-server` takes an opts map:
 
 - `:port` (default 3000)
+- `:host` (default `"127.0.0.1"`) — interface to bind, as an IPv4 address.
+  `"0.0.0.0"` serves every interface. Parsed by `inet_pton`, so it accepts
+  what the platform accepts and anything else fails at boot. The default is
+  loopback rather than Igropyr's `0.0.0.0`: this is a library, and a version
+  bump should not put a server that was private on the network.
 - `:strategy` (default `:threads`) — concurrency backend for connections:
   - `:threads` — fixed worker pool, one worker thread per busy connection
     (`:worker-threads`, default core count); idle keep-alive connections
@@ -103,6 +108,10 @@ reads survives. A request whose `Content-Length` is missing is treated as
 bodyless; one that is not a single non-negative integer gets `400`.
 `Transfer-Encoding` is not decoded — such a request gets `501` rather than
 being framed by guesswork.
+
+`:remote-addr` is the peer address `accept(2)` reported, and `:server-name`
+the host the client asked for (the `Host` header, port stripped), falling back
+to the bind address when the request carries none.
 
 The request `:body` is a `java.io.InputStream` over the body's own octets
 (`nil` when the request has no body), so an upload stays byte-exact — an
@@ -235,5 +244,5 @@ requests go to the Ring handler as usual.
 ## Test
 
 ```bash
-jolt -M:test   # 288 checks; drives the server over raw sockets + http-client
+jolt -M:test   # 311 checks; drives the server over raw sockets + http-client
 ```

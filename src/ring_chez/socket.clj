@@ -25,6 +25,10 @@
 ;; at 0, events at byte 4, revents at bytes 6-7.
 (ffi/defcfn c-poll       "poll"       [:pointer :int :int] :int :blocking)
 (ffi/defcfn c-strerror  "strerror"   [:int] :pointer)
+;; inet_pton parses a presentation-form address into network byte order —
+;; the same routine every other client of the sockets API uses, so ":host"
+;; accepts exactly what the platform accepts and rejects the rest.
+(ffi/defcfn c-inet-pton  "inet_pton"  [:int :pointer :pointer] :int)
 
 (def POLLIN  0x001)
 
@@ -92,21 +96,66 @@
   (let [flags (poller/c-fcntl fd f-getfl 0)]
     (poller/c-fcntl fd f-setfl (bit-and-not flags o-nonblock))))
 
-;; sockaddr_in for 127.0.0.1:port. macOS: byte0 = sin_len (16), byte1 = family;
-;; Linux: bytes0-1 = family (little-endian, so byte0 = AF_INET).
-(defn- make-sockaddr [port]
-  (let [sa (ffi/alloc 16)]
+;; sockaddr_in is 16 bytes: family, port (network order) at 2-3, address at
+;; 4-7. macOS: byte0 = sin_len (16), byte1 = family; Linux: bytes0-1 = family
+;; (little-endian, so byte0 = AF_INET).
+(defn- write-family! [sa]
+  (if macos?
+    (do (ffi/write sa :uint8 0 16) (ffi/write sa :uint8 1 AF-INET))
+    (ffi/write sa :uint8 0 AF-INET)))
+
+(defn ipv4->octets
+  "The four octets of a dotted-quad host, or nil if the platform's inet_pton
+  does not accept it. Parsing is not hand-rolled: inet_pton is what the rest of
+  the sockets API uses, so :host takes exactly the forms the OS takes."
+  [host]
+  (when (and (string? host) (pos? (count host)))
+    (let [src (ffi/alloc (inc (count host)))
+          dst (ffi/alloc 4)]
+      (try
+        (dotimes [i (inc (count host))] (ffi/write src :uint8 i 0))
+        (ffi/write-bytes src host)          ; the zero fill leaves it NUL-terminated
+        (dotimes [i 4] (ffi/write dst :uint8 i 0))
+        (when (= 1 (c-inet-pton AF-INET src dst))
+          (mapv #(ffi/read dst :uint8 %) (range 4)))
+        (finally (ffi/free src) (ffi/free dst))))))
+
+(defn- make-sockaddr [host port]
+  (let [octets (or (ipv4->octets host)
+                   (throw (ex-info (str "run-server: :host must be an IPv4 address"
+                                        " (e.g. \"127.0.0.1\" or \"0.0.0.0\"), got "
+                                        (pr-str host))
+                                   {:key :host :given host
+                                    :expected "an IPv4 address"})))
+        sa (ffi/alloc 16)]
     (dotimes [i 16] (ffi/write sa :uint8 i 0))
-    (if macos?
-      (do (ffi/write sa :uint8 0 16) (ffi/write sa :uint8 1 AF-INET))
-      (ffi/write sa :uint8 0 AF-INET))
+    (write-family! sa)
     (ffi/write sa :uint8 2 (bit-and (bit-shift-right port 8) 0xff))   ; port hi (network order)
     (ffi/write sa :uint8 3 (bit-and port 0xff))                       ; port lo
-    (ffi/write sa :uint8 4 127) (ffi/write sa :uint8 5 0)             ; 127.0.0.1
-    (ffi/write sa :uint8 6 0)   (ffi/write sa :uint8 7 1)
+    (dotimes [i 4] (ffi/write sa :uint8 (+ 4 i) (nth octets i)))
     sa))
 
-(defn listen-socket [port]
+(defn peer-ip
+  "The dotted-quad address out of a sockaddr_in accept() filled in. The Ring
+  :remote-addr used to be the literal \"127.0.0.1\" whatever the peer was,
+  which is not something rate limiting or an access log can work from."
+  [sa]
+  (str/join "." (map #(ffi/read sa :uint8 (+ 4 %)) (range 4))))
+
+;; sockaddr_in is 16 bytes; accept() wants the capacity in/out through a
+;; socklen_t pointer, and writes back what it used.
+(def sockaddr-size 16)
+
+(defn alloc-peer-sockaddr
+  "A zeroed sockaddr_in plus its socklen_t, ready for accept()."
+  []
+  (let [sa (ffi/alloc sockaddr-size)
+        len (ffi/alloc 4)]
+    (dotimes [i sockaddr-size] (ffi/write sa :uint8 i 0))
+    (ffi/write len :int 0 sockaddr-size)
+    [sa len]))
+
+(defn listen-socket [host port]
   (let [fd (c-socket AF-INET SOCK-STREAM 0)]
     (when (neg? fd)
       (let [e (errno-info)]
@@ -120,7 +169,7 @@
           (throw (ex-info (str "setsockopt() failed: " (:strerror e))
                           (assoc e :syscall "setsockopt")))))
       (ffi/free opt))
-    (let [sa (make-sockaddr port)]
+    (let [sa (make-sockaddr host port)]
       (when (neg? (c-bind fd sa 16))
         (let [e (errno-info)
               in-use? (= (if macos? 48 98) (:errno e))]
@@ -134,7 +183,10 @@
                           (cond-> (assoc e :syscall "bind" :port port)
                             in-use? (assoc :errno-name "EADDRINUSE"))))))
       (ffi/free sa))
-    (when (neg? (c-listen fd 64))
+    ;; 511, as Igropyr uses (http.sc:1899): the backlog is what absorbs an
+    ;; accept burst while the acceptor is busy, and 64 is small enough that a
+    ;; modest connection storm gets refused rather than queued.
+    (when (neg? (c-listen fd 511))
       (let [e (errno-info)]
         (c-close fd)
         (throw (ex-info (str "listen() failed: " (:strerror e))
