@@ -2,6 +2,7 @@
   (:require [ring-chez.adapter :as adapter]
             [ring-chez.sse :as sse]
             [ring-chez.fault :as fault]
+            [ring-chez.middleware.multipart :as multipart]
             [ring-chez.websocket :as ws]
             [jolt.http-client :as http]
             [clojure.string :as str]
@@ -1335,6 +1336,163 @@
             r (drain-until-eof fd)]
         (check "write-timeout off: full body delivered" true (<= 262144 (count r)))
         (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+;; --- Wave 2 round 3: multipart uploads -------------------------------------------
+
+;; ring's own wrap-multipart-params is commons-fileupload based and cannot load
+;; under jolt. This is the same middleware over jolt-lang/multipart, proved
+;; end-to-end: a real upload over the wire, through the adapter's own body
+;; framing, with a payload that does not survive a UTF-8 round trip (RFC-0010).
+
+(def ^:private upload-bytes
+  ;; every byte value, so anything that decodes or re-encodes the payload
+  ;; shows up as a mismatch rather than as a lucky pass
+  (byte-array (map #(unchecked-byte %) (range 256))))
+
+(defn- multipart-body
+  "A two-part multipart/form-data body: one text field, one binary upload."
+  [boundary ^bytes file-bytes]
+  (let [head (str "--" boundary "\r\n"
+                  "Content-Disposition: form-data; name=\"title\"\r\n\r\n"
+                  "a picture\r\n"
+                  "--" boundary "\r\n"
+                  "Content-Disposition: form-data; name=\"file\"; filename=\"all.bin\"\r\n"
+                  "Content-Type: application/octet-stream\r\n\r\n")
+        tail (str "\r\n--" boundary "--\r\n")]
+    (byte-array (concat (.getBytes head "UTF-8")
+                        (seq file-bytes)
+                        (.getBytes tail "UTF-8")))))
+
+(defn- upload-handler [{:keys [multipart-params params]}]
+  (let [file (get multipart-params "file")]
+    {:status 200
+     :headers {"Content-Type" "application/octet-stream"
+               "X-Title"      (str (get multipart-params "title"))
+               ;; :params must carry the same keys (Ring merges them)
+               "X-Title-Params" (str (get params "title"))
+               "X-Filename"   (str (:filename file))
+               "X-File-Type"  (str (:content-type file))
+               "X-Size"       (str (:size file))}
+     ;; echo the octets back: the comparison is byte-for-byte
+     :body (:bytes file)}))
+
+(defn test-multipart-upload []
+  (let [server (adapter/run-server (multipart/wrap-multipart-params upload-handler)
+                                   {:port 8540})]
+    (try
+      (Thread/sleep 250)
+      (let [boundary "----ringchez7Zf9"
+            body     (multipart-body boundary upload-bytes)
+            head     (str "POST /upload HTTP/1.1\r\nHost: t\r\n"
+                          "Content-Type: multipart/form-data; boundary=" boundary "\r\n"
+                          "Content-Length: " (alength body) "\r\n\r\n")
+            fd       (client-connect 8540 5000)]
+        (client-send fd head)
+        (t-send-bytes fd (map #(bit-and 0xff (long %)) (seq body)))
+        (let [raw  (client-recv-raw fd)
+              view (String. raw "ISO-8859-1")
+              got  (response-body-bytes raw)]
+          (check-has "multipart: text field" "X-Title: a picture" view)
+          (check-has "multipart: field also in :params" "X-Title-Params: a picture" view)
+          (check-has "multipart: filename" "X-Filename: all.bin" view)
+          (check-has "multipart: part content-type" "X-File-Type: application/octet-stream" view)
+          (check-has "multipart: size" (str "X-Size: " (alength upload-bytes)) view)
+          (check "multipart: upload survives byte-for-byte" true
+                 (java.util.Arrays/equals ^bytes upload-bytes ^bytes got)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+;; The interesting failures are not in the parser, they are at the seam: a body
+;; big enough to span many recv calls, arriving chunked, with a boundary that
+;; can land across a read. Repeated names ride along — Ring collects them into
+;; a vector and so must this.
+(defn test-multipart-large-chunked []
+  (let [big (byte-array (map #(unchecked-byte (mod % 251)) (range 300000)))
+        h   (fn [{:keys [multipart-params]}]
+              (let [tags (get multipart-params "tag")
+                    file (get multipart-params "file")]
+                {:status 200
+                 :headers {"Content-Type" "text/plain"
+                           "X-Tags" (str/join "," (if (vector? tags) tags [tags]))
+                           "X-Size" (str (:size file))
+                           ;; a cheap checksum: the parser must not have
+                           ;; dropped or reordered a read boundary
+                           "X-Sum" (str (reduce + 0 (map #(bit-and 0xff (long %))
+                                                         (seq (:bytes file)))))}
+                 :body "ok"}))
+        server (adapter/run-server (multipart/wrap-multipart-params h)
+                                   {:port 8542 :max-request-bytes 2097152})]
+    (try
+      (Thread/sleep 250)
+      (let [boundary "----ringchezBig"
+            head-str (str "--" boundary "\r\n"
+                          "Content-Disposition: form-data; name=\"tag\"\r\n\r\nred\r\n"
+                          "--" boundary "\r\n"
+                          "Content-Disposition: form-data; name=\"tag\"\r\n\r\nblue\r\n"
+                          "--" boundary "\r\n"
+                          "Content-Disposition: form-data; name=\"file\"; filename=\"big.bin\"\r\n"
+                          "Content-Type: application/octet-stream\r\n\r\n")
+            body (byte-array (concat (.getBytes head-str "UTF-8")
+                                     (seq big)
+                                     (.getBytes (str "\r\n--" boundary "--\r\n") "UTF-8")))
+            fd   (client-connect 8542 15000)]
+        (client-send fd (str "POST /upload HTTP/1.1\r\nHost: t\r\n"
+                             "Content-Type: multipart/form-data; boundary=" boundary "\r\n"
+                             "Transfer-Encoding: chunked\r\n\r\n"))
+        ;; chunk it small enough that boundaries and part headers straddle reads
+        (doseq [part (partition-all 8192 (seq body))]
+          (client-send fd (str (Integer/toHexString (count part)) "\r\n"))
+          (t-send-bytes fd (map #(bit-and 0xff (long %)) part))
+          (client-send fd "\r\n"))
+        (client-send fd "0\r\n\r\n")
+        (let [view (client-recv fd)]
+          (check-has "multipart chunked: repeated names collect" "X-Tags: red,blue" view)
+          (check-has "multipart chunked: full size" (str "X-Size: " (alength big)) view)
+          (check-has "multipart chunked: payload intact"
+                     (str "X-Sum: " (reduce + 0 (map #(bit-and 0xff (long %)) (seq big))))
+                     view))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+;; a truncated body must not take the server down with it
+(defn test-multipart-truncated []
+  (let [h (fn [{:keys [multipart-params]}]
+            {:status 200 :headers {"Content-Type" "text/plain"}
+             :body (str "params=" (pr-str (keys multipart-params)))})
+        server (adapter/run-server (multipart/wrap-multipart-params h) {:port 8543})]
+    (try
+      (Thread/sleep 250)
+      (let [boundary "----ringchezCut"
+            ;; no closing --boundary--
+            body (str "--" boundary "\r\n"
+                      "Content-Disposition: form-data; name=\"a\"\r\n\r\nvalue\r\n")
+            r (try (http/post "http://127.0.0.1:8543/upload"
+                              {:body body
+                               :content-type (str "multipart/form-data; boundary=" boundary)
+                               :throw-exceptions false})
+                   (catch Throwable t (ex-data t)))]
+        (check "multipart truncated: answered, not hung" true (some? (:status r))))
+      ;; and the server is still healthy
+      (check "multipart truncated: server still serves" 200
+             (:status (http/get "http://127.0.0.1:8543/x")))
+      (finally (adapter/stop-server server)))))
+
+;; the middleware must be invisible to everything that is not an upload
+(defn test-multipart-passthrough []
+  (let [seen (atom nil)
+        h    (fn [req]
+               (reset! seen (select-keys req [:multipart-params :params]))
+               {:status 200 :headers {"Content-Type" "text/plain"}
+                :body (str "body=" (if-let [b (:body req)] (slurp b) ""))})
+        server (adapter/run-server (multipart/wrap-multipart-params h) {:port 8541})]
+    (try
+      (Thread/sleep 250)
+      (let [r (http/post "http://127.0.0.1:8541/x"
+                         {:body "name=value" :content-type "application/x-www-form-urlencoded"})]
+        (check "multipart passthrough: served" 200 (:status r))
+        (check-has "multipart passthrough: body untouched" "body=name=value" (:body r))
+        (check "multipart passthrough: no :multipart-params" nil (:multipart-params @seen)))
       (finally (adapter/stop-server server)))))
 
 ;; --- Wave 2 round 2: handler deadline --------------------------------------------
@@ -2773,6 +2931,12 @@
   (test-ws-guard-throw-is-request-failure)
   (test-write-timeout-cuts-stalled-peer)
   (test-write-timeout-zero-disables)
+
+  ;; --- Wave 2 round 3: multipart uploads ---
+  (test-multipart-upload)
+  (test-multipart-large-chunked)
+  (test-multipart-truncated)
+  (test-multipart-passthrough)
 
   ;; --- Wave 2 round 2: handler deadline ---
   (test-handler-deadline-threads)
