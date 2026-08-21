@@ -79,6 +79,19 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
   response map (e.g. `{:status 401 ...}`) to serve it instead — the peer
   never gets the socket and the connection stays keep-alive-usable; return
   nil/false for a bare `403 Forbidden`; a throw routes through `:on-failure`.
+- `:handler-timeout-ms` (default 60000, `0` disables) — how long one handler
+  call may take. Past it the adapter stops waiting: the request is answered
+  through `:on-failure` and then a plain `503`, and the connection and its
+  worker go back to serving. The abandoned handler's *thread* is not
+  reclaimed — jolt has no safe thread kill — so the default is a minute
+  rather than Igropyr's 30s: a deadline that fires on merely-slow handlers
+  would leak threads for a living. Enforcing it means running the handler off
+  the worker thread (it cannot be abandoned from its own stack), so `:threads`
+  pays a thread handoff per request; `0` keeps the handler inline and the
+  behavior of earlier versions. Under `:fibers` the handler was already on a
+  thread, so the deadline costs nothing there. It bounds handler *execution*,
+  not the response: a handler that returns a channel and streams for an hour
+  is untouched.
 - `:write-timeout-ms` (default 30000, `0` disables) — `SO_SNDTIMEO` on every
   blocking send; a peer that stops draining mid-response gets the connection
   abandoned (truncated body = close) instead of pinning a worker forever.
@@ -218,9 +231,30 @@ produce a response:
 
 Return a map with `:status` and it is served — keep-alive survives the
 failure; return anything else (or throw) and the server answers the plain
-`500 Internal Server Error`. The worker always survives. Slow peers are
-bounded separately by `:write-timeout-ms`: a client that stops draining
-mid-response gets the connection abandoned instead of pinning a worker.
+`500 Internal Server Error` (`503` for a timeout). The worker always survives.
+
+What went wrong is on the request the hook receives, under
+`:ring-chez/failure`:
+
+```clojure
+{:kind :timeout        ; :crash :nil-response :timeout :ws-guard :ws-session
+ :elapsed-ms 60003}    ; :timeout only
+```
+
+`ring-chez.fault/fault-handler` is a ready-made hook (Igropyr's
+`make-fault-handler`): it answers a small JSON envelope on a connection that
+stays usable, so a client can resubmit on it rather than reconnecting.
+
+```clojure
+(require '[ring-chez.fault :as fault])
+(adapter/run-server handler {:on-failure (fault/fault-handler)})
+;; => 503  {"fault":"timeout","elapsed-ms":60003,"retryable":true}
+(fault/fault-handler {:status 500 :retryable? (constantly false)})
+```
+
+Slow peers are bounded separately by `:write-timeout-ms`: a client that stops
+draining mid-response gets the connection abandoned instead of pinning a
+worker. A slow *handler* is bounded by `:handler-timeout-ms`.
 
 ## Streaming responses
 

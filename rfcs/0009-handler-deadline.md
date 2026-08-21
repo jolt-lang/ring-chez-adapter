@@ -152,3 +152,22 @@ produced by the adapter, so the string is built without a JSON dependency.
 - `fault-handler` produces the documented envelope.
 - Benchmark `/plaintext` with the deadline on and off, and report the
   delta in the PR.
+
+## Measured cost
+
+`ab -n 20000 -k`, `/plaintext`, macOS, two runs per cell:
+
+| strategy | c | deadline off (`0`) | deadline on (60000) |
+| --- | --- | --- | --- |
+| threads | 10 | 8840 rps | 7112 rps |
+| threads | 100 | 8370 / 7804 rps | 6611 / 6723 rps |
+| fibers | 100 | 6105 / 5631 rps | 6370 / 5722 rps |
+
+Threads pays 15–25% for the handoff. Fibers pays nothing measurable, as
+predicted — the handler was already on a thread, and the deadline adds one
+timeout channel and an `alts!` per request.
+
+The default is still on, because a permanently dead worker is worse than a
+slower live one and the failure it prevents is unbounded. `0` is a
+one-word opt-out for anyone who would rather have the throughput, and it
+restores the previous behavior exactly.

@@ -90,12 +90,27 @@
 ;; worker threads; parking on the poller inside fibers), take! takes from a
 ;; channel body, send! writes to the socket (plain send-all on blocking
 ;; sockets, parking on writability inside fibers), run! executes a blocking
-;; fn (the sync Ring handler or the ws session) directly on the calling
-;; thread or on a parking-spawned thread.
+;; fn (the ws session) directly on the calling thread or on a parking-spawned
+;; thread, and run-timed! runs the Ring handler under a deadline.
+
+(def ^:private timed-out ::timeout)
+
+;; The handler cannot be abandoned from its own stack, so a deadline means
+;; running it elsewhere and giving up on the channel — which is why ms of 0
+;; keeps the direct call rather than paying a handoff for a deadline nobody
+;; asked for. The PORT decides, not the value: a handler that legitimately
+;; returns nil delivers [nil ch], which is the nil-response path, not a
+;; timeout (Igropyr stuck-ms; RFC-0009).
 (def ^:private threads-io
   {:recv! (fn [conn buf] (socket/c-recv conn buf socket/bufsize 0))
    :take! (fn [ch] (async/<!! ch))
-   :run!  (fn [f] (f))})
+   :run!  (fn [f] (f))
+   :run-timed! (fn [f ms]
+                 (if (zero? ms)
+                   (f)
+                   (let [ch (async/thread (f))
+                         [v p] (async/alts!! [ch (async/timeout ms)])]
+                     (if (= p ch) v timed-out))))})
 
 (defn- fiber-recv!
   "One recv for a fiber-held conn — the stdlib socket.io-call contract: EINTR
@@ -148,7 +163,16 @@
               (try (http/send-all c s (fn [] (arm-write!) (poller/wait-ready c :write)))
                    (finally (suspend!))))
      :take! (fn [ch] (async/<! ch))
-     :run!  (fn [f] (async/<! (async/thread (f))))}))
+     :run!  (fn [f] (async/<! (async/thread (f))))
+     ;; the handler is already on a thread here, so the deadline is only an
+     ;; alts! away — the fiber stops waiting, and the fd, the fiber and the
+     ;; connection come back
+     :run-timed! (fn [f ms]
+                   (let [ch (async/thread (f))]
+                     (if (zero? ms)
+                       (async/<! ch)
+                       (let [[v p] (async/alts! [ch (async/timeout ms)])]
+                         (if (= p ch) v timed-out)))))}))
 
 (defn- idle-poll-recv!
   "First read of the next request on an idle keep-alive connection (threads
@@ -185,18 +209,39 @@
               :else (recur)))))
       (finally (ffi/free pfds)))))
 
+(defn- failure-kind
+  "What went wrong, when the call site did not say: an ex-data tag we set
+  ourselves, or a plain crash — which is any throwable the handler raised."
+  [t]
+  (case (:type (ex-data t))
+    :ring-chez/nil-response    :nil-response
+    :ring-chez/handler-timeout :timeout
+    :crash))
+
 (defn- handle-failure
   "Every abnormal handler completion lands here (Igropyr's on-failure
    semantics). The hook gets one attempt: a throw or a non-map/nil return
    falls back to the plain 500, and the worker always survives. The returned
    map goes through http/send-response like any handler response, so keep-alive
-   is preserved across a failure."
-  [on-failure request t]
-  (or (when on-failure
-        (let [r (try (on-failure request t) (catch Throwable _ nil))]
-          (when (and (map? r) (contains? r :status)) r)))
-      {:status 500 :headers {"Content-Type" "text/plain"}
-       :body "Internal Server Error"}))
+   is preserved across a failure.
+
+   info is Igropyr's failure alist — {:kind :elapsed-ms} — handed to the hook
+   as :ring-chez/failure on the request rather than as a third argument, so
+   hooks written against the two-argument shape keep working. The fallback
+   status follows the kind: a timeout may well succeed on retry (503), a
+   crash is the server's own fault (500)."
+  ([on-failure request t] (handle-failure on-failure request t nil))
+  ([on-failure request t info]
+   (let [kind    (or (:kind info) (failure-kind t))
+         request (assoc request :ring-chez/failure (assoc info :kind kind))]
+     (or (when on-failure
+           (let [r (try (on-failure request t) (catch Throwable _ nil))]
+             (when (and (map? r) (contains? r :status)) r)))
+         (if (= :timeout kind)
+           {:status 503 :headers {"Content-Type" "text/plain"}
+            :body "Service Unavailable"}
+           {:status 500 :headers {"Content-Type" "text/plain"}
+            :body "Internal Server Error"})))))
 
 (defn- ws-guard-decision
   "Igropyr's ws-reject, Ring-shaped: a guard may refuse an upgrade BEFORE
@@ -208,7 +253,8 @@
   (if-not guard
     :upgrade
     (let [v (try (guard request)
-                 (catch Throwable t (handle-failure on-failure request t)))]
+                 (catch Throwable t
+                   (handle-failure on-failure request t {:kind :ws-guard})))]
       (cond
         (and (map? v) (contains? v :status)) v
         v :upgrade
@@ -223,7 +269,8 @@
 ;; sites were unreadable.
 (defn- connection-loop [conn conn-info cfg io deadline]
   (let [{:keys [handler-box ws-handler-box ws-guard on-failure ka-ms max-bytes
-                max-header-bytes request-timeout-ms write-timeout-ms stats]} cfg]
+                max-header-bytes request-timeout-ms write-timeout-ms
+                handler-timeout-ms stats]} cfg]
   (socket/set-rcvtimeo! conn ka-ms)
   (socket/set-sndtimeo! conn write-timeout-ms)
   (let [recv!      (:recv! io)
@@ -339,19 +386,54 @@
                      ;; parked the session on bytes already delivered
                      ((:run! io) #(try (ws-handler (ws/make-session conn (:leftover r)))
                                        (catch Throwable t
-                                         (try (when on-failure (on-failure request t))
+                                         (try (when on-failure
+                                                (on-failure
+                                                  (assoc request :ring-chez/failure
+                                                         {:kind :ws-session})
+                                                  t))
                                               (catch Throwable _ nil))))))))
               :else
                (let [_ (do (swap! (:requests stats) inc) (swap! (:active stats) inc))
-                     resp (let [r ((:run! io) #(try (handler request)
-                                                    (catch Throwable t
-                                                      (handle-failure on-failure request t))))]
+                     ;; one report per request: a handler that throws just as
+                     ;; the deadline fires would otherwise call the hook twice,
+                     ;; once from each path. Whoever claims first reports; the
+                     ;; loser's work is abandoned along with the rest of it.
+                     claim!   (let [claimed (atom false)]
+                                #(compare-and-set! claimed false true))
+                     started  (System/currentTimeMillis)
+                     ;; NOT `r`: that is the read, and its :leftover carries
+                     ;; the pipelined bytes this loop recurs on
+                     ran ((:run-timed! io)
+                          #(try (handler request)
+                                (catch Throwable t
+                                  (if (claim!)
+                                    (handle-failure on-failure request t)
+                                    ;; the deadline already answered this request
+                                    {:status 500})))
+                          handler-timeout-ms)
+                     resp (cond
+                            ;; abandoned past :handler-timeout-ms: the thread
+                            ;; runs on, but nothing waits for it and the
+                            ;; connection is usable again (Igropyr stuck-ms,
+                            ;; whose supervisor kills the worker outright)
+                            (= timed-out ran)
+                            (let [info {:kind :timeout
+                                        :elapsed-ms (- (System/currentTimeMillis) started)}
+                                  t (ex-info "handler timed out"
+                                             {:type :ring-chez/handler-timeout
+                                              :timeout-ms handler-timeout-ms})]
+                              (if (claim!)
+                                (handle-failure on-failure request t info)
+                                (handle-failure nil request t info)))
+
+                            (map? ran) ran
+
                             ;; nil is a failure per Ring (Jetty answers 500),
                             ;; tagged so a hook can tell it from a throw
-                            (if (map? r) r
-                                (handle-failure on-failure request
-                                                (ex-info "handler returned nil"
-                                                         {:type :ring-chez/nil-response}))))
+                            :else
+                            (handle-failure on-failure request
+                                            (ex-info "handler returned nil"
+                                                     {:type :ring-chez/nil-response})))
                     ;; retire under accept pressure: another connection is
                     ;; waiting for this worker, so decline keep-alive and free
                     ;; it instead of parking on an idle conn while others
@@ -489,7 +571,8 @@
      :request-timeout-ms (check-num :request-timeout-ms 0 ##Inf)
      :on-failure         (check-ifn :on-failure)
      :ws-guard           (check-ifn :ws-guard)
-     :write-timeout-ms   (check-num :write-timeout-ms 0 ##Inf)}))
+     :write-timeout-ms   (check-num :write-timeout-ms 0 ##Inf)
+     :handler-timeout-ms (check-num :handler-timeout-ms 0 ##Inf)}))
 
 (defn run-server
   "Start the server; return a handle {:socket :port :host :running}. opts:
@@ -513,6 +596,11 @@
                             (Connection: close) so queued connections never
                             starve
     :keep-alive-timeout-ms idle keep-alive timeout (default 30000)
+    :handler-timeout-ms    how long one handler call may take (default 60000,
+                           0 disables). Past it the request is answered
+                           through :on-failure, then a plain 503, and the
+                           worker goes back to serving; the abandoned
+                           handler's thread is not reclaimed
     :max-request-bytes     request cap (default 1048576; 413/431 beyond)
     :ws-handler            fn of a ring-chez.websocket Session, run when a
                            websocket upgrade request arrives."
@@ -540,6 +628,15 @@
           ;; trivial cost to the attacker. 0 disables.
           request-timeout-ms (or (:request-timeout-ms v) 60000)
           write-timeout-ms (or (:write-timeout-ms v) 30000)
+          ;; how long the HANDLER may take. Igropyr kills a worker stuck past
+          ;; stuck-ms and replaces it; we cannot kill a thread, but we can
+          ;; stop waiting for one — which reclaims the worker, the fd and the
+          ;; connection, and answers the client 503 instead of never. A minute
+          ;; rather than Igropyr's 30s because the abandoned thread is NOT
+          ;; reclaimed: a deadline that fires on merely-slow handlers would
+          ;; leak threads for a living. 0 disables (and keeps the handler on
+          ;; the worker thread, with no handoff).
+          handler-timeout-ms (or (:handler-timeout-ms v) 60000)
           ;; loopback by default: Igropyr binds 0.0.0.0, but this is a library
           ;; and a version bump must not put a server that was private on the
           ;; network. Opt in with :host "0.0.0.0".
@@ -558,6 +655,7 @@
                :ka-ms ka-ms :max-bytes max-bytes :max-header-bytes max-header-bytes
                :request-timeout-ms request-timeout-ms
                :write-timeout-ms write-timeout-ms
+               :handler-timeout-ms handler-timeout-ms
                :stats stats}
           fd     (socket/listen-socket host port)
           running? (atom true)]
