@@ -20,12 +20,13 @@
 ;; raw nonblocking syscalls that park the connection's fiber on
 ;; jolt.io-poller — kqueue/epoll with persistent, kernel-held registrations
 ;; (the old hand-rolled loop rebuilt its pollfd set from scratch on every
-;; wake). The poller is process-global and never stops, so every close path
+;; wake). The poller is process-global and never stops, so every teardown path
 ;; must forget! the fd: that keeps the poller table bounded, drops stale
 ;; readiness tombstones before the kernel reuses the fd number, and wakes a
-;; fiber still parked on the fd (close first, then forget! — a forget-first
-;; waker retries recv on the still-open fd, sees EAGAIN, re-parks on a dead
-;; registration and hangs).
+;; fiber still parked on the fd. Order matters, and it is shutdown -> forget!
+;; -> close: the woken recv sees EOF and stops, and the close that frees the
+;; fd NUMBER happens last, in the fiber that owns it, once nobody else can
+;; syscall on it. See conn-down!.
 
 ;; --- the accept loop --------------------------------------------------------
 ;; Clean shutdown: stop-server shutdown()s the listen fd (SHUT_RDWR), which
@@ -134,11 +135,16 @@
   retries, EAGAIN parks the CURRENT fiber on jolt.io-poller until readable,
   anything else is the syscall's answer. No waker go block and no per-read
   timeout race: deadlines are enforced by the connection sweeper, whose
-  close+forget! wakes this parked fiber and its retry recv answers negative
-  (EBADF) → :closed. (An earlier waker+alts! design leaked: a waker that
+  shutdown+forget! wakes this parked fiber and its retry recv answers 0 (EOF)
+  → :closed.
+
+  EOF, not EBADF, and the difference was a bug: teardown used to close() the
+  fd here, so the retry could land on an fd NUMBER the kernel had already
+  handed to another socket and read somebody else's connection. The fd stays
+  allocated until this fiber is done with it — see conn-down!. (An earlier
+  waker+alts! design leaked the same way from the other end: a waker that
   registered after close parked forever, and its stale poller entry
-  misdirected a reused fd number's wakeups — 10% failure rate under
-  stop/restart stress.)"
+  misdirected a reused fd number's wakeups.)"
   [conn buf]
   (loop []
     (let [n (socket/c-recv conn buf socket/bufsize 0)]
@@ -473,36 +479,70 @@
   "Enter one accepted connection in the server's live set. Registered at
   ACCEPT, not when a worker claims it: a conn still sitting in the work
   channel when the server stops has no worker to close it, and used to leak
-  its fd. :closed? is what makes teardown idempotent — see conn-close!."
+  its fd.
+
+  Teardown has three separate once-only steps, so three atoms: :down? the
+  shutdown that wakes everyone off the fd, :owned? the claim on releasing
+  it, and :released? the close itself. See conn-down!."
   [conns conn peer poller?]
-  (let [entry (cond-> {:conn conn :peer peer :closed? (atom false)}
+  (let [entry (cond-> {:conn conn :peer peer
+                       :down?     (atom false)
+                       :owned?    (atom false)
+                       :released? (atom false)}
                 poller? (assoc :poller? true
                                ;; the sweeper's deadline; armed by fiber-io
                                :deadline (atom Long/MAX_VALUE)))]
     (swap! conns conj entry)
     entry))
 
-(defn- conn-close!
-  "Idempotent teardown for one live conn, shared by the serving worker/fiber's
-  finally, the fibers sweeper, and stop-server's sweep: shutdown -> close ->
-  forget!, exactly once (a second close() on an fd number the kernel already
-  handed to another socket would close the wrong one), then deregister from
-  the live set.
+(defn- conn-down!
+  "Take one connection out of service WITHOUT releasing its fd number. This is
+  what the sweeper and stop-server call; only the conn's owner releases it.
 
-  shutdown -> close: on Linux close() alone does not deliver FIN to the peer's
-  blocked recv. forget! after close: it wakes any fiber still parked on the
-  fd, and the woken read must see EBADF — forget-first lets it see EAGAIN,
-  re-park on a dead registration and hang. Only the fibers path has a poller
-  registration to forget.
+  shutdown(SHUT_RDWR) makes every pending and subsequent read on the fd answer
+  EOF and every write EPIPE, so whoever holds it unwinds on its own — and,
+  unlike close(), it leaves the fd NUMBER allocated. That distinction is the
+  whole point. This used to be close() followed by poller/forget!, and forget!
+  RESUMES the fiber parked on the fd; its retry recv was assumed to answer
+  EBADF. But close() had already freed the number, and a resumed fiber does
+  not run until the scheduler reaches it, so an acceptor could be handed that
+  number first — and the woken fiber's recv then read a LIVE connection
+  belonging to somebody else, answering it out of its own stopped server's
+  handler. Measured at ~2.5% of responses under stop/restart churn.
+
+  forget! after shutdown is safe in a way forget-before-close never was: the
+  retry recv sees EOF, not EAGAIN, so it cannot re-park on a dead
+  registration. Only the fibers path has a registration to forget."
+  [entry]
+  (when (compare-and-set! (:down? entry) false true)
+    (socket/c-shutdown (:conn entry) 2)
+    (when (:poller? entry) (poller/forget! (:conn entry)))))
+
+(defn- claim-close!
+  "Take responsibility for releasing this conn's fd. Exactly one caller wins:
+  the worker or fiber that serves it, or stop-server for a conn that no worker
+  ever claimed. A caller that LOSES must not touch the fd again — the winner
+  may already have released the number to another socket."
+  [entry]
+  (compare-and-set! (:owned? entry) false true))
+
+(defn- conn-release!
+  "Release one conn's fd, exactly once, by whoever claimed it. Everything that
+  is not the owner calls conn-down! instead.
+
+  forget! before close here, the opposite of the old order and safe for the
+  opposite reason: the owner is unwinding, so no reader is left to see EAGAIN
+  and re-park. Forgetting AFTER the close would race the freed fd number into
+  another socket's registration.
 
   The :open count is decremented here rather than in each caller's finally, so
-  it is exactly-once for the same reason the close is: a conn the stop sweep
-  closes before any worker claimed it never reaches a finally at all."
+  it is exactly-once for the same reason the close is: a conn stop-server
+  releases before any worker claimed it never reaches a finally at all."
   [conns entry stats]
-  (when (compare-and-set! (:closed? entry) false true)
-    (socket/c-shutdown (:conn entry) 2)
-    (socket/c-close (:conn entry))
+  (conn-down! entry)
+  (when (compare-and-set! (:released? entry) false true)
     (when (:poller? entry) (poller/forget! (:conn entry)))
+    (socket/c-close (:conn entry))
     (swap! (:open stats) dec))
   (swap! conns disj entry))
 
@@ -513,19 +553,24 @@
       ;; yet claimed — decrementing in the acceptor after >!! leaves a window
       ;; where a claimed conn still reads as pressure and over-retires
       ((io :claim!))
-      (try
-        (connection-loop (:conn entry) (assoc base-info :remote-addr (:peer entry)) cfg io nil)
-        ;; an escaping throwable must not kill the worker: a dead worker
-        ;; shrinks the pool permanently and starves later connections
-        (catch Throwable _)
-        (finally (conn-close! conns entry (:stats cfg))))
+      ;; stop-server releases conns nobody claimed. If it got to this one
+      ;; first, the fd number may already belong to another socket, so losing
+      ;; the claim means leaving the fd alone entirely.
+      (when (claim-close! entry)
+        (try
+          (connection-loop (:conn entry) (assoc base-info :remote-addr (:peer entry)) cfg io nil)
+          ;; an escaping throwable must not kill the worker: a dead worker
+          ;; shrinks the pool permanently and starves later connections
+          (catch Throwable _)
+          (finally (conn-release! conns entry (:stats cfg)))))
       (recur))))
 
 (defn- start-sweeper!
   "Fibers-strategy deadline enforcement (the counterpart of SO_RCVTIMEO on
-  the threads strategy): every 100ms, close conns whose deadline passed.
-  conn-close! wakes the fiber parked on the fd (forget! resumes registered
-  waiters), so a parked read ends as :closed, not a hang."
+  the threads strategy): every 100ms, take conns whose deadline passed out of
+  service. conn-down! wakes the fiber parked on the fd (forget! resumes
+  registered waiters), so a parked read ends as :closed, not a hang — and the
+  fiber, not the sweeper, is what then frees the fd number."
   [conns stats]
   (let [stop? (atom false)]
     (future
@@ -534,8 +579,11 @@
         (when-not @stop?
           (let [now (System/currentTimeMillis)]
             (doseq [e @conns]
-              (when (and (not @(e :closed?)) (< @(e :deadline) now))
-                (conn-close! conns e stats))))
+              (when (and (not @(e :down?)) (< @(e :deadline) now))
+                ;; down, not released: the fiber that owns this conn is the
+                ;; only one allowed to free its fd number, and the shutdown
+                ;; here is what wakes it to do that
+                (conn-down! e))))
           (recur))))
     stop?))
 
@@ -551,11 +599,15 @@
     (reset! deadline (+ (System/currentTimeMillis) (:ka-ms cfg)))
     (binding [async/*go-backend* :fiber]
       (async/go
-        (try
-          (connection-loop conn conn-info cfg
-                           (fiber-io conn deadline (:write-timeout-ms cfg)) deadline)
-          (catch Throwable _ nil)
-          (finally (conn-close! conns entry (:stats cfg))))))))
+        ;; stop-server may have released this conn between the accept that
+        ;; registered it and this go block being scheduled; if it did, the fd
+        ;; number may already be another socket's and nothing here may use it
+        (when (claim-close! entry)
+          (try
+            (connection-loop conn conn-info cfg
+                             (fiber-io conn deadline (:write-timeout-ms cfg)) deadline)
+            (catch Throwable _ nil)
+            (finally (conn-release! conns entry (:stats cfg)))))))))
 
 ;; Igropyr http.sc: bad config must crash HERE, at boot — deferred to request
 ;; time it raises inside the reader and the connection just drops. One error
@@ -762,17 +814,24 @@
   bounded by :drain-timeout-ms (default 5000) so a handler that never returns
   cannot stop this returning either.
 
-  Then every live connection is closed, on both strategies: stopped has to
+  Then every live connection is shut down, on both strategies: stopped has to
   mean stopped. A keep-alive connection opened before the stop would
   otherwise keep being served on the threads strategy — closing only the
   listen fd leaves a worker on it until the peer goes away or
   :keep-alive-timeout-ms fires (RFC-0008). The drain runs first, so what the
-  sweep closes is always a connection between requests, never a response
+  sweep shuts down is always a connection between requests, never a response
   mid-write.
 
+  The sweep shuts down rather than closes: shutdown ends the connection at
+  once but keeps the fd NUMBER reserved, and only the worker or fiber holding
+  it frees that (conn-down!). stop-server releases just the conns nobody ever
+  claimed. An owner may therefore still be unwinding when this returns; it is
+  reading EOF by then, and holding an fd a moment longer is much cheaper than
+  handing its number to another socket while somebody still has it.
+
   Fiber strategy: the same sweep also forgets each fd — jolt.io-poller is
-  process-global and never stops, so a parked fiber is released only by its
-  fd going away (the woken read sees EBADF/EOF).
+  process-global and never stops, so a parked fiber is released only by
+  forget! resuming it (the woken read sees EOF).
 
   shutdown(SHUT_RDWR) before close() is required on Linux: close() alone
   leaves the acceptor parked in accept() holding the port binding, so
@@ -793,7 +852,17 @@
   ;; below has already closed
   (when-let [work (:work server)] (async/close! work))
   (let [conns (:conns server)]
-    (doseq [entry @conns] (conn-close! conns entry (:stats server))))
+    ;; take every live conn out of service first: shutdown makes each pending
+    ;; and subsequent read answer EOF, so the worker or fiber holding it
+    ;; unwinds and releases its own fd. Nothing here frees an fd NUMBER that
+    ;; somebody else may still syscall on — that was the bug.
+    (doseq [entry @conns] (conn-down! entry))
+    ;; then release the ones nobody ever claimed: a conn still sitting in the
+    ;; work channel, or one whose fiber was never scheduled, has no finally to
+    ;; run for it. Whoever wins the claim owns the close, so this cannot race
+    ;; a worker that took the same conn.
+    (doseq [entry @conns]
+      (when (claim-close! entry) (conn-release! conns entry (:stats server)))))
   (socket/c-shutdown (:socket server) 2)        ; SHUT_RDWR: wake parked accept()
   (socket/c-close (:socket server))
   nil))
