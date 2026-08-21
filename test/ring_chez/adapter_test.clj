@@ -4,6 +4,7 @@
             [ring-chez.fault :as fault]
             [ring-chez.middleware.multipart :as multipart]
             [ring-chez.middleware.gzip :as gzip]
+            [ring-chez.middleware.static :as static]
             [jolt.http.zlib :as zlib-oracle]
             [ring-chez.websocket :as ws]
             [jolt.http-client :as http]
@@ -1337,6 +1338,212 @@
             _ (client-send fd "GET /big HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
             r (drain-until-eof fd)]
         (check "write-timeout off: full body delivered" true (<= 262144 (count r)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+;; --- Wave 2 round 5: static files -------------------------------------------------
+
+;; wrap-file works under jolt but stats and re-opens on every request. This is
+;; Igropyr's cache in Ring's shape: a hot file is a map lookup, the mtime is
+;; re-checked at most once a second, the gzip copy is kept beside the plain one
+;; and a file too big to cache is streamed from disk (RFC-0012).
+
+(defn- static-root
+  "A throwaway tree: index.html, a css file over the gzip floor, a binary file
+  over the cache cap, a dotfile, and a symlink pointing out of the root."
+  []
+  (let [root (java.io.File. (str (System/getProperty "java.io.tmpdir")
+                                 "/ring-chez-static-" (System/currentTimeMillis)))
+        sub  (java.io.File. root "sub")
+        _    (.mkdirs sub)
+        spit! (fn [^java.io.File f ^String s]
+                (with-open [o (java.io.FileOutputStream. f)]
+                  (.write o (.getBytes s "UTF-8"))))]
+    (spit! (java.io.File. root "index.html") "<h1>index</h1>")
+    (spit! (java.io.File. root "app.css") (apply str (repeat 300 "body { margin: 0; } ")))
+    (spit! (java.io.File. root ".env") "SECRET=hunter2")
+    (spit! (java.io.File. sub "page.html") "<p>sub page</p>")
+    (spit! (java.io.File. root "small.txt") "small")
+    ;; over the 1 MiB cache cap on purpose: served as a File body, streamed
+    (with-open [o (java.io.FileOutputStream. (java.io.File. root "big.bin"))]
+      (.write o (byte-array (repeat 1500000 (byte 7)))))
+    ;; a secret next to the root, and a symlink inside it pointing at it
+    (spit! (java.io.File. (.getParentFile root) (str (.getName root) "-secret.txt"))
+           "outside the root")
+    (try
+      (java.lang.Runtime/getRuntime)
+      (let [p (.start (ProcessBuilder.
+                        ["ln" "-s"
+                         (str (.getPath (.getParentFile root)) "/" (.getName root) "-secret.txt")
+                         (str (.getPath root) "/link.txt")]))]
+        (.waitFor p))
+      (catch Throwable _ nil))
+    root))
+
+(defn- static-get [fd path & [accept-encoding extra]]
+  (client-send fd (str "GET " path " HTTP/1.1\r\nHost: t\r\n"
+                       (when accept-encoding (str "Accept-Encoding: " accept-encoding "\r\n"))
+                       (or extra "")
+                       "\r\n"))
+  (let [raw (client-recv-raw fd)]
+    [(String. raw "ISO-8859-1") raw]))
+
+(defn test-static-serves []
+  (let [root   (static-root)
+        server (adapter/run-server (fn [_] {:status 404 :headers {"Content-Type" "text/plain"}
+                                            :body "handler"})
+                                   {:port 8548})
+        app    (static/wrap-static (fn [_] {:status 404 :headers {"Content-Type" "text/plain"}
+                                            :body "handler"})
+                                   (.getPath root)
+                                   {:cache (static/new-cache)})]
+    (adapter/swap-handler! server app)
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8548 5000)]
+        (let [[view raw] (static-get fd "/index.html")]
+          (check-has "static: served" "200 OK" view)
+          (check-has "static: content-type" "Content-Type: text/html; charset=utf-8" view)
+          (check-has "static: etag" "ETag: W/\"" view)
+          (check "static: body" "<h1>index</h1>"
+                 (String. ^bytes (response-body-bytes raw) "UTF-8")))
+        ;; a directory serves its index
+        (let [[view raw] (static-get fd "/")]
+          (check-has "static: directory index" "200 OK" view)
+          (check "static: index body" "<h1>index</h1>"
+                 (String. ^bytes (response-body-bytes raw) "UTF-8")))
+        (let [[view _] (static-get fd "/sub/page.html")]
+          (check-has "static: nested file" "200 OK" view))
+        ;; a miss falls through to the handler rather than answering itself
+        (let [[view _] (static-get fd "/nope.html")]
+          (check-has "static: miss falls through" "handler" view))
+        ;; and so does a POST
+        (client-send fd "POST /index.html HTTP/1.1\r\nHost: t\r\nContent-Length: 0\r\n\r\n")
+        (check-has "static: POST falls through" "handler" (client-recv fd))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-static-conditional []
+  (let [root   (static-root)
+        app    (static/wrap-static (fn [_] {:status 404 :body "no"}) (.getPath root)
+                                   {:cache (static/new-cache)})
+        server (adapter/run-server app {:port 8549})]
+    (try
+      (Thread/sleep 250)
+      (let [fd   (client-connect 8549 5000)
+            [view _] (static-get fd "/index.html")
+            etag (second (re-find #"ETag: (\S+)" view))]
+        (check "static: etag present" true (some? etag))
+        (let [[view2 _] (static-get fd "/index.html" nil (str "If-None-Match: " etag "\r\n"))]
+          (check-has "static: revalidation is 304" "304 Not Modified" view2)
+          (check "static: 304 carries no body" true (not (str/includes? view2 "<h1>"))))
+        ;; a stale validator gets the file
+        (let [[view3 _] (static-get fd "/index.html" nil "If-None-Match: W/\"deadbeef\"\r\n")]
+          (check-has "static: stale validator gets 200" "200 OK" view3))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-static-gzip []
+  (let [root   (static-root)
+        app    (static/wrap-static (fn [_] {:status 404 :body "no"}) (.getPath root)
+                                   {:cache (static/new-cache)})
+        server (adapter/run-server app {:port 8550})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8550 5000)
+            [view raw] (static-get fd "/app.css" "gzip")]
+        (check-has "static gzip: encoded" "Content-Encoding: gzip" view)
+        (check-has "static gzip: vary" "Vary: Accept-Encoding" view)
+        (check-has "static gzip: distinct etag" "-gz\"" view)
+        (check "static gzip: round-trips" true
+               (str/includes? (String. ^bytes (zlib-oracle/gunzip (response-body-bytes raw)) "UTF-8")
+                              "body { margin: 0; }"))
+        ;; served twice: the second comes from the cached compressed copy
+        (let [[view2 raw2] (static-get fd "/app.css" "gzip")]
+          (check-has "static gzip: second hit still encoded" "Content-Encoding: gzip" view2)
+          (check "static gzip: second hit identical" true
+                 (java.util.Arrays/equals ^bytes (response-body-bytes raw)
+                                          ^bytes (response-body-bytes raw2))))
+        ;; a client that does not accept it gets the plain file
+        (let [[view3 _] (static-get fd "/app.css" nil)]
+          (check "static gzip: plain when not accepted" false
+                 (str/includes? view3 "Content-Encoding: gzip")))
+        ;; under the floor: not worth compressing
+        (let [[view4 _] (static-get fd "/small.txt" "gzip")]
+          (check "static gzip: under floor untouched" false
+                 (str/includes? view4 "Content-Encoding: gzip")))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-static-large-file []
+  (let [root   (static-root)
+        app    (static/wrap-static (fn [_] {:status 404 :body "no"}) (.getPath root)
+                                   {:cache (static/new-cache)})
+        server (adapter/run-server app {:port 8551})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8551 15000)
+            [view raw] (static-get fd "/big.bin")
+            body (response-body-bytes raw)]
+        (check-has "static large: served" "200 OK" view)
+        (check-has "static large: real content-length" "Content-Length: 1500000" view)
+        (check "static large: full body streamed" 1500000 (alength ^bytes body))
+        (check "static large: content intact" true
+               (every? #(= (byte 7) %) (take 1000 (seq body))))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-static-path-safety []
+  (let [root   (static-root)
+        app    (static/wrap-static (fn [_] {:status 404 :headers {"Content-Type" "text/plain"}
+                                            :body "handler"})
+                                   (.getPath root)
+                                   {:cache (static/new-cache)})
+        server (adapter/run-server app {:port 8552})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8552 5000)
+            refused (fn [path]
+                      (let [[view _] (static-get fd path)]
+                        (and (not (str/includes? view "SECRET=hunter2"))
+                             (not (str/includes? view "outside the root")))))]
+        ;; a dotfile is not servable: mounting a project directory must not
+        ;; hand out .env or .git/config
+        (check "static safety: dotfile refused" true (refused "/.env"))
+        ;; the adapter normalizes .. out of :uri, and the encoded form must not
+        ;; walk past the check either
+        (check "static safety: encoded traversal refused" true
+               (refused "/%2e%2e/%2e%2e/etc/passwd"))
+        (check "static safety: encoded dotfile refused" true (refused "/%2Eenv"))
+        ;; a symlink pointing out of the root is not followed
+        (check "static safety: symlink out of root refused" true (refused "/link.txt"))
+        ;; ordinary files still work after all that
+        (let [[view _] (static-get fd "/index.html")]
+          (check-has "static safety: normal file still served" "200 OK" view))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+;; the cache is the point: a file edited past the stat window is re-read, and
+;; one edited inside it is not (that is what makes a hit free)
+(defn test-static-cache-window []
+  (let [root   (static-root)
+        f      (java.io.File. root "index.html")
+        app    (static/wrap-static (fn [_] {:status 404 :body "no"}) (.getPath root)
+                                   {:cache (static/new-cache) :stat-window-ms 300})
+        server (adapter/run-server app {:port 8553})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8553 5000)
+            body-of (fn [] (let [[_ raw] (static-get fd "/index.html")]
+                             (String. ^bytes (response-body-bytes raw) "UTF-8")))]
+        (check "static cache: first read" "<h1>index</h1>" (body-of))
+        (with-open [o (java.io.FileOutputStream. f)]
+          (.write o (.getBytes "<h1>edited</h1>" "UTF-8")))
+        ;; the mtime has to move for the re-read to notice, and mtime is
+        ;; second-granular on some filesystems
+        (.setLastModified f (+ (System/currentTimeMillis) 2000))
+        (Thread/sleep 500)
+        (check "static cache: re-read past the window" "<h1>edited</h1>" (body-of))
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
@@ -3051,6 +3258,14 @@
   (test-ws-guard-throw-is-request-failure)
   (test-write-timeout-cuts-stalled-peer)
   (test-write-timeout-zero-disables)
+
+  ;; --- Wave 2 round 5: static files ---
+  (test-static-serves)
+  (test-static-conditional)
+  (test-static-gzip)
+  (test-static-large-file)
+  (test-static-path-safety)
+  (test-static-cache-window)
 
   ;; --- Wave 2 round 4: gzip ---
   (test-gzip-compresses)
