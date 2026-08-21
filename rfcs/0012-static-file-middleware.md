@@ -25,8 +25,8 @@ idea). For the common case — an unchanged `index.html`, `app.css`,
 and a map lookup.
 
 **Safety.** `ring.middleware.file` decides containment with
-`getCanonicalPath`. Under jolt that method does not resolve symlinks — it
-only absolutizes. Measured:
+`getCanonicalPath`. Through jolt 0.7.19 that method does not resolve
+symlinks — it only absolutizes. Measured:
 
 ```
 /tmp/symprobe/root/link.txt -> /tmp/symprobe/secret.txt
@@ -36,9 +36,13 @@ only absolutizes. Measured:
 ```
 
 So the containment check every Ring static middleware is written with
-silently does not hold here, and a symlink planted inside a served root
+silently does not hold there, and a symlink planted inside a served root
 hands out whatever it points at. This middleware uses `toRealPath`, and
 the test that proves it plants exactly such a link.
+
+The runtime bug is fixed upstream in jolt#693 (`getCanonicalPath` is
+`realpath(3)` now). `toRealPath` stays, because it is correct on every jolt
+version and this library supports the released ones.
 
 ## Design
 

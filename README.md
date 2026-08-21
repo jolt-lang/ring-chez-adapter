@@ -332,9 +332,11 @@ middleware is a no-op: uncompressed is always a correct answer.
 ### Static files
 
 `ring.middleware.file` runs under jolt, but it stats and re-opens the file on
-every request — and it decides containment with `getCanonicalPath`, which under
-jolt does not resolve symlinks (measured: it only absolutizes), so a symlink
-planted inside a served root hands out whatever it points at.
+every request — and it decides containment with `getCanonicalPath`, which
+through jolt 0.7.19 does not resolve symlinks (measured: it only absolutizes),
+so a symlink planted inside a served root hands out whatever it points at.
+(Fixed upstream in [jolt#693](https://github.com/jolt-lang/jolt/pull/693); this
+middleware uses `toRealPath`, which is correct on every version.)
 
 `ring-chez.middleware.static` is Igropyr's static cache in Ring's shape:
 

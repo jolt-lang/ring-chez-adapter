@@ -113,12 +113,14 @@
 (defn- real-path
   "The path with symlinks resolved, or nil.
 
-  NOT `getCanonicalPath`: under jolt that only absolutizes — measured, a
-  symlink at /tmp/x/link.txt pointing to /tmp/secret.txt canonicalizes to
-  itself, while `toRealPath` gives /private/tmp/secret.txt. Every Ring static
-  middleware writes its containment check with `getCanonicalPath`, so on jolt
-  that check silently does not hold and a symlink inside the root serves
-  whatever it points at."
+  NOT `getCanonicalPath`: through jolt 0.7.19 that only absolutizes —
+  measured, a symlink at /tmp/x/link.txt pointing to /tmp/secret.txt
+  canonicalizes to itself, while `toRealPath` gives /private/tmp/secret.txt.
+  Every Ring static middleware writes its containment check with
+  `getCanonicalPath`, so on those versions the check silently does not hold
+  and a symlink inside the root serves whatever it points at. Fixed upstream
+  in jolt#693; `toRealPath` is used regardless, since it is correct on every
+  version and this library supports the released ones."
   ^String [^File f]
   (try
     (str (.toRealPath (java.nio.file.Paths/get (.getPath f) (into-array String []))
