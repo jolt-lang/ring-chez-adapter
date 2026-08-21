@@ -555,6 +555,11 @@
               (let [v (get opts k)]
                 (when-not (fn? v) (bad! k v "a function"))))
             (get opts k))
+          (check-bool [k]
+            (when (contains? opts k)
+              (let [v (get opts k)]
+                (when-not (boolean? v) (bad! k v "true or false"))))
+            (get opts k))
           (check-host []
             (when (contains? opts :host)
               (let [v (get opts :host)]
@@ -572,7 +577,8 @@
      :on-failure         (check-ifn :on-failure)
      :ws-guard           (check-ifn :ws-guard)
      :write-timeout-ms   (check-num :write-timeout-ms 0 ##Inf)
-     :handler-timeout-ms (check-num :handler-timeout-ms 0 ##Inf)}))
+     :handler-timeout-ms (check-num :handler-timeout-ms 0 ##Inf)
+     :reuse-port         (check-bool :reuse-port)}))
 
 (defn run-server
   "Start the server; return a handle {:socket :port :host :running}. opts:
@@ -603,6 +609,9 @@
                            handler's thread is not reclaimed. Costs a thread
                            handoff per request under :threads (~15-25%
                            throughput), nothing under :fibers
+    :reuse-port            bind with SO_REUSEPORT (default false), so several
+                           processes can share the port and the kernel spreads
+                           connections over them (Linux)
     :max-request-bytes     request cap (default 1048576; 413/431 beyond)
     :ws-handler            fn of a ring-chez.websocket Session, run when a
                            websocket upgrade request arrives."
@@ -663,7 +672,7 @@
                :write-timeout-ms write-timeout-ms
                :handler-timeout-ms handler-timeout-ms
                :stats stats}
-          fd     (socket/listen-socket host port)
+          fd     (socket/listen-socket host port {:reuse-port? (boolean (:reuse-port v))})
           running? (atom true)]
       (if (= :fibers strategy)
         (let [conns (atom #{})   ; live conn entries; sweeper + stop sweep them
