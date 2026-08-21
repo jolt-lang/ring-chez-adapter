@@ -3,6 +3,8 @@
             [ring-chez.sse :as sse]
             [ring-chez.fault :as fault]
             [ring-chez.middleware.multipart :as multipart]
+            [ring-chez.middleware.gzip :as gzip]
+            [jolt.http.zlib :as zlib-oracle]
             [ring-chez.websocket :as ws]
             [jolt.http-client :as http]
             [clojure.string :as str]
@@ -1335,6 +1337,124 @@
             _ (client-send fd "GET /big HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
             r (drain-until-eof fd)]
         (check "write-timeout off: full body delivered" true (<= 262144 (count r)))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+;; --- Wave 2 round 4: gzip ---------------------------------------------------------
+
+;; jolt has no java.util.zip, so no existing Ring gzip middleware can load.
+;; This is Igropyr's policy over a zlib binding; the oracle for every check is
+;; jolt.http.zlib/gunzip, a separate implementation (RFC-0011).
+
+(def ^:private path-big "/big")
+
+(def ^:private gzip-text
+  (apply str (repeat 400 "the quick brown fox jumps over the lazy dog. ")))
+
+(defn- gzip-test-handler [{:keys [uri]}]
+  (case uri
+    "/big"    {:status 200 :headers {"Content-Type" "text/plain"} :body gzip-text}
+    "/etag"   {:status 200 :headers {"Content-Type" "text/plain" "ETag" "\"abc123\""}
+               :body gzip-text}
+    "/small"  {:status 200 :headers {"Content-Type" "text/plain"} :body "tiny"}
+    "/png"    {:status 200 :headers {"Content-Type" "image/png"} :body gzip-text}
+    "/preenc" {:status 200 :headers {"Content-Type" "text/plain"
+                                     "Content-Encoding" "br"} :body gzip-text}
+    "/seq"    {:status 200 :headers {"Content-Type" "text/plain"}
+               :body [gzip-text gzip-text]}
+    {:status 404 :headers {"Content-Type" "text/plain"} :body "no"}))
+
+(defn- gzip-get
+  "One request over a raw socket (the http client would transparently decode a
+  gzip response and hide what we are testing). Returns [head-string body-bytes]."
+  [fd path accept-encoding]
+  (client-send fd (str "GET " path " HTTP/1.1\r\nHost: t\r\n"
+                       (when accept-encoding (str "Accept-Encoding: " accept-encoding "\r\n"))
+                       "\r\n"))
+  (let [raw (client-recv-raw fd)]
+    [(String. raw "ISO-8859-1") (response-body-bytes raw)]))
+
+(defn test-gzip-compresses []
+  (let [server (adapter/run-server (gzip/wrap-gzip gzip-test-handler) {:port 8544})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8544 5000)
+            [view body] (gzip-get fd "/big" "gzip")]
+        (check-has "gzip: Content-Encoding" "Content-Encoding: gzip" view)
+        (check-has "gzip: Vary" "Vary: Accept-Encoding" view)
+        (check "gzip: smaller than the original" true
+               (< (alength body) (count (.getBytes gzip-text "UTF-8"))))
+        (check "gzip: body round-trips" gzip-text
+               (String. ^bytes (zlib-oracle/gunzip body) "UTF-8"))
+        ;; the framing has to survive: Content-Length must count the COMPRESSED
+        ;; octets, or the next response on this connection starts mid-body
+        (let [[view2 body2] (gzip-get fd "/small" "gzip")]
+          (check-has "gzip: connection still framed" "200 OK" view2)
+          (check "gzip: next body intact" "tiny" (String. ^bytes body2 "UTF-8")))
+        ;; a seq body is compressed as the octets it concatenates to
+        (let [[_ body3] (gzip-get fd "/seq" "gzip")]
+          (check "gzip: seq body round-trips" (str gzip-text gzip-text)
+                 (String. ^bytes (zlib-oracle/gunzip body3) "UTF-8")))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-gzip-negotiation []
+  (let [server (adapter/run-server (gzip/wrap-gzip gzip-test-handler) {:port 8545})]
+    (try
+      (Thread/sleep 250)
+      (let [gzipped? (fn [ae]
+                       (let [fd (client-connect 8545 5000)
+                             [view _] (gzip-get fd path-big ae)]
+                         (client-close fd)
+                         (str/includes? view "Content-Encoding: gzip")))]
+        (check "gzip: no Accept-Encoding" false (gzipped? nil))
+        (check "gzip: identity only" false (gzipped? "identity"))
+        (check "gzip: plain gzip" true (gzipped? "gzip"))
+        (check "gzip: deflate, gzip" true (gzipped? "deflate, gzip"))
+        (check "gzip: q-value" true (gzipped? "gzip;q=0.5"))
+        ;; q=0 means NOT acceptable — the client is saying it cannot decode it
+        (check "gzip: gzip;q=0 refused" false (gzipped? "gzip;q=0"))
+        (check "gzip: gzip;q=0.0 refused" false (gzipped? "gzip;q=0.0"))
+        ;; the wildcard decides only when nothing names gzip
+        (check "gzip: wildcard alone" true (gzipped? "*"))
+        (check "gzip: explicit beats wildcard" true (gzipped? "*;q=0, gzip"))
+        (check "gzip: explicit q=0 beats wildcard" false (gzipped? "*, gzip;q=0"))
+        ;; a coding that merely contains the letters is not gzip
+        (check "gzip: not a substring match" false (gzipped? "notgzip")))
+      (finally (adapter/stop-server server)))))
+
+(defn test-gzip-skips []
+  (let [server (adapter/run-server (gzip/wrap-gzip gzip-test-handler) {:port 8546})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8546 5000)]
+        (let [[view body] (gzip-get fd "/small" "gzip")]
+          (check "gzip: under min-size untouched" false
+                 (str/includes? view "Content-Encoding: gzip"))
+          (check "gzip: under min-size body intact" "tiny" (String. ^bytes body "UTF-8")))
+        (let [[view _] (gzip-get fd "/png" "gzip")]
+          (check "gzip: incompressible type untouched" false
+                 (str/includes? view "Content-Encoding: gzip")))
+        (let [[view _] (gzip-get fd "/preenc" "gzip")]
+          (check "gzip: already-encoded body left alone" false
+                 (str/includes? view "Content-Encoding: gzip"))
+          (check-has "gzip: its own encoding preserved" "Content-Encoding: br" view))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-gzip-etag []
+  (let [server (adapter/run-server (gzip/wrap-gzip gzip-test-handler) {:port 8547})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8547 5000)
+            [view _] (gzip-get fd "/etag" "gzip")]
+        ;; a gzipped body is a different entity: sharing the plain validator
+        ;; lets a cache serve one for the other
+        (check-has "gzip: etag made distinct" "ETag: \"abc123-gz\"" view)
+        (client-close fd))
+      (let [fd (client-connect 8547 5000)
+            [view _] (gzip-get fd "/etag" nil)]
+        (check-has "gzip: plain etag unchanged" "ETag: \"abc123\"" view)
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
@@ -2931,6 +3051,12 @@
   (test-ws-guard-throw-is-request-failure)
   (test-write-timeout-cuts-stalled-peer)
   (test-write-timeout-zero-disables)
+
+  ;; --- Wave 2 round 4: gzip ---
+  (test-gzip-compresses)
+  (test-gzip-negotiation)
+  (test-gzip-skips)
+  (test-gzip-etag)
 
   ;; --- Wave 2 round 3: multipart uploads ---
   (test-multipart-upload)
