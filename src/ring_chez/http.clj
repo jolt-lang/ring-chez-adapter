@@ -343,6 +343,13 @@
 (defn- conn-token? [tok v]
   (some #(= tok (str/lower-case %)) (header-tokens v)))
 
+(defn connection-token?
+  "True when the request's Connection header carries tok. Connection is a
+  comma-separated token list, so \"keep-alive, Upgrade\" really does offer an
+  upgrade and \"Keep-Alive, Close\" really does mean close."
+  [req tok]
+  (boolean (conn-token? tok (get-in req [:headers "connection"]))))
+
 (defn keep-alive? [req]
   (let [c (get-in req [:headers "connection"])]
     (if (= "HTTP/1.0" (:protocol req))
