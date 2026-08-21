@@ -72,6 +72,10 @@
 ;; SOL_SOCKET / SO_REUSEADDR differ by platform: macOS 0xffff / 4, Linux 1 / 2.
 (def ^:private sol-socket  (if macos? 0xffff 1))
 (def ^:private so-reuse    (if macos? 4 2))
+;; SO_REUSEPORT: macOS 0x0200, Linux 15. Same name, different meanings — on
+;; Linux it load-balances new connections across every socket bound to the
+;; port, which is the point; the BSDs allow the bind but do not balance.
+(def ^:private so-reuseport (if macos? 0x0200 15))
 (def ^:private so-rcvtimeo (if macos? 0x1006 20))
 ;; darwin keeps the sockopt block contiguous: SO_SNDBUF 0x1001 ... SO_SNDTIMEO
 ;; 0x1005, SO_RCVTIMEO 0x1006 (0x2005 is nothing — setsockopt ENOPROTOOPTs)
@@ -188,20 +192,33 @@
     (ffi/write len :int 0 sockaddr-size)
     [sa len]))
 
-(defn listen-socket [host port]
+(defn- setsockopt-flag!
+  "Set one boolean socket option, or throw with the errno behind it."
+  [fd opt-name opt-const]
+  (let [opt (ffi/alloc 4)]
+    (ffi/write opt :int 0 1)
+    (try
+      (when (neg? (c-setsockopt fd sol-socket opt-const opt 4))
+        (let [e (errno-info)]
+          (c-close fd)
+          (throw (ex-info (str "setsockopt(" opt-name ") failed: " (:strerror e))
+                          (assoc e :syscall "setsockopt" :option opt-name)))))
+      (finally (ffi/free opt)))))
+
+(defn listen-socket
+  ([host port] (listen-socket host port nil))
+  ([host port {:keys [reuse-port?]}]
   (let [fd (c-socket AF-INET SOCK-STREAM 0)]
     (when (neg? fd)
       (let [e (errno-info)]
         (throw (ex-info (str "socket() failed: " (:strerror e))
                         (assoc e :syscall "socket")))))
-    (let [opt (ffi/alloc 4)]
-      (ffi/write opt :int 0 1)
-      (when (neg? (c-setsockopt fd sol-socket so-reuse opt 4))
-        (let [e (errno-info)]
-          (c-close fd) (ffi/free opt)
-          (throw (ex-info (str "setsockopt() failed: " (:strerror e))
-                          (assoc e :syscall "setsockopt")))))
-      (ffi/free opt))
+    (setsockopt-flag! fd "SO_REUSEADDR" so-reuse)
+    ;; SO_REUSEPORT before bind, or it does not apply to it: several processes
+    ;; then bind the same port and the kernel spreads new connections over
+    ;; them (Linux). Opt-in, because without it a second bind SHOULD fail —
+    ;; that error is how you find out a server is already running.
+    (when reuse-port? (setsockopt-flag! fd "SO_REUSEPORT" so-reuseport))
     (let [sa (make-sockaddr host port)]
       (when (neg? (c-bind fd sa 16))
         (let [e (errno-info)
@@ -224,6 +241,6 @@
         (c-close fd)
         (throw (ex-info (str "listen() failed: " (:strerror e))
                         (assoc e :syscall "listen")))))
-    fd))
+    fd)))
 
 (def bufsize 65536)

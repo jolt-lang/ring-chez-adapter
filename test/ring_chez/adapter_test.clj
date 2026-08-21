@@ -5,6 +5,7 @@
             [ring-chez.middleware.multipart :as multipart]
             [ring-chez.middleware.gzip :as gzip]
             [ring-chez.middleware.static :as static]
+            [ring-chez.middleware.proxy :as proxy]
             [jolt.http.zlib :as zlib-oracle]
             [ring-chez.websocket :as ws]
             [jolt.http-client :as http]
@@ -1340,6 +1341,77 @@
         (check "write-timeout off: full body delivered" true (<= 262144 (count r)))
         (client-close fd))
       (finally (adapter/stop-server server)))))
+
+;; --- Wave 2 round 6: reuse-port and trusted-proxy addressing ----------------------
+
+;; SO_REUSEPORT: several processes (here, several servers in one process) bind
+;; the same port and the kernel spreads connections over them. Without it the
+;; second bind must fail — that error is how you find out a server is already
+;; running (RFC-0013).
+(defn test-reuse-port []
+  (let [h (fn [_] {:status 200 :headers {"Content-Type" "text/plain"} :body "ok"})
+        s1 (adapter/run-server h {:port 8554 :reuse-port true})]
+    (try
+      (Thread/sleep 250)
+      (let [s2 (try (adapter/run-server h {:port 8554 :reuse-port true})
+                    (catch Throwable t t))]
+        (check "reuse-port: second bind succeeds" false (instance? Throwable s2))
+        (check "reuse-port: still serving" 200
+               (:status (http/get "http://127.0.0.1:8554/")))
+        (when-not (instance? Throwable s2) (adapter/stop-server s2)))
+      (finally (adapter/stop-server s1))))
+  ;; and without it, the second bind is refused with the message that names why
+  (let [h  (fn [_] {:status 200 :body "ok"})
+        s1 (adapter/run-server h {:port 8555})]
+    (try
+      (Thread/sleep 250)
+      (let [t (try (adapter/run-server h {:port 8555}) nil (catch Throwable t t))]
+        (check "no reuse-port: second bind refused" true (some? t))
+        (check "no reuse-port: names EADDRINUSE" "EADDRINUSE"
+               (:errno-name (ex-data t))))
+      (finally (adapter/stop-server s1)))))
+
+;; X-Forwarded-For is written by the client and appended to by each proxy, so
+;; the left end is forgeable and the right end is not. ring's own middleware
+;; takes the leftmost; Igropyr takes the Nth from the right, where N is a
+;; deployment fact the operator states.
+(defn test-trusted-proxy-addr []
+  (let [seen (atom nil)
+        h    (fn [req] (reset! seen (select-keys req [:remote-addr :ring-chez/peer-addr]))
+               {:status 200 :headers {"Content-Type" "text/plain"}
+                :body (str (:remote-addr req))})
+        server (adapter/run-server
+                 (proxy/wrap-forwarded-remote-addr h {:trust-proxy 1}) {:port 8556})]
+    (try
+      (Thread/sleep 250)
+      ;; one trusted hop: take what OUR edge proxy saw, not what the client claimed
+      (let [r (http/get "http://127.0.0.1:8556/"
+                        {:headers {"X-Forwarded-For" "9.9.9.9, 10.0.0.9"}})]
+        (check "proxy: takes the entry the trusted hop saw" "10.0.0.9" (:body r))
+        (check "proxy: peer address kept" "127.0.0.1" (:ring-chez/peer-addr @seen)))
+      ;; a client forging a whole chain cannot move the trusted position
+      (let [r (http/get "http://127.0.0.1:8556/"
+                        {:headers {"X-Forwarded-For" "1.1.1.1, 2.2.2.2, 3.3.3.3, 10.0.0.9"}})]
+        (check "proxy: forged chain cannot move the pick" "10.0.0.9" (:body r)))
+      ;; fewer entries than declared hops: fall back to the peer, never to a
+      ;; client-supplied value
+      (let [r (http/get "http://127.0.0.1:8556/" {:headers {"X-Forwarded-For" ""}})]
+        (check "proxy: empty header falls back to peer" "127.0.0.1" (:body r)))
+      (finally (adapter/stop-server server))))
+  ;; trust nothing by default
+  (let [h (fn [req] {:status 200 :headers {"Content-Type" "text/plain"}
+                     :body (str (:remote-addr req))})
+        server (adapter/run-server (proxy/wrap-forwarded-remote-addr h) {:port 8557})]
+    (try
+      (Thread/sleep 250)
+      (let [r (http/get "http://127.0.0.1:8557/" {:headers {"X-Forwarded-For" "9.9.9.9"}})]
+        (check "proxy: trust-proxy 0 ignores the header" "127.0.0.1" (:body r)))
+      (finally (adapter/stop-server server))))
+  ;; and the picker itself, at the boundaries
+  (check "proxy: nth-from-right 1" "c" (proxy/nth-from-right "a, b, c" 1))
+  (check "proxy: nth-from-right 3" "a" (proxy/nth-from-right "a, b, c" 3))
+  (check "proxy: nth-from-right past the end" nil (proxy/nth-from-right "a, b" 3))
+  (check "proxy: nth-from-right of nothing" nil (proxy/nth-from-right nil 1)))
 
 ;; --- Wave 2 round 5: static files -------------------------------------------------
 
@@ -3258,6 +3330,10 @@
   (test-ws-guard-throw-is-request-failure)
   (test-write-timeout-cuts-stalled-peer)
   (test-write-timeout-zero-disables)
+
+  ;; --- Wave 2 round 6: reuse-port and trusted-proxy addressing ---
+  (test-reuse-port)
+  (test-trusted-proxy-addr)
 
   ;; --- Wave 2 round 5: static files ---
   (test-static-serves)

@@ -99,6 +99,11 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
   genuinely stuck handler trips it. It bounds handler *execution*, not the
   response: a handler that returns a channel and streams for an hour is
   untouched.
+- `:reuse-port` (default false) — bind with `SO_REUSEPORT`, so several
+  processes can listen on the same port and the kernel spreads new connections
+  across them (Linux; the BSDs allow the bind without the balancing). Off by
+  default because a second bind failing is how you find out a server is already
+  running.
 - `:write-timeout-ms` (default 30000, `0` disables) — `SO_SNDTIMEO` on every
   blocking send; a peer that stops draining mid-response gets the connection
   abandoned (truncated body = close) instead of pinning a worker forever.
@@ -360,6 +365,36 @@ the `..` check), dotfiles are refused except `.well-known`, and symlinks out of
 the root are refused via `toRealPath`. A miss, an unsafe path, or any method
 other than GET/HEAD falls through to the wrapped handler, so a traversal
 attempt cannot tell a 403 from a 404.
+
+### `:remote-addr` behind a proxy
+
+`X-Forwarded-For` is written by the client and appended to by each proxy, so
+its left end is forgeable and its right end is not.
+`ring.middleware.proxy-headers/wrap-forwarded-remote-addr` takes the *leftmost*
+entry — so an allow-list or rate limiter keyed on `:remote-addr` behind it can
+be pointed anywhere by sending a header.
+
+`ring-chez.middleware.proxy` takes Igropyr's approach instead: how many proxies
+of yours append to that header is a deployment fact you state, and the address
+taken is that many entries from the **right**.
+
+```clojure
+(require '[ring-chez.middleware.proxy :as proxy])
+(def app (proxy/wrap-forwarded-remote-addr handler {:trust-proxy 1}))
+
+;; X-Forwarded-For: 1.2.3.4, 10.0.0.9, 10.0.0.1
+;;   :trust-proxy 0  => the peer address (default: trust nothing)
+;;   :trust-proxy 1  => 10.0.0.9   — what your edge actually observed
+;;   :trust-proxy 2  => 1.2.3.4
+```
+
+A client can prepend as many entries as it likes without moving the one that is
+picked. Fewer entries than declared hops falls back to the connection's peer
+address, never to a client-supplied value, and that peer address stays on the
+request as `:ring-chez/peer-addr`.
+
+This is exactly as safe as the count is true: pointed at a deployment with no
+proxy, `:trust-proxy 1` hands the client control of its own address.
 
 ## Streaming responses
 
