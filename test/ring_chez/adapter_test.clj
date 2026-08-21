@@ -747,11 +747,19 @@
   ;; more keep-alive connections than workers: every connection must still be
   ;; answered. Without pressure-retirement the first conns pin all workers
   ;; idle and the rest starve until the client times out (the ab -k -c 100 stall)
+  ;;
+  ;; The read timeout is generous on purpose. What is asserted is fairness, not
+  ;; latency: retiring an idle connection under pressure waits out a 2s grace
+  ;; period first (never instantly, or a client mid-reuse races a reset), so
+  ;; with 3 connections queued behind 2 workers the last one can legitimately
+  ;; wait several seconds on a loaded machine. At 5s that tipped over on CI and
+  ;; read as starvation. Real starvation still fails this: without retirement
+  ;; the queued connections wait out the full 60s keep-alive timeout.
   (let [server (adapter/run-server handler {:port 8427 :worker-threads 2
                                             :keep-alive-timeout-ms 60000})]
     (Thread/sleep 250)
     (try
-      (let [fds (mapv (fn [_] (client-connect 8427 5000)) (range 5))]
+      (let [fds (mapv (fn [_] (client-connect 8427 20000)) (range 5))]
         (Thread/sleep 600)                     ; let the acceptor hand off / park
         (doseq [fd fds]
           (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n"))
