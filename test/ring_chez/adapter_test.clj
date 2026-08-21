@@ -89,8 +89,11 @@
         (cond
           (pos? sent) (recur (+ off sent))
           (and (neg? sent) (or (poller/eintr?) (poller/eagain?))) (recur off)
-          :else (throw (ex-info "client send failed"
-                                {:sent sent :offset off :length n})))))))
+          :else (throw (ex-info (str "client send failed: errno " (ffi/errno)
+                                     " " (ffi/errno-message (ffi/errno)))
+                                {:sent sent :offset off :length n
+                                 :errno (ffi/errno)
+                                 :errno-message (ffi/errno-message (ffi/errno))})))))))
 
 (defn client-send [fd ^String s]
   (let [buf (ffi/alloc (max 1 (* 4 (count s))))
@@ -290,9 +293,14 @@
         (if (str/includes? (latin1 acc) needle)
           acc
           (let [n (t-recv fd buf 65536 0)]
-            (if (pos? n)
-              (recur (bcat acc (ffi/read-array buf n)))
-              acc))))
+            (cond
+              (pos? n) (recur (bcat acc (ffi/read-array buf n)))
+              ;; EINTR is not the end of the response — same reasoning as
+              ;; client-recv-raw. Returning acc here gave callers a partial (or
+              ;; empty) response that reads as the server having answered
+              ;; nothing: `uri: /a/b -> /a/b — no "..." in ""` was this.
+              (and (neg? n) (poller/eintr?)) (recur acc)
+              :else acc))))
       (finally (ffi/free buf)))))
 
 (defn client-recv-until

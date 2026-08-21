@@ -101,8 +101,25 @@
 ;; asked for. The PORT decides, not the value: a handler that legitimately
 ;; returns nil delivers [nil ch], which is the nil-response path, not a
 ;; timeout (Igropyr stuck-ms; RFC-0009).
+(defn- blocking-recv!
+  "One recv on a blocking socket, retrying a signal.
+
+  EINTR is not the peer going away, and read-request cannot tell the
+  difference: at the start of a request a non-positive return is :closed —
+  the connection is dropped with no response — and mid-request it is :bad, a
+  400 on a request that was fine. fiber-recv! and send-window! have always
+  retried it; these paths did not, and the disagreement was the bug.
+
+  EAGAIN is deliberately NOT retried: with SO_RCVTIMEO that is the idle
+  timeout firing, which is exactly what read-request should read as a peer
+  that stopped talking."
+  [conn buf]
+  (loop []
+    (let [n (socket/c-recv conn buf socket/bufsize 0)]
+      (if (and (neg? n) (poller/eintr?)) (recur) n))))
+
 (def ^:private threads-io
-  {:recv! (fn [conn buf] (socket/c-recv conn buf socket/bufsize 0))
+  {:recv! blocking-recv!
    :take! (fn [ch] (async/<!! ch))
    :run!  (fn [f] (f))
    :run-timed! (fn [f ms]
@@ -200,7 +217,10 @@
             (cond
               (and (pos? rc)
                    (pos? (bit-and (socket/pollfd-revents pfds) socket/poll-readable)))
-              (socket/c-recv conn buf socket/bufsize 0)
+              ;; poll said readable, but the recv that follows can still be
+              ;; interrupted — and a signal here would retire a live
+              ;; connection, since the caller reads non-positive as gone
+              (blocking-recv! conn buf)
 
               (and (neg? rc) (poller/eintr?)) (recur)
               (neg? rc) 0

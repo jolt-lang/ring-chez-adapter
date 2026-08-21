@@ -335,14 +335,23 @@
   true)
 
 (defn- fill!
-  "One recv into the session buffer; false at EOF or on a read timeout."
+  "One recv into the session buffer; false at EOF or on a read timeout.
+
+  EINTR retries. Treating a signal as EOF ends a live session — the frame
+  reader answers :close, the session function returns, and the adapter closes
+  a connection whose peer is still there, whose next frame then hits EPIPE.
+  A read timeout (EAGAIN under SO_RCVTIMEO) still ends it: that is the idle
+  peer being reaped, which is what the timeout is for."
   [session]
   (let [fbuf (ffi/alloc recv-bufsize)]
     (try
-      (let [got (c-recv (:fd session) fbuf recv-bufsize 0)]
-        (when (pos? got)
-          (ib-append! (:buf session) (ffi/read-array fbuf got))
-          true))
+      (loop []
+        (let [got (c-recv (:fd session) fbuf recv-bufsize 0)]
+          (cond
+            (pos? got) (do (ib-append! (:buf session) (ffi/read-array fbuf got))
+                           true)
+            (and (neg? got) (poller/eintr?)) (recur)
+            :else nil)))
       (finally (ffi/free fbuf)))))
 
 (defn- next-frame!
