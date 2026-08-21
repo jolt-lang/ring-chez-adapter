@@ -146,13 +146,11 @@
             acc
             (let [n (t-recv fd buf 65536 0)]
               (cond (pos? n)  (recur (bcat acc (ffi/read-array buf n)))
-                    (zero? n) (do (when (zero? (alength acc))
-                                    ;; the peer closed having sent nothing. Say
-                                    ;; so: a check that reports only "" cannot
-                                    ;; be told from a timeout, and the two mean
-                                    ;; opposite things about who went away.
-                                    (println "  [recv: clean EOF, no bytes, fd" fd "]"))
-                                  acc)
+                    ;; a clean EOF with nothing read is "" — which is what
+                    ;; several tests assert, so it is not worth announcing.
+                    ;; An errno below is: that one distinguishes a peer that
+                    ;; went away from a read that failed for another reason.
+                    (zero? n) acc
                     ;; a signal is not the peer going away, and the three
                     ;; ways a recv can answer non-positive mean opposite
                     ;; things. Conflating them is what made `client-recv`
