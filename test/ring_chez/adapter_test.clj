@@ -1941,9 +1941,16 @@
 ;; Igropyr kills a worker stuck past stuck-ms and answers through on-failure.
 ;; We cannot kill a thread, but we can stop waiting for one: the client is
 ;; answered 503 and the worker goes back to serving (RFC-0009).
+(def spin-unwound (atom nil))
+
 (defn- deadline-handler [{:keys [uri]}]
   (cond
     (= uri "/hang")  (do @(promise) {:status 200 :body "never"})
+    ;; a COMPUTE hang, distinct from /hang's wait: the deadline's interrupt
+    ;; fires on reduction back-edges, so this loop unwinds (and the finally
+    ;; observes it) while a parked wait only unwinds when it wakes
+    (= uri "/spin")  (try (loop [] (recur))
+                          (finally (reset! spin-unwound :unwound)))
     (= uri "/slow")  (do (Thread/sleep 700)
                          {:status 200 :headers {"Content-Type" "text/plain"} :body "slow done"})
     (= uri "/throw-late") (do (Thread/sleep 600) (throw (ex-info "late" {})))
@@ -2009,6 +2016,25 @@
         (check "deadline: off by default" 200 (:status r))
         (check-has "deadline: default runs the handler to completion" "slow done" (:body r)))
       (finally (adapter/stop-server dflt)))))
+
+;; the deadline does not just stop waiting: it interrupts the abandoned
+;; handler, so a compute-stuck one unwinds — its finally runs and its thread
+;; terminates — instead of spinning forever
+(defn test-handler-deadline-interrupts []
+  (reset! spin-unwound nil)
+  (let [server (adapter/run-server deadline-handler {:port 8560 :handler-timeout-ms 300})]
+    (try
+      (Thread/sleep 250)
+      (check "deadline: compute-stuck handler answers 503" 503
+             (:status (http/get "http://127.0.0.1:8560/spin" {:throw-exceptions false})))
+      (let [t0 (System/currentTimeMillis)]
+        (loop []
+          (when (and (nil? @spin-unwound)
+                     (< (- (System/currentTimeMillis) t0) 5000))
+            (Thread/sleep 50)
+            (recur))))
+      (check "deadline: the abandoned handler unwound (finally ran)" :unwound @spin-unwound)
+      (finally (adapter/stop-server server)))))
 
 ;; a channel body is returned immediately and streams for longer than the
 ;; deadline — the deadline covers handler execution, not the stream
@@ -3566,6 +3592,7 @@
   (run-test "test-handler-deadline-threads" test-handler-deadline-threads)
   (run-test "test-handler-deadline-fibers" test-handler-deadline-fibers)
   (run-test "test-handler-deadline-bounds" test-handler-deadline-bounds)
+  (run-test "test-handler-deadline-interrupts" test-handler-deadline-interrupts)
   (run-test "test-handler-deadline-spares-streams" test-handler-deadline-spares-streams)
   (run-test "test-handler-deadline-hook" test-handler-deadline-hook)
   (run-test "test-fault-handler-envelope" test-fault-handler-envelope)

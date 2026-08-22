@@ -87,18 +87,25 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
 
   **It costs throughput on `:threads`.** A handler cannot be abandoned from its
   own stack, so enforcing a deadline means running it on another thread — a
-  handoff per request, measured at 15-25% (`ab -n 20000 -k /plaintext`: 8840 →
-  7112 rps at c=10, 8370 → 6611 at c=100). Under `:fibers` the handler is
+  handoff per request, measured at 14-16% (`ab -n 20000 -k /plaintext`: 9854 →
+  8434 rps at c=10, 9368 → 7853 at c=100; arming the interrupt that reclaims
+  the thread adds nothing measurable on top). Under `:fibers` the handler is
   already on a thread and the deadline measures free, so turn it on there
-  without hesitating. On `:threads` it is a trade: pay ~20% against a failure
+  without hesitating. On `:threads` it is a trade: pay ~15% against a failure
   mode you may never hit, or leave it off and make sure your handlers can't
   hang (client timeouts on everything they call).
 
-  Whatever you set, the abandoned handler's *thread* is not reclaimed — jolt
-  has no safe thread kill — so keep the value generous enough that only a
-  genuinely stuck handler trips it. It bounds handler *execution*, not the
-  response: a handler that returns a channel and streams for an hour is
-  untouched.
+  Whatever you set, a handler that trips the deadline is not merely
+  abandoned: the adapter fires jolt's cooperative interrupt at it, and the
+  handler unwinds at its next reduction — `finally` blocks run, a catch-all
+  cannot swallow the escape (a continuation jump, not a throw), and the
+  thread is reclaimed. *Cooperative* is the operative word: a compute-stuck
+  handler unwinds promptly, while one blocked in a foreign call or a wait —
+  an upstream socket read, a channel take, a promise deref — only observes
+  the interrupt when that call returns to Scheme, and holds its thread until
+  then. So still keep the value generous enough that only a genuinely stuck
+  handler trips it. It bounds handler *execution*, not the response: a
+  handler that returns a channel and streams for an hour is untouched.
 - `:reuse-port` (default false) — bind with `SO_REUSEPORT`, so several
   processes can listen on the same port and the kernel spreads new connections
   across them (Linux; the BSDs allow the bind without the balancing). Off by
@@ -351,8 +358,9 @@ middleware is a no-op: uncompressed is always a correct answer.
 every request — and it decides containment with `getCanonicalPath`, which
 through jolt 0.7.19 does not resolve symlinks (measured: it only absolutizes),
 so a symlink planted inside a served root hands out whatever it points at.
-(Fixed upstream in [jolt#693](https://github.com/jolt-lang/jolt/pull/693); this
-middleware uses `toRealPath`, which is correct on every version.)
+(Fixed in [jolt#693](https://github.com/jolt-lang/jolt/pull/693), released in
+jolt 0.7.20; this middleware uses `toRealPath`, which is correct on every
+version.)
 
 `ring-chez.middleware.static` is Igropyr's static cache in Ring's shape:
 
@@ -494,7 +502,7 @@ requests go to the Ring handler as usual.
 ## Test
 
 ```bash
-jolt -M:test   # 509 checks over raw sockets + http-client, plus the parser suite's 103
+jolt -M:test   # 511 checks over raw sockets + http-client, plus the parser suite's 103
 ```
 
 ## License

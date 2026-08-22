@@ -97,6 +97,7 @@
 ;; thread, and run-timed! runs the Ring handler under a deadline.
 
 (def ^:private timed-out ::timeout)
+(def ^:private interrupted ::interrupted)
 
 ;; The handler cannot be abandoned from its own stack, so a deadline means
 ;; running it elsewhere and giving up on the channel — which is why ms of 0
@@ -104,6 +105,25 @@
 ;; asked for. The PORT decides, not the value: a handler that legitimately
 ;; returns nil delivers [nil ch], which is the nil-response path, not a
 ;; timeout (Igropyr stuck-ms; RFC-0009).
+;;
+;; Giving up on the channel is not the end of the stuck handler: the deadline
+;; also fires jolt.host/interrupt! on the token this wrapper armed, and jolt's
+;; timer-based cooperative interrupt unwinds the handler at its next reduction
+;; — the escape is a continuation jump, so a catch-all inside the handler
+;; cannot swallow it, while its finally blocks still run — and the thread
+;; terminates instead of spinning forever. Cooperative has one edge: a handler
+;; blocked inside a foreign call or a wait (an upstream socket read, a channel
+;; take) only observes the interrupt when that call returns to Scheme, so a
+;; thread can outlive its deadline by however long that blocking call takes.
+(defn- run-interruptible*
+  "Run f under jolt's cooperative interrupt; the deadline's interrupt! makes
+  it answer ::interrupted (nobody reads that — the response already went out
+  through the timeout path) instead of killing the thread's channel with a
+  throw. f catches Throwable itself, so only the interrupt escapes it."
+  [tok f]
+  (try (jolt.host/run-interruptible tok f)
+       (catch Exception e
+         (if (:jolt/interrupted (ex-data e)) interrupted (throw e)))))
 (defn- blocking-recv!
   "One recv on a blocking socket, retrying a signal.
 
@@ -134,9 +154,12 @@
    :run-timed! (fn [f ms]
                  (if (zero? ms)
                    (f)
-                   (let [ch (async/thread (f))
+                   (let [tok (jolt.host/make-interrupt)
+                         ch (async/thread (run-interruptible* tok f))
                          [v p] (async/alts!! [ch (async/timeout ms)])]
-                     (if (= p ch) v timed-out))))})
+                     (if (= p ch)
+                       v
+                       (do (jolt.host/interrupt! tok) timed-out)))))})
 
 (defn- fiber-recv!
   "One recv for a fiber-held conn — the stdlib socket.io-call contract: EINTR
@@ -197,13 +220,16 @@
      :run!  (fn [f] (async/<! (async/thread (f))))
      ;; the handler is already on a thread here, so the deadline is only an
      ;; alts! away — the fiber stops waiting, and the fd, the fiber and the
-     ;; connection come back
+     ;; connection come back; the interrupt reclaims the handler's thread too
      :run-timed! (fn [f ms]
-                   (let [ch (async/thread (f))]
-                     (if (zero? ms)
-                       (async/<! ch)
-                       (let [[v p] (async/alts! [ch (async/timeout ms)])]
-                         (if (= p ch) v timed-out)))))}))
+                   (if (zero? ms)
+                     (async/<! (async/thread (f)))
+                     (let [tok (jolt.host/make-interrupt)
+                           ch (async/thread (run-interruptible* tok f))
+                           [v p] (async/alts! [ch (async/timeout ms)])]
+                       (if (= p ch)
+                         v
+                         (do (jolt.host/interrupt! tok) timed-out)))))}))
 
 (defn- idle-poll-recv!
   "First read of the next request on an idle keep-alive connection (threads
@@ -446,10 +472,12 @@
                                     {:status 500})))
                           handler-timeout-ms)
                      resp (cond
-                            ;; abandoned past :handler-timeout-ms: the thread
-                            ;; runs on, but nothing waits for it and the
-                            ;; connection is usable again (Igropyr stuck-ms,
-                            ;; whose supervisor kills the worker outright)
+                            ;; past :handler-timeout-ms: nothing waits for the
+                            ;; handler, the connection is usable again, and the
+                            ;; interrupt run-timed! fired unwinds the handler
+                            ;; at its next reduction so its thread is reclaimed
+                            ;; (Igropyr stuck-ms kills the worker outright;
+                            ;; jolt's interrupt is the cooperative equivalent)
                             (= timed-out ran)
                             (let [info {:kind :timeout
                                         :elapsed-ms (- (System/currentTimeMillis) started)}
