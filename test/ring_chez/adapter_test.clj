@@ -2133,7 +2133,8 @@
 (defn- serves-only-own-conns [strategy base]
   (let [rounds 16
         conns  8
-        bad    (atom [])]
+        bad    (atom [])
+        silent (atom [])]
     (dotimes [i rounds]
       (let [pa (+ base (* 2 (mod i 8)))
             pb (inc pa)
@@ -2157,20 +2158,40 @@
                                     {:port pb :strategy strategy})]
           (try
             (Thread/sleep 60)
-            (let [fds (doall (for [_ (range conns)] (client-connect pb 2000)))]
+            (let [fds (doall (for [_ (range conns)] (client-connect pb 5000)))]
               (doseq [fd fds]
                 (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n"))
               (doseq [fd fds]
-                (let [r (or (client-recv fd) "")]
-                  (when-not (str/includes? r tb)
+                (let [r (client-recv fd)]
+                  (cond
+                    ;; nil is a read that timed out, "" a peer that closed
+                    ;; without answering. Neither is a cross-serve: that is a
+                    ;; response which ARRIVED carrying another server's token.
+                    ;; `(or ... "")` used to fold the three together, so a read
+                    ;; that came back empty was reported as a stopped server
+                    ;; answering somebody else's connection — CI failed exactly
+                    ;; that way, with :got "".
+                    (str/blank? r)
+                    (swap! silent conj {:round i :recv (if (nil? r) :timeout :closed)})
+
+                    (not (str/includes? r tb))
                     (swap! bad conj {:round i :wanted tb
                                      :got (subs r 0 (min 120 (count r)))}))))
               (doseq [fd fds] (client-close fd)))
             (finally (adapter/stop-server b))))))
     (doseq [b (take 3 @bad)]
       (println "  [cross-serve:" (pr-str b) "]"))
+    (doseq [s (take 3 @silent)]
+      (println "  [no response:" (pr-str s) "]"))
     (check (str (name strategy) " isolation: no conn served by a stopped server")
-           0 (count @bad))))
+           0 (count @bad))
+    ;; Still a failure, just its own one: a live server that never answers a
+    ;; well-formed request is a bug too — an owner from the stopped server
+    ;; closing an fd number the new acceptor was just handed would look like
+    ;; this — but it is not the bug the check above names. 5s of client budget
+    ;; keeps a slow runner from reading as one.
+    (check (str (name strategy) " isolation: every conn answered")
+           0 (count @silent))))
 
 (defn test-serves-only-own-conns-fibers []
   (serves-only-own-conns :fibers 8600))

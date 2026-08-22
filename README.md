@@ -494,7 +494,7 @@ requests go to the Ring handler as usual.
 ## Test
 
 ```bash
-jolt -M:test   # 507 checks over raw sockets + http-client, plus the parser suite's 103
+jolt -M:test   # 509 checks over raw sockets + http-client, plus the parser suite's 103
 ```
 
 ## License
