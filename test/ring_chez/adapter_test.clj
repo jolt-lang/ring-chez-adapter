@@ -3,6 +3,8 @@
             [ring-chez.sse :as sse]
             [ring-chez.fault :as fault]
             [ring-chez.middleware.multipart :as multipart]
+            [ring-chez.multipart-test]
+            [clojure.test :as ct]
             [ring-chez.middleware.gzip :as gzip]
             [ring-chez.middleware.static :as static]
             [ring-chez.middleware.proxy :as proxy]
@@ -3426,6 +3428,14 @@
          (swap! failures inc)
          (println "  FAIL" nm "— threw" (str t)))))
 
+;; The multipart parser came in from jolt-lang/multipart with its own
+;; clojure.test suite, kept verbatim rather than retyped into check/check-has.
+;; Fold its counts into this runner's so one failing assertion still fails the
+;; run.
+(defn run-parser-suite []
+  (let [{:keys [fail error]} (ct/run-tests 'ring-chez.multipart-test)]
+    (swap! failures + fail error)))
+
 (defn -main [& _]
   (println "ring adapter over jolt.ffi sockets")
 
@@ -3525,6 +3535,7 @@
   (run-test "test-gzip-etag" test-gzip-etag)
 
   ;; --- Wave 2 round 3: multipart uploads ---
+  (run-test "ring-chez.multipart parser suite" run-parser-suite)
   (run-test "test-multipart-upload" test-multipart-upload)
   (run-test "test-multipart-large-chunked" test-multipart-large-chunked)
   (run-test "test-multipart-truncated" test-multipart-truncated)

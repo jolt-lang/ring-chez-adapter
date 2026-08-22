@@ -279,8 +279,8 @@ a JVM library; this repo ships those.
 `ring.middleware.multipart-params` is written against Apache
 commons-fileupload, so it cannot load under jolt and a Ring stack here has no
 way to accept a file upload. `ring-chez.middleware.multipart` is the same
-middleware over [jolt-lang/multipart](https://github.com/jolt-lang/multipart),
-an RFC 7578 parser in pure Clojure:
+middleware over `ring-chez.multipart.core`, an RFC 7578 parser in pure Clojure
+that ships with this repo:
 
 ```clojure
 (require '[ring-chez.middleware.multipart :as multipart])
@@ -300,6 +300,17 @@ specifies. A text field's value is a string; an upload is
 
 There is no temp-file store: the parser buffers in memory, so bound uploads
 with `:max-request-bytes` rather than assuming a large one spools to disk.
+
+The parser underneath is `ring-chez.multipart.core`, and it is public: call it
+directly to stream a body chunk by chunk (`make-parser` / `parse-chunk` /
+`parse-stream`), or to read a part's `:charset` and `:headerlist`, which the
+Ring shape drops.
+
+```clojure
+(require '[ring-chez.multipart.core :as mp])
+
+(mp/parse-form-data request)   ; => {:params {"user" "alice"} :files {"doc" {...}}}
+```
 
 ### gzip
 
@@ -483,5 +494,11 @@ requests go to the Ring handler as usual.
 ## Test
 
 ```bash
-jolt -M:test   # 386 checks; drives the server over raw sockets + http-client
+jolt -M:test   # 507 checks over raw sockets + http-client, plus the parser suite's 103
 ```
+
+## License
+
+EPL-2.0, except `src/ring_chez/multipart/`, which is a port of
+[defnull/multipart](https://github.com/defnull/multipart) and stays under
+Apache-2.0 — see `LICENSE-multipart`.
