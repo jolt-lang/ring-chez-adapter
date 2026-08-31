@@ -67,15 +67,15 @@
            src-buf (ffi/alloc (max 1 n))
            out-buf (ffi/alloc CHUNK)]
        (try
-         (dotimes [i ZS] (ffi/write strm :uint8 i 0))
+         (dotimes [i ZS] (ffi/write strm :uint8 0 i))
          (ffi/write-array src-buf src)
-         (ffi/write strm :pointer O-next-in src-buf)
-         (ffi/write strm :uint O-avail-in n)
+         (ffi/write strm :pointer src-buf O-next-in)
+         (ffi/write strm :uint n O-avail-in)
          (when-not (zero? (deflate-init strm level 8 GZIP-WINDOW-BITS 8 0 (version) ZS))
            (throw (ex-info "zlib: deflateInit2 failed" {:level level})))
          (let [chunks (loop [acc []]
-                        (ffi/write strm :pointer O-next-out out-buf)
-                        (ffi/write strm :uint O-avail-out CHUNK)
+                        (ffi/write strm :pointer out-buf O-next-out)
+                        (ffi/write strm :uint CHUNK O-avail-out)
                         (let [r        (deflate strm Z-FINISH)
                               produced (- CHUNK (ffi/read strm :uint O-avail-out))
                               acc      (if (pos? produced)

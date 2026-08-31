@@ -22,23 +22,23 @@
 
 (defn- sockaddr [port]
   (let [sa (ffi/alloc 16)]
-    (dotimes [i 16] (ffi/write sa :uint8 i 0))
+    (dotimes [i 16] (ffi/write sa :uint8 0 i))
     (if macos?
-      (do (ffi/write sa :uint8 0 16) (ffi/write sa :uint8 1 2))
-      (ffi/write sa :uint8 0 2))
-    (ffi/write sa :uint8 2 (bit-and (bit-shift-right port 8) 0xff))
-    (ffi/write sa :uint8 3 (bit-and port 0xff))
-    (ffi/write sa :uint8 4 127) (ffi/write sa :uint8 5 0)
-    (ffi/write sa :uint8 6 0)   (ffi/write sa :uint8 7 1)
+      (do (ffi/write sa :uint8 16 0) (ffi/write sa :uint8 2 1))
+      (ffi/write sa :uint8 2 0))
+    (ffi/write sa :uint8 (bit-and (bit-shift-right port 8) 0xff) 2)
+    (ffi/write sa :uint8 (bit-and port 0xff) 3)
+    (ffi/write sa :uint8 127 4) (ffi/write sa :uint8 0 5)
+    (ffi/write sa :uint8 0 6)   (ffi/write sa :uint8 1 7)
     sa))
 
 (defn- set-rcvtimeo! [fd ms]
   (let [tv (ffi/alloc 16)]
-    (dotimes [i 16] (ffi/write tv :uint8 i 0))
-    (ffi/write tv :uint64 0 (quot ms 1000))
+    (dotimes [i 16] (ffi/write tv :uint8 0 i))
+    (ffi/write tv :uint64 (quot ms 1000) 0)
     (if macos?
-      (ffi/write tv :uint 8 (long (rem ms 1000)))
-      (ffi/write tv :uint64 8 (long (rem ms 1000))))
+      (ffi/write tv :uint (long (rem ms 1000)) 8)
+      (ffi/write tv :uint64 (long (rem ms 1000)) 8))
     (t-setsockopt fd sol-socket so-rcvtimeo tv 16)
     (ffi/free tv)))
 

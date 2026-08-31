@@ -41,7 +41,7 @@
   (let [[sa salen] (socket/alloc-peer-sockaddr)]
     (try
       (loop [backoff 0]
-        (ffi/write salen :int 0 socket/sockaddr-size)
+        (ffi/write salen :int socket/sockaddr-size 0)
         (let [conn (socket/c-accept listen-fd sa salen)]
           (cond
             ;; already stopped: nobody downstream will ever see this fd, so
