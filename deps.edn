@@ -1,4 +1,9 @@
-{:paths ["src"]
+{;; jolt.ffi/write takes the value BEFORE the offset as of jolt 0.8.0, and the
+ ;; two spellings are both integers — an older runtime writes to the wrong
+ ;; place rather than failing. Declare the floor so it refuses instead.
+ :jolt/min-version "0.8.0"
+
+ :paths ["src"]
 
  ;; The server binds BSD sockets (socket/bind/listen/accept/recv/send) directly
  ;; over jolt.ffi. Those live in the C standard library, reached through the

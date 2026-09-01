@@ -53,10 +53,10 @@
   POLLWRBAND 0x200, POLLMSG 0x400). One of those set turns every poll on a
   writable socket into an instant wake."
   [pfds fd events]
-  (dotimes [i pollfd-size] (ffi/write pfds :uint8 i 0))
-  (ffi/write pfds :int 0 fd)
-  (ffi/write pfds :uint8 4 (bit-and 0xff events))
-  (ffi/write pfds :uint8 5 (bit-and 0xff (bit-shift-right events 8))))
+  (dotimes [i pollfd-size] (ffi/write pfds :uint8 0 i))
+  (ffi/write pfds :int fd 0)
+  (ffi/write pfds :uint8 (bit-and 0xff events) 4)
+  (ffi/write pfds :uint8 (bit-and 0xff (bit-shift-right events 8)) 5))
 
 (defn pollfd-revents
   "What poll actually reported. Acting on the return count alone treats a wake
@@ -96,12 +96,12 @@
 ;; the connection in ~1ms, :write-timeout-ms 500 became a 500µs send timeout.
 ;; Only multiples of 1000 came out right, which is why the defaults hid it.
 (defn- write-timeval! [tv ms]
-  (dotimes [i 16] (ffi/write tv :uint8 i 0))
-  (ffi/write tv :uint64 0 (quot ms 1000))
+  (dotimes [i 16] (ffi/write tv :uint8 0 i))
+  (ffi/write tv :uint64 (quot ms 1000) 0)
   (let [usec (* 1000 (rem ms 1000))]
     (if macos?
-      (ffi/write tv :uint 8 usec)
-      (ffi/write tv :uint64 8 usec))))
+      (ffi/write tv :uint usec 8)
+      (ffi/write tv :uint64 usec 8))))
 
 (defn set-rcvtimeo! [fd ms]
   (let [tv (ffi/alloc 16)]
@@ -138,8 +138,8 @@
 ;; (little-endian, so byte0 = AF_INET).
 (defn- write-family! [sa]
   (if macos?
-    (do (ffi/write sa :uint8 0 16) (ffi/write sa :uint8 1 AF-INET))
-    (ffi/write sa :uint8 0 AF-INET)))
+    (do (ffi/write sa :uint8 16 0) (ffi/write sa :uint8 AF-INET 1))
+    (ffi/write sa :uint8 AF-INET 0)))
 
 (defn ipv4->octets
   "The four octets of a dotted-quad host, or nil if the platform's inet_pton
@@ -150,9 +150,9 @@
     (let [src (ffi/alloc (inc (count host)))
           dst (ffi/alloc 4)]
       (try
-        (dotimes [i (inc (count host))] (ffi/write src :uint8 i 0))
+        (dotimes [i (inc (count host))] (ffi/write src :uint8 0 i))
         (ffi/write-bytes src host)          ; the zero fill leaves it NUL-terminated
-        (dotimes [i 4] (ffi/write dst :uint8 i 0))
+        (dotimes [i 4] (ffi/write dst :uint8 0 i))
         (when (= 1 (c-inet-pton AF-INET src dst))
           (mapv #(ffi/read dst :uint8 %) (range 4)))
         (finally (ffi/free src) (ffi/free dst))))))
@@ -165,11 +165,11 @@
                                    {:key :host :given host
                                     :expected "an IPv4 address"})))
         sa (ffi/alloc 16)]
-    (dotimes [i 16] (ffi/write sa :uint8 i 0))
+    (dotimes [i 16] (ffi/write sa :uint8 0 i))
     (write-family! sa)
-    (ffi/write sa :uint8 2 (bit-and (bit-shift-right port 8) 0xff))   ; port hi (network order)
-    (ffi/write sa :uint8 3 (bit-and port 0xff))                       ; port lo
-    (dotimes [i 4] (ffi/write sa :uint8 (+ 4 i) (nth octets i)))
+    (ffi/write sa :uint8 (bit-and (bit-shift-right port 8) 0xff) 2)   ; port hi (network order)
+    (ffi/write sa :uint8 (bit-and port 0xff) 3)                       ; port lo
+    (dotimes [i 4] (ffi/write sa :uint8 (nth octets i) (+ 4 i)))
     sa))
 
 (defn peer-ip
@@ -188,15 +188,15 @@
   []
   (let [sa (ffi/alloc sockaddr-size)
         len (ffi/alloc 4)]
-    (dotimes [i sockaddr-size] (ffi/write sa :uint8 i 0))
-    (ffi/write len :int 0 sockaddr-size)
+    (dotimes [i sockaddr-size] (ffi/write sa :uint8 0 i))
+    (ffi/write len :int sockaddr-size 0)
     [sa len]))
 
 (defn- setsockopt-flag!
   "Set one boolean socket option, or throw with the errno behind it."
   [fd opt-name opt-const]
   (let [opt (ffi/alloc 4)]
-    (ffi/write opt :int 0 1)
+    (ffi/write opt :int 1 0)
     (try
       (when (neg? (c-setsockopt fd sol-socket opt-const opt 4))
         (let [e (errno-info)]

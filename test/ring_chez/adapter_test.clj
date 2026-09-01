@@ -34,24 +34,24 @@
 
 (defn- t-sockaddr [port]
   (let [sa (ffi/alloc 16)]
-    (dotimes [i 16] (ffi/write sa :uint8 i 0))
+    (dotimes [i 16] (ffi/write sa :uint8 0 i))
     (if t-macos?
-      (do (ffi/write sa :uint8 0 16) (ffi/write sa :uint8 1 2))
-      (ffi/write sa :uint8 0 2))
-    (ffi/write sa :uint8 2 (bit-and (bit-shift-right port 8) 0xff))
-    (ffi/write sa :uint8 3 (bit-and port 0xff))
-    (ffi/write sa :uint8 4 127) (ffi/write sa :uint8 5 0)
-    (ffi/write sa :uint8 6 0)   (ffi/write sa :uint8 7 1)
+      (do (ffi/write sa :uint8 16 0) (ffi/write sa :uint8 2 1))
+      (ffi/write sa :uint8 2 0))
+    (ffi/write sa :uint8 (bit-and (bit-shift-right port 8) 0xff) 2)
+    (ffi/write sa :uint8 (bit-and port 0xff) 3)
+    (ffi/write sa :uint8 127 4) (ffi/write sa :uint8 0 5)
+    (ffi/write sa :uint8 0 6)   (ffi/write sa :uint8 1 7)
     sa))
 
 (defn- t-set-rcvtimeo! [fd ms]
   ;; struct timeval: tv_sec (8 bytes), tv_usec (4 bytes macOS / 8 linux)
   (let [tv (ffi/alloc 16)]
-    (dotimes [i 16] (ffi/write tv :uint8 i 0))
-    (ffi/write tv :uint64 0 (quot ms 1000))
+    (dotimes [i 16] (ffi/write tv :uint8 0 i))
+    (ffi/write tv :uint64 (quot ms 1000) 0)
     (if t-macos?
-      (ffi/write tv :uint 8 (long (rem ms 1000)))
-      (ffi/write tv :uint64 8 (long (rem ms 1000))))
+      (ffi/write tv :uint (long (rem ms 1000)) 8)
+      (ffi/write tv :uint64 (long (rem ms 1000)) 8))
     (let [r (t-setsockopt fd t-sol-socket t-so-rcvtimeo tv 16)]
       (ffi/free tv)
       r)))
@@ -204,7 +204,7 @@
 
 (defn t-send-bytes [fd bs]
   (let [n (count bs) buf (ffi/alloc (max 1 n))]
-    (doseq [[i b] (map-indexed vector bs)] (ffi/write buf :uint8 i b))
+    (doseq [[i b] (map-indexed vector bs)] (ffi/write buf :uint8 b i))
     (try (send-buf! fd buf n)
          (finally (ffi/free buf)))))
 
@@ -1299,7 +1299,7 @@
   (let [fd (t-socket 2 1 0)
         so-rcvbuf (if t-macos? 0x1002 8)
         v (ffi/alloc 4)]
-    (ffi/write v :int 0 2048)
+    (ffi/write v :int 2048 0)
     (t-setsockopt fd t-sol-socket so-rcvbuf v 4)
     (ffi/free v)
     (t-set-rcvtimeo! fd rcvtimeo-ms)
@@ -2792,10 +2792,10 @@
   ;; of these, and reading it is what replaced the hardcoded "127.0.0.1"
   (let [sa (ffi/alloc 16)]
     (try
-      (dotimes [i 16] (ffi/write sa :uint8 i 0))
+      (dotimes [i 16] (ffi/write sa :uint8 0 i))
       (doseq [[a b c d] [[127 0 0 1] [10 1 2 3] [192 168 250 17] [255 255 255 255]]]
-        (ffi/write sa :uint8 4 a) (ffi/write sa :uint8 5 b)
-        (ffi/write sa :uint8 6 c) (ffi/write sa :uint8 7 d)
+        (ffi/write sa :uint8 a 4) (ffi/write sa :uint8 b 5)
+        (ffi/write sa :uint8 c 6) (ffi/write sa :uint8 d 7)
         (check (str "peer-ip: " a "." b "." c "." d)
                (str a "." b "." c "." d) (socket/peer-ip sa)))
       (finally (ffi/free sa)))))
