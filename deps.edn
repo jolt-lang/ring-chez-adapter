@@ -16,7 +16,7 @@
  ;; javax.crypto — just has to (require 'jolt.crypto); no separate dep. It's not
  ;; required here, so a plain adapter server doesn't pull in OpenSSL.
  :deps {jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/jolt-crypto"
-                               :git/sha "584a4d32094f0a72613d028deb944de00cd9fc11"}}
+                               :git/sha "44da69bad08a2fd7631bd4061e3fb53938dafff6"}}
 
  ;; The test drives the server with the jolt-lang/http-client library (jolt no
  ;; longer ships a built-in HTTP client). v0.0.4 or newer matters here: earlier
