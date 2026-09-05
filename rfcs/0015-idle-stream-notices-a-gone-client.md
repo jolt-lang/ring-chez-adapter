@@ -102,7 +102,9 @@ Three tests cover it, run under both strategies where it matters:
 
 ## Note on the test dependency
 
-The suite could not run at all on jolt 0.8.1: its `http-client` pin (v0.0.5)
-raises `UnknownHostException` for every host, `127.0.0.1` included, before it
-reaches a socket. The pin moves to a current sha, which resolves again. This is
-a test-only dependency; nothing in `src/` uses it.
+The suite could not run at all while the `http-client` pin was v0.0.5: on jolt
+0.8.1 that release raises `UnknownHostException` for every host, `127.0.0.1`
+included, before it reaches a socket — it writes sockaddr bytes with the
+pre-0.8.0 `ffi/write` argument order. v0.0.6 carries the fix, and main had
+already moved the pin there. This is a test-only dependency; nothing in `src/`
+uses it.

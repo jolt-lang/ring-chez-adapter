@@ -16,20 +16,22 @@
  ;; javax.crypto — just has to (require 'jolt.crypto); no separate dep. It's not
  ;; required here, so a plain adapter server doesn't pull in OpenSSL.
  :deps {jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/jolt-crypto"
-                               :git/sha "0adae49db6064180374ffdcfc72b5b9ac01888cd"}}
+                               :git/sha "44da69bad08a2fd7631bd4061e3fb53938dafff6"}}
 
  ;; The test drives the server with the jolt-lang/http-client library (jolt no
  ;; longer ships a built-in HTTP client). v0.0.4 or newer matters here: earlier
  ;; versions replace java.io.ByteArrayInputStream process-wide with a shim, so
  ;; the SUITE's request bodies (not an app's — this dep is test-only) were a
- ;; stream ~1300x slower to drain and without .readAllBytes. Past v0.0.5,
- ;; because on jolt 0.8.1 that release resolves no host at all -- every request
- ;; in the suite, including "http://127.0.0.1:8399/", raises
- ;; UnknownHostException before it reaches a socket.
+ ;; stream ~1300x slower to drain and without .readAllBytes. Past v0.0.5 too: on
+ ;; jolt 0.8.1 that release resolves no host at all -- every request in the
+ ;; suite, "http://127.0.0.1:8399/" included, raises UnknownHostException
+ ;; before it reaches a socket, because it writes sockaddr bytes with the
+ ;; pre-0.8.0 ffi/write argument order. v0.0.6 carries that fix.
   :aliases {:test {:extra-paths ["test"]
                    :extra-deps {jolt-lang/http-client
                                 {:git/url "https://github.com/jolt-lang/http-client"
-                                :git/sha "f0c675da0a6c8230952f72d834847ccdb5a3a59e"}}
+                                :git/tag "v0.0.6"
+                                :git/sha "177b1ce4e529ffe052e6a1b7b103ed924de535f6"}}
                    :main-opts ["-m" "ring-chez.adapter-test"]}
            :bench {:extra-paths ["test"]
                    :main-opts ["-m" "ring-chez.bench"]}}
