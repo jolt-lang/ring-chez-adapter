@@ -147,9 +147,22 @@
     (let [n (socket/c-recv conn buf socket/bufsize 0)]
       (if (and (neg? n) (poller/eintr?)) (recur) n))))
 
+(def ^:private stream-idle-check-ms
+  "How often a streaming response with nothing to send asks whether its client
+  is still there. One poll(2) per idle stream per second — the cost of not
+  holding a worker, an fd and an application's producer for a client that has
+  been gone since the last chunk."
+  1000)
+
 (def ^:private threads-io
   {:recv! blocking-recv!
-   :take! (fn [ch] (async/<!! ch))
+   :take! (fn [ch conn]
+            (loop []
+              (let [[v p] (async/alts!! [ch (async/timeout stream-idle-check-ms)])]
+                (cond
+                  (= p ch)                 v
+                  (socket/peer-gone? conn) http/peer-gone
+                  :else                    (recur)))))
    :run!  (fn [f] (f))
    :run-timed! (fn [f ms]
                  (if (zero? ms)
@@ -216,7 +229,13 @@
      :send! (fn [c s]
               (try (http/send-all c s (fn [] (arm-write!) (poller/wait-ready c :write)))
                    (finally (suspend!))))
-     :take! (fn [ch] (async/<! ch))
+     :take! (fn [ch c]
+              (loop []
+                (let [[v p] (async/alts! [ch (async/timeout stream-idle-check-ms)])]
+                  (cond
+                    (= p ch)              v
+                    (socket/peer-gone? c) http/peer-gone
+                    :else                 (recur)))))
      :run!  (fn [f] (async/<! (async/thread (f))))
      ;; the handler is already on a thread here, so the deadline is only an
      ;; alts! away — the fiber stops waiting, and the fd, the fiber and the

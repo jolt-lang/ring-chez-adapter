@@ -244,3 +244,47 @@
     fd)))
 
 (def bufsize 65536)
+
+(def ^:private MSG-PEEK
+  "recv(2)'s MSG_PEEK — 0x2 on Linux, macOS and the BSDs alike."
+  0x2)
+
+(defn peer-gone?
+  "True when the far end of fd has closed. Consumes nothing if it has not.
+
+  This is what lets a response that is streaming notice a client that walked
+  away while the application had nothing to send: without it, a stream only
+  finds out at its next write, and a stream whose application is quiet never
+  finds out at all.
+
+  poll(2) with a zero timeout answers immediately. A hangup or error is
+  conclusive; readability is not, because a peer may equally have pipelined
+  its next request, so readability is settled by a PEEKING recv — end of
+  stream reports 0, and real bytes stay queued for the reader they belong to.
+  EINTR is not an answer either way, so it asks again."
+  [fd]
+  (let [pfds (ffi/alloc pollfd-size)
+        buf  (ffi/alloc 1)]
+    (try
+      (init-pollfd! pfds fd POLLIN)
+      (loop []
+        (let [rc (c-poll pfds 1 0)]
+          (cond
+            (zero? rc) false
+            (neg? rc)  (if (poller/eintr?) (recur) true)
+
+            (pos? (bit-and (pollfd-revents pfds)
+                           (bit-or POLLERR POLLHUP POLLNVAL)))
+            true
+
+            (pos? (bit-and (pollfd-revents pfds) POLLIN))
+            (let [n (c-recv fd buf 1 MSG-PEEK)]
+              (cond
+                (zero? n) true                              ; orderly shutdown
+                (pos? n)  false                             ; the peer is talking
+                :else     (if (poller/eintr?) (recur) false)))
+
+            :else false)))
+      (finally
+        (ffi/free pfds)
+        (ffi/free buf)))))

@@ -22,7 +22,11 @@
  ;; longer ships a built-in HTTP client). v0.0.4 or newer matters here: earlier
  ;; versions replace java.io.ByteArrayInputStream process-wide with a shim, so
  ;; the SUITE's request bodies (not an app's — this dep is test-only) were a
- ;; stream ~1300x slower to drain and without .readAllBytes.
+ ;; stream ~1300x slower to drain and without .readAllBytes. Past v0.0.5 too: on
+ ;; jolt 0.8.1 that release resolves no host at all -- every request in the
+ ;; suite, "http://127.0.0.1:8399/" included, raises UnknownHostException
+ ;; before it reaches a socket, because it writes sockaddr bytes with the
+ ;; pre-0.8.0 ffi/write argument order. v0.0.6 carries that fix.
   :aliases {:test {:extra-paths ["test"]
                    :extra-deps {jolt-lang/http-client
                                 {:git/url "https://github.com/jolt-lang/http-client"

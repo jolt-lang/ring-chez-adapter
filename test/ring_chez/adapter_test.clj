@@ -367,6 +367,7 @@
         (println "  FAIL" label "— no" (pr-str needle) "in" (pr-str haystack)))))
 
 (def stream-abort-noticed (atom false))
+(def idle-stream-channel (atom nil))
 
 (defn handler [{:keys [uri request-method query-string headers]}]
   (cond
@@ -391,6 +392,13 @@
             (recur (inc i))))
         (reset! stream-abort-noticed true)
         (a/close! ch))
+      {:status 200 :headers {"Content-Type" "text/plain"} :body ch})
+    (= uri "/stream-idle")
+    ;; one chunk, then silence: the application has nothing more to say for
+    ;; now, which is the normal state of an SSE stream between events
+    (let [ch (a/chan)]
+      (a/put! ch "first")
+      (reset! idle-stream-channel ch)
       {:status 200 :headers {"Content-Type" "text/plain"} :body ch})
     (= uri "/stream-204")
     (let [ch (a/chan)]
@@ -636,6 +644,63 @@
       ;; server still healthy afterwards
       (let [r (http/get "http://127.0.0.1:8409/")]
         (check "abort: server still serves" 200 (:status r)))
+      (finally (adapter/stop-server server)))))
+
+(defn test-stream-idle-client-disconnect-reclaims []
+  ;; A stream that is quiet cannot learn about its client from a failed write,
+  ;; because there is no write. With one worker, a single such connection used
+  ;; to take the whole server down with it.
+  (let [server (adapter/run-server handler {:port 8425 :worker-threads 1})]
+    (try
+      (Thread/sleep 250)
+      (reset! idle-stream-channel nil)
+      (let [fd (client-connect 8425 5000)]
+        (client-send fd "GET /stream-idle HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "idle stream: first chunk arrived" "first" (client-recv-until fd "first"))
+        (client-close fd)                     ; go away, and stay quiet
+        (Thread/sleep 2500)
+        (check "idle stream: adapter closed the body channel" false
+               (a/put! @idle-stream-channel "nobody is listening")))
+      ;; the worker is back: with :worker-threads 1 this only answers if the
+      ;; abandoned stream let go
+      (let [r (http/get "http://127.0.0.1:8425/")]
+        (check "idle stream: the only worker was reclaimed" 200 (:status r)))
+      (finally (adapter/stop-server server)))))
+
+(defn test-stream-idle-client-disconnect-reclaims-fibers []
+  (let [server (adapter/run-server handler {:port 8426 :strategy :fibers})]
+    (try
+      (Thread/sleep 250)
+      (reset! idle-stream-channel nil)
+      (let [fd (client-connect 8426 5000)]
+        (client-send fd "GET /stream-idle HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "idle stream (fibers): first chunk arrived" "first" (client-recv-until fd "first"))
+        (client-close fd)
+        (Thread/sleep 2500)
+        (check "idle stream (fibers): adapter closed the body channel" false
+               (a/put! @idle-stream-channel "nobody is listening")))
+      (let [r (http/get "http://127.0.0.1:8426/")]
+        (check "idle stream (fibers): server still serves" 200 (:status r)))
+      (finally (adapter/stop-server server)))))
+
+(defn test-stream-pipelined-request-is-not-a-disconnect []
+  ;; readability is not the same as a hangup: a client that pipelines its next
+  ;; request while a stream is running must not have the stream torn down
+  (let [server (adapter/run-server handler {:port 8427 :worker-threads 2})]
+    (try
+      (Thread/sleep 250)
+      (reset! idle-stream-channel nil)
+      (let [fd (client-connect 8427 5000)]
+        (client-send fd "GET /stream-idle HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "pipelined: first chunk arrived" "first" (client-recv-until fd "first"))
+        ;; send the next request without reading the rest of this response
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (Thread/sleep 2500)
+        (check "pipelined: stream still open" true
+               (a/put! @idle-stream-channel "second"))
+        (check-has "pipelined: and the chunk still arrives" "second"
+                   (client-recv-until fd "second"))
+        (client-close fd))
       (finally (adapter/stop-server server)))))
 
 (defn test-stream-http10-close-delimited []
@@ -3523,6 +3588,9 @@
   ;; --- Phase 3 ---
   (run-test "test-stream-chunked" test-stream-chunked)
   (run-test "test-stream-client-disconnect-aborts" test-stream-client-disconnect-aborts)
+  (run-test "test-stream-idle-client-disconnect-reclaims" test-stream-idle-client-disconnect-reclaims)
+  (run-test "test-stream-idle-client-disconnect-reclaims-fibers" test-stream-idle-client-disconnect-reclaims-fibers)
+  (run-test "test-stream-pipelined-request-is-not-a-disconnect" test-stream-pipelined-request-is-not-a-disconnect)
   (run-test "test-stream-http10-close-delimited" test-stream-http10-close-delimited)
   (run-test "test-stream-204-no-framing" test-stream-204-no-framing)
 
