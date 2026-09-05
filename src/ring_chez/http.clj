@@ -757,19 +757,30 @@
   [^bytes bs]
   [(str (format "%x" (alength bs)) "\r\n") bs "\r\n"])
 
+(def peer-gone
+  "What a strategy's take! answers when the client disappeared while it waited
+  for the application's next chunk."
+  ::peer-gone)
+
 (defn- stream-body
   "Pump a channel body onto conn: chunked framing for HTTP/1.1, raw bytes for
   HTTP/1.0 (close-delimited; caller closes). take! abstracts the channel take
-  (blocking on worker threads, parking inside fibers); send! likewise (plain
-  send-all on blocking sockets, parking on writability inside fibers). True
-  when the stream finished cleanly (terminator sent); false when the client
-  went away — the channel is then closed so a parked producer's put returns
-  false instead of hanging."
+  (blocking on worker threads, parking inside fibers, and answering
+  `peer-gone` when the client went away first); send! likewise (plain send-all
+  on blocking sockets, parking on writability inside fibers). True when the
+  stream finished cleanly (terminator sent); false when the client went away —
+  the channel is then closed so a parked producer's put returns false instead
+  of hanging, and so an application that is simply quiet stops being told to
+  produce for nobody."
   [conn ch http10? take! send!]
   (loop []
-    (let [v (take! ch)
-          bs (when (some? v) (chunk->bytes v))]
+    (let [v (take! ch conn)
+          bs (when (and (some? v) (not= peer-gone v)) (chunk->bytes v))]
       (cond
+        ;; the client left while we waited: nothing to send, nothing to frame
+        (= peer-gone v)
+        (do (async/close! ch) false)
+
         ;; closed, or an empty chunk: end of stream. (an empty chunk carries no
         ;; data and would frame as a bogus terminator)
         (or (nil? bs) (zero? (alength bs)))
