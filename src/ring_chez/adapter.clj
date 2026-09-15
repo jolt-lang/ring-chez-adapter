@@ -29,10 +29,13 @@
 ;; syscall on it. See conn-down!.
 
 ;; --- the accept loop --------------------------------------------------------
-;; Clean shutdown: stop-server shutdown()s the listen fd (SHUT_RDWR), which
-;; wakes the acceptor parked in accept() on both Linux and macOS (close()
-;; alone does NOT wake it on Linux), then closes it; the loop sees `running?`
-;; false and exits instead of spinning on the dead fd.
+;; Clean shutdown: stop-server ends the acceptor and WAITS for it before it
+;; frees the listen fd's number — see stop-server for the two platform halves
+;; of the wake-up. The loop sees `running?` false, or a failing accept() on a
+;; socket that no longer listens, and exits instead of spinning on the dead
+;; fd. It never closes the listen fd itself: the number is freed by
+;; stop-server once this thread has provably stopped using it, under the same
+;; rule conn-down! applies to a connection.
 (defn- serve-loop
   "Accept forever, handing each connection and its peer address to serve!.
   accept() fills the sockaddr, which is where :remote-addr comes from — it
@@ -804,7 +807,10 @@
       (if (= :fibers strategy)
         (let [conns (atom #{})   ; live conn entries; sweeper + stop sweep them
               sweep (start-sweeper! conns stats)]
-          (future (serve-loop fd running?
+          {:socket fd :port port :host host :running running? :conns conns :sweep sweep
+           :handler handler-box :ws-handler ws-handler-box :stats stats
+           :acceptor
+           (future (serve-loop fd running?
                               (fn [conn peer]
                                 (poller/nonblock! conn)
                                 (swap! (:open stats) inc)
@@ -823,9 +829,7 @@
                                     (fiber-serve (assoc base-info :remote-addr peer)
                                                  cfg entry conns)
                                     (when (claim-close! entry)
-                                      (conn-release! conns entry stats)))))))
-          {:socket fd :port port :host host :running running? :conns conns :sweep sweep
-           :handler handler-box :ws-handler ws-handler-box :stats stats})
+                                      (conn-release! conns entry stats)))))))})
         (let [work  (async/chan)  ; unbuffered: acceptor parks when all workers busy
               conns (atom #{})    ; live conn entries; the stop sweep closes them
               pending (atom 0)    ; conns accepted but not yet claimed by a worker
@@ -841,7 +845,10 @@
                          ;; the recv contract (n>0 data, 0 closed/retire).
                          :idle-recv! #(idle-poll-recv! %1 %2 ka-ms pending))]
            (dotimes [_ n] (async/thread (worker base-info cfg io work conns)))
-          (future (serve-loop fd running?
+          {:socket fd :port port :host host :running running? :work work :conns conns
+           :handler handler-box :ws-handler ws-handler-box :stats stats
+           :acceptor
+           (future (serve-loop fd running?
                               (fn [conn peer]
                                 (swap! pending inc)
                                 (swap! (:open stats) inc)
@@ -854,9 +861,7 @@
                                   (when-not (and @running? (async/>!! work entry))
                                     (swap! pending dec)
                                     (when (claim-close! entry)
-                                      (conn-release! conns entry stats)))))))
-          {:socket fd :port port :host host :running running? :work work :conns conns
-           :handler handler-box :ws-handler ws-handler-box :stats stats})))))
+                                      (conn-release! conns entry stats)))))))})))))
 
 (defn swap-handler!
   "Point a running server at a new Ring handler (Igropyr http-swap!). Takes
@@ -911,9 +916,26 @@
   process-global and never stops, so a parked fiber is released only by
   forget! resuming it (the woken read sees EOF).
 
-  shutdown(SHUT_RDWR) before close() is required on Linux: close() alone
-  leaves the acceptor parked in accept() holding the port binding, so
-  rebinding the same port fails with EADDRINUSE."
+  The listen fd's NUMBER is freed last, after the acceptor thread has exited.
+  It used to be closed before the acceptor was known to be done with it, and
+  an acceptor that had handed a connection off and not yet re-entered accept()
+  — a preemption or a collection is enough — then called accept() on a number
+  the next run-server's socket() had already taken as its own listener. It won
+  that listener's first connection, read its own running? as false and closed
+  the fd unread: the client saw EOF with no header. So the socket is ended in
+  place and the acceptor waited for; the number is closed once nothing can
+  syscall on it, and the port is free when this returns.
+
+  Ending it in place takes two calls because the platforms disagree.
+  shutdown(SHUT_RDWR) on a listening socket wakes a parked accept() on Linux
+  (EINVAL, and every accept() after it fails the same way) but is ENOTCONN
+  and does nothing on macOS, where close() is what wakes accept() — and
+  close() is the very thing that frees the number. dup2(/dev/null) over the
+  fd is the portable move: it drops the listener's last reference — which on
+  macOS drains the parked accept() (ECONNABORTED) — while the number keeps
+  naming an open file, so an accept() the acceptor makes later is ENOTSOCK
+  rather than a call on somebody else's socket. Linux does not drain a
+  syscall on dup2, hence the shutdown first."
   ([server] (stop-server server nil))
   ([server {:keys [drain-timeout-ms] :or {drain-timeout-ms 5000}}]
   (reset! (:running server) false)
@@ -941,6 +963,17 @@
     ;; a worker that took the same conn.
     (doseq [entry @conns]
       (when (claim-close! entry) (conn-release! conns entry (:stats server)))))
-  (socket/c-shutdown (:socket server) 2)        ; SHUT_RDWR: wake parked accept()
-  (socket/c-close (:socket server))
+  (let [fd (:socket server)]
+    (socket/c-shutdown fd 2)                    ; Linux: wakes and fails accept(); macOS: ENOTCONN
+    (let [reserved? (not (neg? (socket/c-dup2 @socket/devnull-fd fd)))] ; both: the number is ours until the close below
+      ;; Every accept() from here fails at once, so the wait is bounded by the
+      ;; acceptor's own backoff (<= 100ms) plus scheduling; the timeout guards
+      ;; against a runtime fault. An acceptor still alive past it may yet
+      ;; syscall on the number, so the number is left reserved rather than
+      ;; freed — the safe side of the race, at the cost of one /dev/null fd.
+      (let [acceptor (:acceptor server)
+            exited?  (or (nil? acceptor)
+                         (not= ::timeout (deref acceptor drain-timeout-ms ::timeout)))]
+        (when (or exited? (not reserved?))
+          (socket/c-close fd)))))
   nil))

@@ -2001,6 +2001,39 @@
         (check "multipart passthrough: no :multipart-params" nil (:multipart-params @seen)))
       (finally (adapter/stop-server server)))))
 
+;; stop-server used to close the listen fd itself and return without waiting
+;; for the acceptor thread. An acceptor that had just handed a connection off
+;; and not yet re-entered accept() — a preemption or a collection is enough —
+;; then called accept() on a freed fd NUMBER, and the next run-server's
+;; socket() had already taken that number for its own listener. The stale
+;; acceptor won the race for the new server's first connection, read its own
+;; running? as false and closed the fd unread: the client saw EOF with no
+;; header. Seen once in CI on the test above this one; reproduced here by
+;; holding the acceptor between two accepts for longer than the stop and the
+;; next start take together.
+(defn test-stale-acceptor-does-not-take-the-next-servers-connection []
+  (let [real-accept socket/c-accept
+        gap (atom 0)]
+    (with-redefs [socket/c-accept (fn [fd sa salen]
+                                    (when (pos? @gap) (Thread/sleep @gap))
+                                    (real-accept fd sa salen))]
+      (dotimes [i 8]
+        (let [a (adapter/run-server handler {:port 8561})]
+          (Thread/sleep 50)
+          ;; the acceptor is parked in accept() already; from here on every
+          ;; accept it makes waits 30ms first
+          (reset! gap 30)
+          (http/get "http://127.0.0.1:8561/")
+          (adapter/stop-server a)
+          (let [b (adapter/run-server handler {:port 8562})]
+            (try
+              (Thread/sleep 100)
+              (let [r (try (http/get "http://127.0.0.1:8562/")
+                           (catch Throwable t {:error (str t)}))]
+                (check (str "stale acceptor " i ": the next server answers its first connection")
+                       200 (:status r)))
+              (finally (reset! gap 0) (adapter/stop-server b)))))))))
+
 ;; --- Wave 2 round 2: handler deadline --------------------------------------------
 
 ;; Igropyr kills a worker stuck past stuck-ms and answers through on-failure.
@@ -3655,6 +3688,8 @@
   (run-test "test-multipart-large-chunked" test-multipart-large-chunked)
   (run-test "test-multipart-truncated" test-multipart-truncated)
   (run-test "test-multipart-passthrough" test-multipart-passthrough)
+  (run-test "test-stale-acceptor-does-not-take-the-next-servers-connection"
+            test-stale-acceptor-does-not-take-the-next-servers-connection)
 
   ;; --- Wave 2 round 2: handler deadline ---
   (run-test "test-handler-deadline-threads" test-handler-deadline-threads)
