@@ -18,6 +18,15 @@
 (ffi/defcfn c-close      "close"      [:int] :int)
 (ffi/defcfn c-shutdown   "shutdown"   [:int :int] :int)
 (ffi/defcfn c-accept     "accept"     [:int :pointer :pointer] :int :blocking)
+(ffi/defcfn c-dup2       "dup2"       [:int :int] :int)
+(ffi/defcfn c-open       "open"       [:string :int] :int)
+;; One /dev/null for the process, opened on first use: stop-server dup2()s it
+;; over a listen fd to end the listener without freeing the fd's NUMBER (see
+;; stop-server). O_RDWR is 2 on every platform this runs on.
+(def devnull-fd (delay (let [fd (c-open "/dev/null" 2)]
+                         (when (neg? fd)
+                           (throw (ex-info "open(/dev/null) failed" {:errno (ffi/errno)})))
+                         fd)))
 (ffi/defcfn c-recv       "recv"       [:int :pointer :size_t :int] :ssize_t :blocking)
 (ffi/defcfn c-send       "send"       [:int :pointer :size_t :int] :ssize_t :blocking)
 ;; threads-strategy idle reads wait in poll(2) slices (see run-server's
