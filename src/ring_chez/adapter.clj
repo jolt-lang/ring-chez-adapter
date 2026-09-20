@@ -39,8 +39,10 @@
   "Record and report a fault that is the SERVER's rather than a request's:
   something thrown where no response can carry it and no caller is left to
   catch it — the accept loop, a worker's take/claim/release, a fiber's
-  teardown. :on-failure is not the hook for these, because it answers a
-  REQUEST and there is no request here.
+  teardown — or, for :unclaimed, a connection the accept handoff lost, where
+  nothing was thrown at all and the silence was the whole failure.
+  :on-failure is not the hook for these, because it answers a REQUEST and
+  there is no request here.
 
   Every one of them used to be silent, and silence is what made them
   expensive: a throw in the acceptor ended accepting, a throw in a worker's
@@ -596,6 +598,20 @@
                   (when reusable (recur (:leftover r)))))))
           :else nil))))))
 
+(def ^:private claim-deadline-ms
+  "How long a connection may sit registered but UNCLAIMED before the sweeper
+  gives up on it (see start-sweeper!). The clock starts only once somebody is
+  provably responsible for the conn — a worker has taken it off the work
+  channel, or the fiber has been spawned — so it never runs on a conn that is
+  merely queued behind a busy pool.
+
+  Five seconds is three orders of magnitude more than either handoff costs,
+  and a false reap is not worse than what it guards against: a conn nothing
+  has claimed in five seconds is one the client has already been waiting on
+  with no response, so closing it is the same answer, arrived at sooner and
+  with a fault to read afterwards."
+  5000)
+
 (defn- register-conn!
   "Enter one accepted connection in the server's live set. Registered at
   ACCEPT, not when a worker claims it: a conn still sitting in the work
@@ -604,12 +620,20 @@
 
   Teardown has three separate once-only steps, so three atoms: :down? the
   shutdown that wakes everyone off the fd, :owned? the claim on releasing
-  it, and :released? the close itself. See conn-down!."
+  it, and :released? the close itself. See conn-down!.
+
+  :claim-by is the deadline for somebody taking responsibility at all, armed
+  by whoever hands the conn on (see claim-deadline-ms) and no-deadline until
+  then; :pending? is this conn's own membership in the threads strategy's
+  accept-pressure count, so leaving that count is once-only per conn rather
+  than a bare decrement at each exit (see pending-done!)."
   [conns conn peer poller?]
   (let [entry (cond-> {:conn conn :peer peer
                        :down?     (atom false)
                        :owned?    (atom false)
-                       :released? (atom false)}
+                       :released? (atom false)
+                       :claim-by  (atom no-deadline)
+                       :pending?  (atom false)}
                 poller? (assoc :poller? true
                                ;; the sweeper's deadline; armed by fiber-io
                                :deadline (atom Long/MAX_VALUE)))]
@@ -646,6 +670,20 @@
   may already have released the number to another socket."
   [entry]
   (compare-and-set! (:owned? entry) false true))
+
+(defn- pending-done!
+  "Take one conn out of the threads strategy's accept-pressure count, exactly
+  once however it leaves: claimed by a worker, released by the acceptor
+  because it was never handed over, or reaped unclaimed by the sweeper.
+
+  Once-only per conn, and not a bare decrement at each of those places,
+  because a conn lost between the take and the claim used to leave the count
+  raised for the life of the server — and `pending` stuck above zero is
+  under-pressure? stuck true, which is keep-alive declined on every response
+  from then on."
+  [pending entry]
+  (when (compare-and-set! (:pending? entry) true false)
+    (swap! pending dec)))
 
 (defn- conn-release!
   "Release one conn's fd, exactly once, by whoever claimed it. Everything that
@@ -691,7 +729,7 @@
           ;; claim at take-time: pending then counts only conns accepted but not
           ;; yet claimed — decrementing in the acceptor after >!! leaves a window
           ;; where a claimed conn still reads as pressure and over-retires
-          ((io :claim!))
+          ((io :claim!) entry)
           ;; stop-server releases conns nobody claimed. If it got to this one
           ;; first, the fd number may already belong to another socket, so losing
           ;; the claim means leaving the fd alone entirely.
@@ -722,19 +760,39 @@
           (recur))))))
 
 (defn- start-sweeper!
-  "Fibers-strategy deadline enforcement (the counterpart of SO_RCVTIMEO on
-  the threads strategy): every 100ms, take conns whose deadline passed out of
-  service. conn-down! wakes the fiber parked on the fd (forget! resumes
-  registered waiters), so a parked read ends as :closed, not a hang — and the
-  fiber, not the sweeper, is what then frees the fd number.
+  "Every 100ms, take out of service the conns that have run out of time. Both
+  strategies run one; there are two deadlines and they are not the same thing.
+
+  A CONNECTION NOBODY EVER CLAIMED is the first, and it runs on both
+  strategies. The accept path registers a conn and then hands it on — onto the
+  work channel for a worker, or into a fiber-backed go block — and the whole
+  serving path hangs off the claim at the far end of that hop. A conn that is
+  handed on and never claimed is therefore served by nobody, closed by nobody
+  and reported by nobody: no guard is crossed, so no fault is recorded, and
+  because only an OWNER may free an fd number (see conn-down!) the fd is held
+  for the life of the process while the peer waits on a request that will
+  never be answered. Measured on macOS under plain-mode connect churn as one
+  connection in a few thousand, on both strategies, which is enough for ab to
+  abort a whole benchmark cell over a server that is otherwise healthy.
+
+  The sweeper is what closes that hole: past :claim-by it takes the claim
+  ITSELF — winning the same CAS a late worker or fiber would have to win, so
+  the two can never both serve the conn — releases the fd, and reports the
+  loss as a server-level fault. A late owner finds the claim gone and leaves
+  the conn alone, which is the rule everywhere else too.
+
+  A FIBER-HELD CONN PAST ITS IDLE DEADLINE is the second, and it is the
+  counterpart of SO_RCVTIMEO on the threads strategy. conn-down! wakes the
+  fiber parked on the fd (forget! resumes registered waiters), so a parked
+  read ends as :closed, not a hang — and the fiber, not the sweeper, is what
+  then frees the fd number.
 
   A tick that throws must not end the sweep, for the reason a fault must not
-  end a worker: this future is the ONLY thing enforcing a keep-alive deadline
-  on the fibers strategy, nothing restarts it, and nothing would have reported
-  it going away. Idle connections would then accumulate for the life of the
-  process, each holding an fd and a parked fiber, with the server looking
-  entirely healthy."
-  [conns stats fault!]
+  end a worker: this future is the only thing enforcing either deadline,
+  nothing restarts it, and nothing would have reported it going away. Idle
+  and dropped connections would then accumulate for the life of the process,
+  each holding an fd, with the server looking entirely healthy."
+  [conns stats fault! unpend!]
   (let [stop? (atom false)]
     (future
       (loop []
@@ -743,10 +801,21 @@
           (try
             (let [now (System/currentTimeMillis)]
               (doseq [e @conns]
-                (when (and (not @(e :down?)) (< @(e :deadline) now))
+                (cond
+                  ;; handed on, and still nobody's: the handoff lost it
+                  (and (not @(e :owned?)) (< @(e :claim-by) now))
+                  (when (claim-close! e)
+                    (unpend! e)
+                    (fault! :unclaimed
+                            (ex-info "connection accepted and handed on, but never claimed"
+                                     {:type :ring-chez/unclaimed-conn
+                                      :peer (:peer e)}))
+                    (conn-release! conns e stats))
+
                   ;; down, not released: the fiber that owns this conn is the
                   ;; only one allowed to free its fd number, and the shutdown
                   ;; here is what wakes it to do that
+                  (and (:poller? e) (not @(e :down?)) (< @(e :deadline) now))
                   (conn-down! e))))
             (catch Throwable t (fault! :sweeper t)))
           (recur))))
@@ -924,13 +993,14 @@
           running? (atom true)]
       (if (= :fibers strategy)
         (let [conns (atom #{})   ; live conn entries; sweeper + stop sweep them
-              sweep (start-sweeper! conns stats fault!)]
+              ;; nothing to un-count on this strategy: accept pressure and its
+              ;; keep-alive retirement are the fixed pool's problem
+              sweep (start-sweeper! conns stats fault! (fn [_]))]
           {:socket fd :port port :host host :running running? :conns conns :sweep sweep
            :handler handler-box :ws-handler ws-handler-box :stats stats
            :acceptor
            (future (serve-loop fd running?
                               (fn [conn peer]
-                                (poller/nonblock! conn)
                                 (swap! (:open stats) inc)
                                 ;; publish, THEN check — the order is the whole
                                 ;; interlock. stop-server clears running? before
@@ -943,13 +1013,29 @@
                                 ;; with nobody left to take it down: a stopped
                                 ;; server went on serving it, and its fd leaked.
                                 (let [entry (register-conn! conns conn peer true)]
+                                  ;; the spawn below is the handoff, and from
+                                  ;; here the conn is somebody's: a go block
+                                  ;; that never runs leaves it registered,
+                                  ;; unclaimed and unserved, which is the drop
+                                  ;; the sweeper reaps and reports
+                                  (reset! (:claim-by entry)
+                                          (+ (System/currentTimeMillis) claim-deadline-ms))
                                   (if @running?
                                     ;; the spawn, not the session: a throw here
                                     ;; means the go block never ran, so this
                                     ;; conn is still unclaimed and releasing it
                                     ;; is ours to do. A fault inside the
                                     ;; session is the fiber's (see fiber-serve).
-                                    (try (fiber-serve (assoc base-info :remote-addr peer)
+                                    ;;
+                                    ;; nonblock! is inside the guard, and it
+                                    ;; used to run before the conn was
+                                    ;; registered at all: a throw from it was
+                                    ;; then a connection nothing had a record
+                                    ;; of, so the fault said a conn was lost
+                                    ;; without leaving anything able to close
+                                    ;; it. Registered first, it is releasable.
+                                    (try (poller/nonblock! conn)
+                                         (fiber-serve (assoc base-info :remote-addr peer)
                                                       cfg entry conns)
                                          (catch Throwable t
                                            (fault! :spawn t)
@@ -961,9 +1047,13 @@
         (let [work  (async/chan)  ; unbuffered: acceptor parks when all workers busy
               conns (atom #{})    ; live conn entries; the stop sweep closes them
               pending (atom 0)    ; conns accepted but not yet claimed by a worker
+              ;; the claim backstop runs here too: >!! answers only once a
+              ;; worker has the conn, so a conn still unclaimed after that is
+              ;; one the take/claim hop lost, not one queued behind a busy pool
+              sweep (start-sweeper! conns stats fault! #(pending-done! pending %))
                io (assoc threads-io
                          :under-pressure? #(pos? @pending)
-                         :claim! #(swap! pending dec)
+                         :claim! #(pending-done! pending %)
                          ;; idle keep-alive first read: wait in poll(2) slices
                          ;; instead of parking a full ka-timeout recv. Enforces
                          ;; the ka deadline itself (poll has no timeout), and
@@ -974,11 +1064,10 @@
                          :idle-recv! #(idle-poll-recv! %1 %2 ka-ms pending))]
            (dotimes [_ n] (start-worker! base-info cfg io work conns running?))
           {:socket fd :port port :host host :running running? :work work :conns conns
-           :handler handler-box :ws-handler ws-handler-box :stats stats
+           :sweep sweep :handler handler-box :ws-handler ws-handler-box :stats stats
            :acceptor
            (future (serve-loop fd running?
                               (fn [conn peer]
-                                (swap! pending inc)
                                 (swap! (:open stats) inc)
                                 ;; publish, then check — see the fibers arm. The
                                 ;; put is part of the same condition: >!! answers
@@ -993,15 +1082,24 @@
                                 ;; a throw out of the release cannot take the
                                 ;; accept loop with it (see serve-loop).
                                 (let [entry (register-conn! conns conn peer false)
+                                      _ (do (reset! (:pending? entry) true)
+                                            (swap! pending inc))
                                       handed? (try (and @running? (async/>!! work entry))
                                                    (catch Throwable t
                                                      (fault! :handoff t)
                                                      false))]
-                                  (when-not handed?
-                                    (swap! pending dec)
-                                    (try (when (claim-close! entry)
-                                           (conn-release! conns entry stats))
-                                         (catch Throwable t (fault! :conn-release t))))))
+                                  (if handed?
+                                    ;; a worker has it — the rendezvous does not
+                                    ;; answer until one does — so from here an
+                                    ;; unclaimed conn is a lost one, not a
+                                    ;; queued one. Arm the backstop.
+                                    (reset! (:claim-by entry)
+                                            (+ (System/currentTimeMillis) claim-deadline-ms))
+                                    (do
+                                      (pending-done! pending entry)
+                                      (try (when (claim-close! entry)
+                                             (conn-release! conns entry stats))
+                                           (catch Throwable t (fault! :conn-release t)))))))
                               fault!))})))))
 
 (defn swap-handler!
@@ -1031,8 +1129,9 @@
      :requests @requests
      ;; server-level faults, not request failures (:on-failure has those):
      ;; anything thrown in the accept loop, a worker's take/claim/release or a
-     ;; fiber's teardown. Nonzero means something the server recovered from
-     ;; happened where nothing could report it to a caller — see make-fault!.
+     ;; fiber's teardown, plus :unclaimed — a connection the accept handoff
+     ;; lost. Nonzero means something the server recovered from happened where
+     ;; nothing could report it to a caller — see make-fault!.
      :faults (if faults @faults 0)
      :last-fault (when last-fault @last-fault)
      :uptime-ms (- (System/currentTimeMillis) started)}))
