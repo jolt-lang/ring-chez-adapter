@@ -124,12 +124,16 @@ connection already served and closed (the full ~5k TIME_WAIT) — while ab
 sits parked in `kevent` at 0% CPU for the remainder of its 30 s, then
 aborts the whole run. A raw-socket python client (same 5000×10 plain
 workload, no ab) completes 5000/5000 in 0.7 s against both strategies —
-until, across repeated fresh-server runs, it reproduces the drop the ab
-runs were reporting: **exactly one accepted connection in ~5000 (roughly 2
-in 5 runs) never gets served** — connect succeeds, the request never
-answered, the client times out after 5 s, and the connection freezes as
-one `CLOSE_WAIT` on the server (client side `FIN_WAIT_2`): nobody ever
-recv'd, polled, or shut it down. One dropped connection is the whole
+and across repeated fresh-server runs it reproduces the drop the ab
+runs were reporting: **an accepted connection very occasionally never
+gets served** — connect succeeds, the request never answered, the client
+times out after 5 s, and the connection freezes as one `CLOSE_WAIT` on
+the server (client side `FIN_WAIT_2`): nobody ever recv'd, polled, or
+shut it down. Observed counts this session, classified per connection:
+fibers 1 drop in 7 fresh-server runs, threads 2 drops in 3 runs (the
+shipped probe, `benchmark/probes/`); too few runs to pin a rate — call it
+intermittent, one to two drops per handful of fresh servers, always
+exactly one conn per failing run. One dropped connection is the whole
 finding: ab aborts its entire run over it, which is why a whole `plain`
 cell reports `AB-FAILED`/`~165 req/s` while every other client and every
 other cell sees a healthy server. The drop reproduced on BOTH strategies
