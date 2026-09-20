@@ -43,7 +43,10 @@ connection on its own, and says which of the three answers it got: every
 connection served (the server was healthy throughout and ab aborted over
 something only ab saw), a connection accepted and never answered (a real
 drop), or only connects that never landed (the client's port table, not the
-server). `DIAGNOSE=0` skips it.
+server). The probe is capped by `AB_TIMEOUT` like the ab run itself, and
+hitting that cap is the fourth answer: the server stopped answering this
+client too, which is the real stall a dropped connection is not. `DIAGNOSE=0`
+skips the whole step.
 
 ## Probes
 

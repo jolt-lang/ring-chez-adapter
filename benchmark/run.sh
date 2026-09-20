@@ -79,12 +79,19 @@ diagnose() { # port mode
     fi
   fi
   if [ "$mode" = "plain" ] && [ -x "$PROBE" ] && command -v python3 >/dev/null 2>&1; then
-    probe="$(PORT="$port" N="$N" C=10 python3 "$PROBE" 2>&1)" && rc=0 || rc=$?
+    # capped like every ab run, and for a sharper reason: against the wedged
+    # server this is here to rule out, every connection waits out its own
+    # TIMEOUT before the next one starts, so an uncapped probe costs
+    # N/C * TIMEOUT — nearly three hours at the default N — and the diagnosis
+    # of one failed cell hangs the rest of the matrix behind it.
+    probe="$(PORT="$port" N="$N" C=10 timeout "$AB_TIMEOUT" python3 "$PROBE" 2>&1)" && rc=0 || rc=$?
     result="$(grep "^RESULT" <<<"$probe" || tail -1 <<<"$probe")"
     case "${rc:-0}" in
       0) verdict="the server served every connection; ab aborted on its own";;
       1) verdict="connections really were accepted and never answered";;
       2) verdict="only connects failed — the CLIENT ran out of 4-tuples, not a server fault";;
+      124) result="no completion within ${AB_TIMEOUT}s"
+           verdict="the server stopped answering this client too — a real stall, not one dropped conn";;
       *) verdict="the probe itself failed to run";;
     esac
     printf '%22s non-ab probe: %s -> %s\n' "" "$result" "$verdict"
