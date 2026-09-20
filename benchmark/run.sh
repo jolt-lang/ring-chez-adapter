@@ -30,9 +30,13 @@ C_LIST="${C_LIST:-10 100}"
 AB_TIMEOUT="${AB_TIMEOUT:-90}"   # per-run cap; a stalled run is reported as TIMEOUT
 
 LABEL="chez-${STRATEGY}${WORKERS:+-$WORKERS}"
-UNDERTOW_LOG="$(mktemp -t undertow-bench)"
-JETTY_LOG="$(mktemp -t jetty-bench)"
-CHEZ_LOG="$(mktemp -t chez-bench)"
+# `mktemp -t PREFIX` is the BSD spelling: GNU coreutils reads the same argument
+# as a TEMPLATE and refuses it ("too few X's in template"), so on Linux this
+# script died at startup before it ran a single request. A full template under
+# TMPDIR is the spelling both accept.
+UNDERTOW_LOG="$(mktemp "${TMPDIR:-/tmp}/undertow-bench.XXXXXX")"
+JETTY_LOG="$(mktemp "${TMPDIR:-/tmp}/jetty-bench.XXXXXX")"
+CHEZ_LOG="$(mktemp "${TMPDIR:-/tmp}/chez-bench.XXXXXX")"
 UNDERTOW_PID=""
 JETTY_PID=""
 CHEZ_PID=""
@@ -67,10 +71,11 @@ wait_up() { # port label logfile
 }
 
 run_ab() { # label port mode c [path]   (mode: plain|ka)
-  local label="$1" port="$2" mode="$3" c="$4" path="${5:-/plaintext}" out rps p50 p99 note=""
+  local label="$1" port="$2" mode="$3" c="$4" path="${5:-/plaintext}" out rc rps p50 p99 note=""
   local flags=(-n "$N" -c "$c")
   if [ "$mode" = "ka" ]; then flags+=(-k); fi
-  if out=$(timeout "$AB_TIMEOUT" ab "${flags[@]}" "http://127.0.0.1:$port$path" 2>&1); then
+  out=$(timeout "$AB_TIMEOUT" ab "${flags[@]}" "http://127.0.0.1:$port$path" 2>&1) && rc=0 || rc=$?
+  if [ "$rc" -eq 0 ]; then
     if grep -qE "apr_socket_recv|timed out|Connection reset|Broken pipe" <<<"$out"; then
       note="  <- client errors (stall?)"
     fi
@@ -79,8 +84,27 @@ run_ab() { # label port mode c [path]   (mode: plain|ka)
     p99=$(awk '$1=="99%"{print $2}' <<<"$out")
     printf '%-18s %-5s c=%-4s %10s req/s  p50=%-4sms p99=%-5sms%s\n' \
       "$label" "$mode" "$c" "$rps" "$p50" "$p99" "$note"
+  elif [ "$rc" -eq 124 ]; then
+    printf '%-18s %-5s c=%-4s %10s  <- no completion within %ss\n' \
+      "$label" "$mode" "$c" "TIMEOUT" "$AB_TIMEOUT"
   else
-    printf '%-18s %-5s c=%-4s %10s\n' "$label" "$mode" "$c" "TIMEOUT"
+    # ab gave up on its own, which is NOT the same finding as a server that
+    # stopped answering — and the two used to print identically. The common
+    # one in `plain` mode is the CLIENT running out of 4-tuples: every request
+    # is a new connection the server closes, so each leaves a TIME_WAIT entry
+    # against the server's fixed port for 2*MSL, and a run of N requests needs
+    # N distinct ephemeral ports inside that window. macOS ships 16384 of them
+    # (49152-65535) and no loopback TIME_WAIT reuse, so the stock `N=20000`
+    # plain cells cannot complete there whatever the server does. See the
+    # "Ephemeral ports" section of benchmark/README.md.
+    if grep -qE "apr_socket_connect|Can.t assign requested address|Address already in use" <<<"$out"; then
+      note="CLIENT-PORTS"
+    else
+      note="AB-FAILED"
+    fi
+    printf '%-18s %-5s c=%-4s %10s  <- %s (ab exit %s): %s\n' \
+      "$label" "$mode" "$c" "INCOMPLETE" "$note" "$rc" \
+      "$(grep -m1 -E "^(apr_|Test aborted|socket:)" <<<"$out" | head -c 120)"
   fi
 }
 

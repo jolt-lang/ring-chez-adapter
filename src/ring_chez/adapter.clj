@@ -28,6 +28,37 @@
 ;; fd NUMBER happens last, in the fiber that owns it, once nobody else can
 ;; syscall on it. See conn-down!.
 
+;; --- server-level faults ----------------------------------------------------
+(def ^:private fault-report-limit
+  "How many server-level faults reach stderr before it goes quiet. The count in
+  server-stats keeps rising either way; what has to be seen is the FIRST one,
+  and a fault that repeats per connection must not become the load itself."
+  20)
+
+(defn- make-fault!
+  "Record and report a fault that is the SERVER's rather than a request's:
+  something thrown where no response can carry it and no caller is left to
+  catch it — the accept loop, a worker's take/claim/release, a fiber's
+  teardown. :on-failure is not the hook for these, because it answers a
+  REQUEST and there is no request here.
+
+  Every one of them used to be silent, and silence is what made them
+  expensive: a throw in the acceptor ended accepting, a throw in a worker's
+  release ended that worker, and the future or thread holding the throwable
+  was never looked at, so a server that had stopped serving was
+  indistinguishable from one that was merely busy. stderr gets the first few
+  and server-stats gets the count and the last one."
+  [stats]
+  (fn [kind t]
+    (let [n (swap! (:faults stats) inc)]
+      (reset! (:last-fault stats)
+              {:kind kind :error (str t) :at (System/currentTimeMillis)})
+      (when (<= n fault-report-limit)
+        (binding [*out* *err*]
+          (println (str "ring-chez: " (name kind) " fault: " t
+                        (when (= n fault-report-limit)
+                          " — further faults are counted in server-stats, not printed"))))))))
+
 ;; --- the accept loop --------------------------------------------------------
 ;; Clean shutdown: stop-server ends the acceptor and WAITS for it before it
 ;; frees the listen fd's number — see stop-server for the two platform halves
@@ -39,8 +70,20 @@
 (defn- serve-loop
   "Accept forever, handing each connection and its peer address to serve!.
   accept() fills the sockaddr, which is where :remote-addr comes from — it
-  used to be passed ffi/null and the Ring field was a hardcoded literal."
-  [listen-fd running? serve!]
+  used to be passed ffi/null and the Ring field was a hardcoded literal.
+
+  ONE CONNECTION'S FAULT IS NOT THE SERVER'S, and it used to be. A throw out
+  of serve! unwound this loop, the finally freed the sockaddr, and accepting
+  ended for the life of the process — silently, because the loop runs in a
+  future nothing derefs until stop-server. What that looks like from outside
+  is exactly a server under load: the port is still held, server-stats still
+  answers, in-flight requests still finish, and every connection after it sits
+  in the listen backlog, where it costs the process no fd and shows up in no
+  count. Measured with one injected throw: the next request, and every request
+  after it, timed out, and the only report of it came out of stop-server as an
+  ExecutionException. So serve! runs under a guard, and a loop that ends while
+  the server is running says so."
+  [listen-fd running? serve! fault!]
   (let [[sa salen] (socket/alloc-peer-sockaddr)]
     (try
       (loop [backoff 0]
@@ -59,9 +102,29 @@
                           (when (pos? backoff) (Thread/sleep backoff))
                           (recur (min 100 (if (zero? backoff) 1 (* 2 backoff)))))
             :else
-            (do (serve! conn (socket/peer-ip sa))
-                (recur 0)))))
-      (finally (ffi/free sa) (ffi/free salen)))))
+            (let [;; read the peer BEFORE serve! is entered, so the two faults
+                  ;; can be told apart. serve! owns the fd from its first
+                  ;; instruction — both strategies guard their own body and
+                  ;; release the conn on their fault path — so a throw out of
+                  ;; it must NOT be answered with a close here: that frees a
+                  ;; NUMBER the kernel may already have handed to another
+                  ;; socket, the one failure worse than the leak it would be
+                  ;; fixing (see conn-down!). A throw from peer-ip is the
+                  ;; other case, and there the fd is still nobody's.
+                  peer (try (socket/peer-ip sa)
+                            (catch Throwable t (fault! :peer-addr t) nil))]
+              (if (nil? peer)
+                (do (socket/c-shutdown conn 2) (socket/c-close conn))
+                (try (serve! conn peer)
+                     (catch Throwable t (fault! :accept t))))
+              (recur 0)))))
+      (catch Throwable t (fault! :acceptor t))
+      (finally
+        (when @running?
+          (fault! :acceptor-exit
+                  (ex-info "accept loop ended while the server was running"
+                           {:type :ring-chez/acceptor-exit})))
+        (ffi/free sa) (ffi/free salen)))))
 
 ;; Each worker parks on the work channel until a connection fd arrives, then
 ;; owns that connection: with keep-alive it serves requests until the client
@@ -604,44 +667,88 @@
     (swap! (:open stats) dec))
   (swap! conns disj entry))
 
-(defn- worker [base-info cfg io work conns]
-  (loop []
-    (when-let [entry (async/<!! work)]
-      ;; claim at take-time: pending then counts only conns accepted but not
-      ;; yet claimed — decrementing in the acceptor after >!! leaves a window
-      ;; where a claimed conn still reads as pressure and over-retires
-      ((io :claim!))
-      ;; stop-server releases conns nobody claimed. If it got to this one
-      ;; first, the fd number may already belong to another socket, so losing
-      ;; the claim means leaving the fd alone entirely.
-      (when (claim-close! entry)
+(defn- worker
+  "Serve connections off the work channel until it closes.
+
+  NOTHING IN THE BODY MAY END THE LOOP, and the guard below the claim was not
+  enough for that. It covered the connection — a handler that throws must not
+  cost the pool a thread — but the claim, the take-side bookkeeping and above
+  all conn-release! sat outside it, and conn-release! runs in a FINALLY, where
+  a throw beats the catch beside it and leaves the loop with the worker.
+
+  What that costs is not one connection. A worker that leaves is never
+  replaced, so the pool shrinks for the life of the process; when the last one
+  goes, the acceptor parks on the unbuffered work channel forever and the
+  server answers nothing at all while still holding the port and reporting
+  :active 0. Measured with a throw injected into the release path, pool of
+  four: four faults, four dead workers, and every request after them timed
+  out. start-worker! is the second line of the same defence."
+  [base-info cfg io work conns]
+  (let [fault! (:fault! cfg)]
+    (loop []
+      (when-let [entry (async/<!! work)]
         (try
-          (connection-loop (:conn entry) (assoc base-info :remote-addr (:peer entry)) cfg io nil)
-          ;; an escaping throwable must not kill the worker: a dead worker
-          ;; shrinks the pool permanently and starves later connections
-          (catch Throwable _)
-          (finally (conn-release! conns entry (:stats cfg)))))
-      (recur))))
+          ;; claim at take-time: pending then counts only conns accepted but not
+          ;; yet claimed — decrementing in the acceptor after >!! leaves a window
+          ;; where a claimed conn still reads as pressure and over-retires
+          ((io :claim!))
+          ;; stop-server releases conns nobody claimed. If it got to this one
+          ;; first, the fd number may already belong to another socket, so losing
+          ;; the claim means leaving the fd alone entirely.
+          (when (claim-close! entry)
+            (try
+              (connection-loop (:conn entry) (assoc base-info :remote-addr (:peer entry)) cfg io nil)
+              ;; an escaping throwable must not kill the worker: a dead worker
+              ;; shrinks the pool permanently and starves later connections
+              (catch Throwable _)
+              (finally (conn-release! conns entry (:stats cfg)))))
+          (catch Throwable t (fault! :worker t)))
+        (recur)))))
+
+(defn- start-worker!
+  "One pool thread, replaced if it ever leaves for a reason other than the work
+  channel closing. worker guards its own body, so what is left for this to
+  cover is the take and the runtime beneath it — and the point of covering it
+  is that \"a dead worker shrinks the pool permanently\" stops being a property
+  of the design and becomes something that cannot happen."
+  [base-info cfg io work conns running?]
+  (async/thread
+    (loop []
+      (let [failed? (try (worker base-info cfg io work conns) false
+                         (catch Throwable t ((:fault! cfg) :worker-exit t) true))]
+        (when (and failed? @running?)
+          ;; a fault that repeats instantly would otherwise spin a core
+          (Thread/sleep 10)
+          (recur))))))
 
 (defn- start-sweeper!
   "Fibers-strategy deadline enforcement (the counterpart of SO_RCVTIMEO on
   the threads strategy): every 100ms, take conns whose deadline passed out of
   service. conn-down! wakes the fiber parked on the fd (forget! resumes
   registered waiters), so a parked read ends as :closed, not a hang — and the
-  fiber, not the sweeper, is what then frees the fd number."
-  [conns stats]
+  fiber, not the sweeper, is what then frees the fd number.
+
+  A tick that throws must not end the sweep, for the reason a fault must not
+  end a worker: this future is the ONLY thing enforcing a keep-alive deadline
+  on the fibers strategy, nothing restarts it, and nothing would have reported
+  it going away. Idle connections would then accumulate for the life of the
+  process, each holding an fd and a parked fiber, with the server looking
+  entirely healthy."
+  [conns stats fault!]
   (let [stop? (atom false)]
     (future
       (loop []
         (Thread/sleep 100)
         (when-not @stop?
-          (let [now (System/currentTimeMillis)]
-            (doseq [e @conns]
-              (when (and (not @(e :down?)) (< @(e :deadline) now))
-                ;; down, not released: the fiber that owns this conn is the
-                ;; only one allowed to free its fd number, and the shutdown
-                ;; here is what wakes it to do that
-                (conn-down! e))))
+          (try
+            (let [now (System/currentTimeMillis)]
+              (doseq [e @conns]
+                (when (and (not @(e :down?)) (< @(e :deadline) now))
+                  ;; down, not released: the fiber that owns this conn is the
+                  ;; only one allowed to free its fd number, and the shutdown
+                  ;; here is what wakes it to do that
+                  (conn-down! e))))
+            (catch Throwable t (fault! :sweeper t)))
           (recur))))
     stop?))
 
@@ -665,7 +772,14 @@
             (connection-loop conn conn-info cfg
                              (fiber-io conn deadline (:write-timeout-ms cfg)) deadline)
             (catch Throwable _ nil)
-            (finally (conn-release! conns entry (:stats cfg)))))))))
+            ;; the release is guarded for the reason the worker's is: it runs
+            ;; in a FINALLY, where a throw beats the catch above it. Here it
+            ;; costs one connection rather than a pool thread — there is no
+            ;; fixed pool to shrink — but it is the same silence, and the fd
+            ;; it leaks is just as gone.
+            (finally
+              (try (conn-release! conns entry (:stats cfg))
+                   (catch Throwable t ((:fault! cfg) :conn-release t))))))))))
 
 ;; Igropyr http.sc: bad config must crash HERE, at boot — deferred to request
 ;; time it raises inside the reader and the connection just drops. One error
@@ -792,11 +906,15 @@
           handler-box (atom handler)
           ws-handler-box (atom ws-handler)
           stats {:open (atom 0) :requests (atom 0) :active (atom 0)
+                 ;; server-level faults (see make-fault!): a wedge that used to
+                 ;; be invisible is a number a caller can read
+                 :faults (atom 0) :last-fault (atom nil)
                  :started (System/currentTimeMillis)}
+          fault! (make-fault! stats)
           ;; everything that does not vary per connection, built once and
           ;; threaded through the serving path unchanged
           cfg {:handler-box handler-box :ws-handler-box ws-handler-box
-               :ws-guard ws-guard :on-failure on-failure
+               :ws-guard ws-guard :on-failure on-failure :fault! fault!
                :ka-ms ka-ms :max-bytes max-bytes :max-header-bytes max-header-bytes
                :request-timeout-ms request-timeout-ms
                :write-timeout-ms write-timeout-ms
@@ -806,7 +924,7 @@
           running? (atom true)]
       (if (= :fibers strategy)
         (let [conns (atom #{})   ; live conn entries; sweeper + stop sweep them
-              sweep (start-sweeper! conns stats)]
+              sweep (start-sweeper! conns stats fault!)]
           {:socket fd :port port :host host :running running? :conns conns :sweep sweep
            :handler handler-box :ws-handler ws-handler-box :stats stats
            :acceptor
@@ -826,10 +944,20 @@
                                 ;; server went on serving it, and its fd leaked.
                                 (let [entry (register-conn! conns conn peer true)]
                                   (if @running?
-                                    (fiber-serve (assoc base-info :remote-addr peer)
-                                                 cfg entry conns)
+                                    ;; the spawn, not the session: a throw here
+                                    ;; means the go block never ran, so this
+                                    ;; conn is still unclaimed and releasing it
+                                    ;; is ours to do. A fault inside the
+                                    ;; session is the fiber's (see fiber-serve).
+                                    (try (fiber-serve (assoc base-info :remote-addr peer)
+                                                      cfg entry conns)
+                                         (catch Throwable t
+                                           (fault! :spawn t)
+                                           (when (claim-close! entry)
+                                             (conn-release! conns entry stats))))
                                     (when (claim-close! entry)
-                                      (conn-release! conns entry stats)))))))})
+                                      (conn-release! conns entry stats)))))
+                              fault!))})
         (let [work  (async/chan)  ; unbuffered: acceptor parks when all workers busy
               conns (atom #{})    ; live conn entries; the stop sweep closes them
               pending (atom 0)    ; conns accepted but not yet claimed by a worker
@@ -844,7 +972,7 @@
                          ;; or a client mid-reuse would race a reset. Returns
                          ;; the recv contract (n>0 data, 0 closed/retire).
                          :idle-recv! #(idle-poll-recv! %1 %2 ka-ms pending))]
-           (dotimes [_ n] (async/thread (worker base-info cfg io work conns)))
+           (dotimes [_ n] (start-worker! base-info cfg io work conns running?))
           {:socket fd :port port :host host :running running? :work work :conns conns
            :handler handler-box :ws-handler ws-handler-box :stats stats
            :acceptor
@@ -857,11 +985,24 @@
                                 ;; false on a channel stop-server has closed, and
                                 ;; a conn nobody can take off it needs the same
                                 ;; cleanup as one accepted after the sweep.
-                                (let [entry (register-conn! conns conn peer false)]
-                                  (when-not (and @running? (async/>!! work entry))
+                                ;;
+                                ;; The handoff is its own expression so the
+                                ;; cleanup below runs exactly once whether the
+                                ;; put answered false or threw: pending is
+                                ;; decremented on the not-handed path only, and
+                                ;; a throw out of the release cannot take the
+                                ;; accept loop with it (see serve-loop).
+                                (let [entry (register-conn! conns conn peer false)
+                                      handed? (try (and @running? (async/>!! work entry))
+                                                   (catch Throwable t
+                                                     (fault! :handoff t)
+                                                     false))]
+                                  (when-not handed?
                                     (swap! pending dec)
-                                    (when (claim-close! entry)
-                                      (conn-release! conns entry stats)))))))})))))
+                                    (try (when (claim-close! entry)
+                                           (conn-release! conns entry stats))
+                                         (catch Throwable t (fault! :conn-release t))))))
+                              fault!))})))))
 
 (defn swap-handler!
   "Point a running server at a new Ring handler (Igropyr http-swap!). Takes
@@ -879,13 +1020,21 @@
 
 (defn server-stats
   "A snapshot of what the server is doing: :connections open right now,
-  :active requests in flight, :requests answered since boot, and :uptime-ms
-  (Igropyr http-stats)."
+  :active requests in flight, :requests answered since boot, :uptime-ms
+  (Igropyr http-stats), and the server-level fault count with the last one
+  (:faults / :last-fault — see make-fault!; these are the server's own
+  failures, not a handler's, which :on-failure answers)."
   [server]
-  (let [{:keys [open requests active started]} (:stats server)]
+  (let [{:keys [open requests active started faults last-fault]} (:stats server)]
     {:connections @open
      :active @active
      :requests @requests
+     ;; server-level faults, not request failures (:on-failure has those):
+     ;; anything thrown in the accept loop, a worker's take/claim/release or a
+     ;; fiber's teardown. Nonzero means something the server recovered from
+     ;; happened where nothing could report it to a caller — see make-fault!.
+     :faults (if faults @faults 0)
+     :last-fault (when last-fault @last-fault)
      :uptime-ms (- (System/currentTimeMillis) started)}))
 
 (defn stop-server

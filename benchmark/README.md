@@ -28,14 +28,93 @@ N=2000 C_LIST="10" benchmark/run.sh    # quick smoke run
 Requires `ab`, `curl`, `timeout`, `lsof`, the Clojure CLI, and `jolt`.
 Defaults: undertow on :8080, adapter on :8081, jetty on :8082, `N=20000`
 requests, concurrency 10 and 100, plain and keepalive (`-k`) modes. Each line
-prints req/s plus p50/p99 latency; `TIMEOUT` or a `<- client errors (stall?)`
-marker means the run hung or dropped connections — that is a finding, not a
-script failure. Server logs go to mktemp files named at startup.
+prints req/s plus p50/p99 latency. `TIMEOUT` (no completion within
+`AB_TIMEOUT`) or a `<- client errors (stall?)` marker means the run hung or
+dropped connections — that is a finding, not a script failure. `INCOMPLETE`
+means `ab` itself gave up, and the marker beside it says which: `CLIENT-PORTS`
+is the client running out of ephemeral ports, a limit of the machine and not of
+the server (see below). Server logs go to mktemp files named at startup.
 
 For a single server by hand: `jolt -M:bench` from the repo root
 (`PORT`, `STRATEGY`, `WORKERS` envs),
 `cd benchmark/minimal-ring-undertow && clojure -M:run` (`PORT` env), or
 `cd benchmark/minimal-ring-jetty && clojure -M:run` (`PORT` env).
+
+## Ephemeral ports: read a `plain` failure here before blaming the server
+
+In `plain` mode every request is its own connection and the SERVER closes it,
+so each one leaves a TIME_WAIT entry for 2*MSL against the server's fixed port.
+The 4-tuple is therefore pinned by the client's ephemeral port, and a run of N
+requests needs N distinct ones inside that window — the run is far too fast for
+any of them to have expired.
+
+That is a client limit and it bites well below the default `N=20000`:
+
+| | ephemeral ports | TIME_WAIT | loopback reuse |
+|---|---:|---:|---|
+| macOS (stock) | 16384 (49152-65535) | 30 s (`net.inet.tcp.msl` 15000) | no |
+| Linux (stock) | 28232 (32768-60999) | 60 s | yes (`tcp_tw_reuse=2`) |
+
+So on stock macOS the `plain` cells **cannot** complete as configured, whatever
+the server does: 2000 warmup + 20000 = 22000 connections against 16384 ports.
+Linux gets through it because the range is larger and the kernel recycles
+loopback TIME_WAIT entries for new outgoing connections — one full matrix run
+measured here left 14115 of them behind, which is half the range.
+
+`run.sh` now prints `INCOMPLETE ... CLIENT-PORTS` rather than `TIMEOUT` when
+`ab` gives up connecting, because the two used to be indistinguishable in the
+output and they are not the same finding. Check it with `netstat -an | grep -c
+TIME_WAIT` during a run. To measure the server instead of the port table:
+lower `N`, raise the range (`sysctl -w net.inet.ip.portrange.first=16384` on
+macOS), or read the `ka` cells, which reuse a handful of connections and never
+touch it.
+
+## Findings (2026-09-20, 4-core Linux 6.8, jolt 0.8.10, colocated, `ab -n 20000`)
+
+A second machine and a much smaller one, recorded because the matrix had never
+run on Linux at all — `run.sh` died at startup on `mktemp -t undertow-bench`,
+which is the BSD spelling of an argument GNU coreutils reads as a template and
+refuses. Chez only; three runs of the whole matrix per strategy.
+
+| server | plain c=10 | ka c=10 | plain c=100 | ka c=100 |
+|---|---:|---:|---:|---:|
+| chez `:threads` | 5.31-5.47k | 6.86-6.98k | 5.30-5.37k | 6.91-6.97k |
+| chez `:fibers` | 4.60-4.63k | 6.11-6.17k | 4.87-4.88k | 6.06-6.08k |
+
+Re-run after the server-fault hardening (same machine, same sitting):
+threads 5.05-5.20k plain / 6.56-6.59k ka, fibers 4.32-4.66k plain / 5.81-5.97k
+ka — every cell complete, and the guards cost nothing measurable.
+
+What is worth saying about them:
+
+- **No stall, anywhere.** 40 further cells across `:worker-threads` 1/2/4/16 and
+  concurrency 10/50/200/etc, a 200k-request plain soak, and 100k requests
+  against a deliberately allocation-heavy handler (~3000 maps per request, to
+  make the collector run constantly) all completed with zero failures and a
+  flat fd and thread count. The `plain`-mode hang reported against jolt 0.8.9
+  on macOS does not reproduce here.
+- **Keepalive is only ~1.3x plain, not ~3x.** With four workers and ten or more
+  clients there is essentially always a connection waiting for a worker, so the
+  accept-pressure retirement stamps `Connection: close` on nearly every
+  response and keep-alive never engages. That is the documented trade-off doing
+  what it says, but it means the `ka` cells on a small machine measure roughly
+  the same thing the `plain` cells do.
+- **Throughput barely scales with the pool**: 3.45k at one worker, 5.00k at
+  two, 5.55k at four, 4.54k at sixteen. Four cores, so the last is
+  oversubscription; the first three are the interesting shape, and 1.6x from
+  four times the workers says most of a request is spent somewhere serialized
+  rather than in the workers.
+
+One data point from the Mac that reported the `plain`-mode stall, re-run with
+this branch on jolt 0.8.10 (`N=5000`, well under its 16384-port table): both
+`plain` cells still end `AB-FAILED` with `apr_pollset_poll` timeout — ab was
+connected and the response never came — while both `ka` cells either side of
+them ran at full speed. The server log carries no `fault:` line and no
+GC-rendezvous line, and the port table held ~2.4k TIME_WAIT entries against
+~16k available. So on that machine it is none of the three known causes: not a
+server-level throw, not a whole-process GC stall (the server kept serving
+between failures), not the client port table. The Mac stall stays open as a
+jolt-side issue; the Linux numbers above are unaffected by it.
 
 ## Findings (2026-08-20, M-series Mac, colocated, `ab -n 20000`)
 

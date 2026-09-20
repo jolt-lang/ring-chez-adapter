@@ -211,7 +211,8 @@ that connection rather than writing garbage into the stream.
 
 ```clojure
 (adapter/server-stats server)
-;; {:connections 12 :active 3 :requests 48122 :uptime-ms 903111}
+;; {:connections 12 :active 3 :requests 48122 :uptime-ms 903111
+;;  :faults 0 :last-fault nil}
 
 (adapter/swap-handler! server new-handler)      ; takes effect next request
 (adapter/swap-ws-handler! server new-ws-handler)
@@ -226,6 +227,24 @@ rather than cutting a response off mid-write, bounded by `:drain-timeout-ms`
 After the drain every live connection is closed, on both strategies — once it
 returns, nothing is served, including on keep-alive connections opened before
 the stop.
+
+`:faults` counts the server's OWN failures — something thrown in the accept
+loop, in a worker's take/claim/release, or in a fiber's teardown, where no
+response can carry it and no caller is left to catch it. A handler's failures
+are not here; `:on-failure` answers those, because they have a request to
+answer. Every such fault is also printed once to stderr (the first twenty, so
+one that repeats per connection cannot become the load itself), and
+`:last-fault` keeps `{:kind :error :at}` for the most recent.
+
+It should stay at zero. What it is for is that none of these used to be
+visible at all: a throw out of the accept loop ended accepting for the life of
+the process, a throw out of a worker's release ended that worker and the pool
+never grew back, and the future or thread holding the throwable was never
+looked at. A server that had stopped serving therefore looked exactly like a
+busy one — it held the port, `server-stats` answered, in-flight requests
+finished, and new connections waited in the listen backlog where they cost the
+process no fd and showed up in no count. The server now survives all of these
+and says so; a nonzero `:faults` is worth a look even though nothing stopped.
 
 `swap-handler!` re-points a running server without a restart, including on
 connections already open — the handler is resolved per request, after the read

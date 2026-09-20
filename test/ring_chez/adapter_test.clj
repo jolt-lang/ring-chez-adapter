@@ -2034,6 +2034,111 @@
                        200 (:status r)))
               (finally (reset! gap 0) (adapter/stop-server b)))))))))
 
+;; --- server-level faults must not wedge the server -------------------------
+;; Both of these used to end with the server holding the port and answering
+;; nothing, which from outside is indistinguishable from a server under load:
+;; in-flight requests finish, server-stats still answers, and connections that
+;; are never accepted sit in the listen backlog where they cost the process no
+;; fd and appear in no count. That is the shape a stall in the benchmarks takes,
+;; so the shape is what these pin.
+
+;; One bounded request. A wedged server would otherwise hang the whole suite
+;; rather than fail one test, which is the failure these tests exist to catch.
+(defn- get-within
+  "GET / on port, or :timeout after ms. The response's first line, so a dead
+  connection (:eof) reads differently from a dead server (:timeout)."
+  [port ms]
+  (let [ch (a/thread
+             (try
+               (let [sock (java.net.Socket. "127.0.0.1" (int port))]
+                 (try
+                   (let [out (.getOutputStream sock)]
+                     (.write out (.getBytes "GET / HTTP/1.0\r\nHost: x\r\n\r\n" "UTF-8"))
+                     (.flush out))
+                   (let [buf (byte-array 256)
+                         n (.read (.getInputStream sock) buf)]
+                     (if (pos? n)
+                       (first (str/split (String. buf 0 n "UTF-8") #"\r\n"))
+                       :eof))
+                   (finally (.close sock))))
+               (catch Throwable t (str "ERR " (.getMessage t)))))
+        [v p] (a/alts!! [ch (a/timeout ms)])]
+    (if (= p ch) v :timeout)))
+
+;; conn-release! runs in the worker's FINALLY, where a throw beats the catch
+;; beside it and leaves the loop WITH THE WORKER. A worker that leaves was
+;; never replaced, so the pool shrank for the life of the process, and when the
+;; last one went the acceptor parked on the unbuffered work channel forever.
+;; Measured before the fix with a pool of four: four injected faults, four dead
+;; workers, and every request after them timed out.
+(defn test-worker-survives-a-fault-in-connection-teardown []
+  (let [real-close socket/c-close
+        pool 4
+        armed (atom 0)]
+    (with-redefs [socket/c-close
+                  (fn [fd]
+                    (let [[was _] (swap-vals! armed (fn [n] (if (pos? n) (dec n) 0)))]
+                      (if (pos? was)
+                        (throw (ex-info "injected teardown fault" {:fd fd}))
+                        (real-close fd))))]
+      (let [server (adapter/run-server handler {:port 8573 :worker-threads pool})]
+        (try
+          (Thread/sleep 150)
+          (check "teardown fault: healthy before" "HTTP/1.1 200 OK" (get-within 8573 3000))
+          ;; twice the pool size, so under the old code every worker is gone
+          (reset! armed (* 2 pool))
+          (dotimes [_ (* 2 pool)] (get-within 8573 3000))
+          (reset! armed 0)
+          (Thread/sleep 150)
+          (check "teardown fault: the pool still serves" "HTTP/1.1 200 OK" (get-within 8573 3000))
+          (check "teardown fault: the pool still serves twice" "HTTP/1.1 200 OK" (get-within 8573 3000))
+          (check "teardown fault: counted as a server fault"
+                 true (pos? (:faults (adapter/server-stats server))))
+          (check "teardown fault: the last one is kept"
+                 :worker (:kind (:last-fault (adapter/server-stats server))))
+          (finally (reset! armed 0) (adapter/stop-server server)))))))
+
+;; The accept loop's only guard was a finally that freed the sockaddr, so a
+;; throw from ONE connection's handoff unwound it and ended accepting for the
+;; life of the process — and the future holding the throwable was never
+;; deref'd, so the first report of it came out of stop-server as an
+;; ExecutionException, if anyone ever stopped the server at all.
+(defn test-accept-loop-survives-one-connections-fault []
+  (let [real-peer socket/peer-ip
+        armed (atom 0)]
+    (with-redefs [socket/peer-ip
+                  (fn [sa]
+                    (let [[was _] (swap-vals! armed (fn [n] (if (pos? n) (dec n) 0)))]
+                      (if (pos? was)
+                        (throw (ex-info "injected accept fault" {}))
+                        (real-peer sa))))]
+      (let [server (adapter/run-server handler {:port 8574})]
+        (try
+          (Thread/sleep 150)
+          (check "accept fault: healthy before" "HTTP/1.1 200 OK" (get-within 8574 3000))
+          (reset! armed 1)                      ; exactly ONE connection faults
+          ;; that connection is lost — its fd is released and the peer reads
+          ;; EOF — and it is the only one that is
+          (get-within 8574 3000)
+          (Thread/sleep 150)
+          (check "accept fault: still accepting" "HTTP/1.1 200 OK" (get-within 8574 3000))
+          (check "accept fault: still accepting twice" "HTTP/1.1 200 OK" (get-within 8574 3000))
+          (check "accept fault: counted as a server fault"
+                 1 (:faults (adapter/server-stats server)))
+          (finally (reset! armed 0) (adapter/stop-server server)))))))
+
+;; A healthy server reports no faults — the counter above is only evidence if
+;; it stays at zero when nothing is wrong.
+(defn test-clean-run-reports-no-faults []
+  (let [server (adapter/run-server handler {:port 8575})]
+    (try
+      (Thread/sleep 150)
+      (dotimes [_ 5] (get-within 8575 3000))
+      (let [st (adapter/server-stats server)]
+        (check "clean run: no faults" 0 (:faults st))
+        (check "clean run: no last fault" nil (:last-fault st)))
+      (finally (adapter/stop-server server)))))
+
 ;; --- Wave 2 round 2: handler deadline --------------------------------------------
 
 ;; Igropyr kills a worker stuck past stuck-ms and answers through on-failure.
@@ -3690,6 +3795,11 @@
   (run-test "test-multipart-passthrough" test-multipart-passthrough)
   (run-test "test-stale-acceptor-does-not-take-the-next-servers-connection"
             test-stale-acceptor-does-not-take-the-next-servers-connection)
+  (run-test "test-worker-survives-a-fault-in-connection-teardown"
+            test-worker-survives-a-fault-in-connection-teardown)
+  (run-test "test-accept-loop-survives-one-connections-fault"
+            test-accept-loop-survives-one-connections-fault)
+  (run-test "test-clean-run-reports-no-faults" test-clean-run-reports-no-faults)
 
   ;; --- Wave 2 round 2: handler deadline ---
   (run-test "test-handler-deadline-threads" test-handler-deadline-threads)
