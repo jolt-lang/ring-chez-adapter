@@ -35,6 +35,35 @@ means `ab` itself gave up, and the marker beside it says which: `CLIENT-PORTS`
 is the client running out of ephemeral ports, a limit of the machine and not of
 the server (see below). Server logs go to mktemp files named at startup.
 
+On an `AB-FAILED` or `TIMEOUT` cell, `run.sh` then diagnoses it rather than
+leaving the reader to: it prints the server's own `fault:` lines (or says there
+were none) and, for a `plain` cell, re-runs the same workload through
+`probes/plain-drop-probe.py`, a raw-socket client that classifies every
+connection on its own, and says which of the three answers it got: every
+connection served (the server was healthy throughout and ab aborted over
+something only ab saw), a connection accepted and never answered (a real
+drop), or only connects that never landed (the client's port table, not the
+server). The probe is capped by `AB_TIMEOUT` like the ab run itself, and
+hitting that cap is the fourth answer: the server stopped answering this
+client too, which is the real stall a dropped connection is not. `DIAGNOSE=0`
+skips the whole step.
+
+## Probes
+
+`probes/` holds the two scripts that turned the Mac `plain` failure from "the
+server stalls" into "one connection in a few thousand is never served". Both
+are standalone and take `PORT`, `N`, `C` from the environment.
+
+- `plain-drop-probe.py` — N one-shot `Connection: close` requests over C
+  threads, each connection classified on its own. Exit status 0 when every
+  connection was answered, 1 when one was accepted and never answered (the
+  drop), 2 when the only failures were connects that never landed (the client
+  port table, not the server), so a harness can branch on it; `run.sh` does.
+- `plain-drop-hunt.sh` — a fresh server per round (the drop was only ever seen
+  in the window after a start) running the probe until a round loses a
+  connection, then leaving the server up and printing the server's faults, the
+  connection states on the port, the fd count and the thread state.
+
 For a single server by hand: `jolt -M:bench` from the repo root
 (`PORT`, `STRATEGY`, `WORKERS` envs),
 `cd benchmark/minimal-ring-undertow && clojure -M:run` (`PORT` env), or
@@ -111,10 +140,34 @@ this branch on jolt 0.8.10 (`N=5000`, well under its 16384-port table): both
 connected and the response never came — while both `ka` cells either side of
 them ran at full speed. The server log carries no `fault:` line and no
 GC-rendezvous line, and the port table held ~2.4k TIME_WAIT entries against
-~16k available. So on that machine it is none of the three known causes: not a
+~16k available. So on that machine it was none of the three known causes: not a
 server-level throw, not a whole-process GC stall (the server kept serving
-between failures), not the client port table. The Mac stall stays open as a
-jolt-side issue; the Linux numbers above are unaffected by it.
+between failures), not the client port table.
+
+It was one dropped connection. A raw-socket client over the identical plain
+workload (`probes/plain-drop-probe.py`) completed 5000/5000 in 0.7s
+against both strategies, and across fresh-server runs it caught what ab was
+reporting: roughly one connection in a few thousand was accepted, handed on,
+and then claimed by nobody — connect succeeded, the request was never
+answered, and the connection froze as `CLOSE_WAIT` on the server against
+`FIN_WAIT_2` on the client, with nothing having recv'd, polled or shut it
+down. ab aborts its *entire* run over one of those, which is why a whole
+`plain` cell read `AB-FAILED` while every other client and every other cell
+saw a healthy server.
+
+The adapter no longer leaves such a connection lying there: the connection
+sweeper now runs on both strategies and enforces a claim deadline as well as
+an idle one, so a connection nobody has claimed within five seconds of the
+handoff is taken over by the sweeper, closed, and counted as an `:unclaimed`
+server fault (`server-stats`). That is a backstop and not a root cause — why
+the handoff loses a connection at all, once in a few thousand and only on that
+machine, is still open — but it bounds what one costs: the peer is closed on
+after five seconds instead of waiting on silence forever, the fd comes back
+instead of sitting in `CLOSE_WAIT` for the life of the process, and the loss
+is a number a caller can read rather than nothing at all. It does not make the
+cell pass: a dropped connection is still a connection ab never got an answer
+for, and ab still aborts over it. See the `lost-handoff` / `lost-spawn` tests
+in the suite.
 
 ## Findings (2026-08-20, M-series Mac, colocated, `ab -n 20000`)
 

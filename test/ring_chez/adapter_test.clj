@@ -2139,6 +2139,115 @@
         (check "clean run: no last fault" nil (:last-fault st)))
       (finally (adapter/stop-server server)))))
 
+;; --- a connection the accept handoff lost ----------------------------------
+;; The whole serving path hangs off the claim at the far end of the accept
+;; handoff, so a connection that is handed on and never claimed is served by
+;; nobody, closed by nobody — only an owner may free an fd number — and
+;; reported by nobody, because nothing was thrown and no guard was crossed.
+;; Measured on macOS under plain-mode connect churn as roughly one connection
+;; in a few thousand, on BOTH strategies: the peer waited out its own timeout
+;; against a server answering everyone else in a millisecond, and the fd sat
+;; in CLOSE_WAIT for the life of the process. One is enough for ab to abort a
+;; whole benchmark cell, which is how it was found. Injected below at each
+;; strategy's own handoff, because there is no throw to inject.
+
+(defn- take-arm!
+  "True for exactly as many calls as the test armed, false after. Keeps an
+  injection to the connections it is meant for."
+  [armed]
+  (pos? (first (swap-vals! armed (fn [n] (if (pos? n) (dec n) 0))))))
+
+;; Threads: the rendezvous answers true — "a worker has it" — and no worker
+;; does. Only puts on THIS server's work channel are intercepted: core.async
+;; puts a thread's return value through >!! too, and that must not count.
+(defn test-threads-lost-handoff-is-reaped-and-reported []
+  (let [server (adapter/run-server handler {:port 8576 :worker-threads 2})
+        work (:work server)
+        real->!! a/>!!
+        armed (atom 0)]
+    (try
+      (Thread/sleep 150)
+      (check "lost handoff: healthy before" "HTTP/1.1 200 OK" (get-within 8576 3000))
+      (with-redefs [ring-chez.adapter/claim-deadline-ms 1500
+                    a/>!! (fn [ch v]
+                            (if (and (identical? ch work) (take-arm! armed))
+                              true
+                              (real->!! ch v)))]
+        (reset! armed 1)
+        (check "lost handoff: that connection is not answered"
+               :timeout (get-within 8576 400)))
+      (Thread/sleep 2000)                   ; past the claim deadline and a sweep
+      (let [st (adapter/server-stats server)]
+        (check "lost handoff: reported as a server fault"
+               :unclaimed (:kind (:last-fault st)))
+        (check "lost handoff: counted once" 1 (:faults st))
+        (check "lost handoff: the fd was released" 0 (:connections st)))
+      (check "lost handoff: the server still serves" "HTTP/1.1 200 OK" (get-within 8576 3000))
+      ;; the lost conn was also still counted as accept pressure, and that
+      ;; count never comes back down on its own: `pending` stuck above zero is
+      ;; under-pressure? stuck true, which is keep-alive declined on every
+      ;; response from then on. Asked on the wire, because a client that sends
+      ;; `Connection: close` is answered with one whatever the pressure is.
+      (let [fd (client-connect 8576 3000)]
+        (try
+          (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+          (check "lost handoff: accept pressure did not leak"
+                 false (str/includes? (str/lower-case (client-recv-until fd "\r\n\r\n"))
+                                      "connection: close"))
+          (finally (client-close fd))))
+      (finally (reset! armed 0) (adapter/stop-server server)))))
+
+;; Fibers: the spawn returns without the go block ever existing, which is what
+;; a go block that is never scheduled looks like from the accept loop.
+(defn test-fibers-lost-spawn-is-reaped-and-reported []
+  (let [server (adapter/run-server handler {:port 8577 :strategy :fibers})
+        real-serve @#'ring-chez.adapter/fiber-serve
+        armed (atom 0)]
+    (try
+      (Thread/sleep 250)
+      (check "lost spawn: healthy before" "HTTP/1.1 200 OK" (get-within 8577 3000))
+      (with-redefs [ring-chez.adapter/claim-deadline-ms 1500
+                    ring-chez.adapter/fiber-serve
+                    (fn [conn-info cfg entry conns]
+                      (when-not (take-arm! armed)
+                        (real-serve conn-info cfg entry conns)))]
+        (reset! armed 1)
+        (check "lost spawn: that connection is not answered"
+               :timeout (get-within 8577 400)))
+      (Thread/sleep 2000)
+      (let [st (adapter/server-stats server)]
+        (check "lost spawn: reported as a server fault"
+               :unclaimed (:kind (:last-fault st)))
+        (check "lost spawn: counted once" 1 (:faults st))
+        (check "lost spawn: the fd was released" 0 (:connections st)))
+      (check "lost spawn: the server still serves" "HTTP/1.1 200 OK" (get-within 8577 3000))
+      (finally (reset! armed 0) (adapter/stop-server server)))))
+
+;; The other half of the rule, and the one that makes the reap safe to ship: a
+;; connection QUEUED behind a busy pool is unclaimed too, and reaping it would
+;; drop a live request. The claim clock starts only once somebody is provably
+;; responsible for the conn — the rendezvous has answered, or the fiber is
+;; spawned — so a conn still parked in the handoff is not on it, however long
+;; the pool stays busy.
+(defn test-queued-connection-is-not-reaped []
+  (let [server (adapter/run-server (fn [_] (Thread/sleep 1200) {:status 200 :body "slow-ok"})
+                                   {:port 8578 :worker-threads 1})]
+    (try
+      (Thread/sleep 150)
+      (with-redefs [ring-chez.adapter/claim-deadline-ms 200]
+        (let [busy   (a/thread (get-within 8578 9000))
+              _      (Thread/sleep 150)
+              queued (a/thread (get-within 8578 9000))]
+          ;; the single worker is inside the handler for 1200ms, six times the
+          ;; claim deadline, with the second conn parked in the handoff
+          (check "queued conn: the busy worker's request is answered"
+                 "HTTP/1.1 200 OK" (a/<!! busy))
+          (check "queued conn: the queued request is answered too"
+                 "HTTP/1.1 200 OK" (a/<!! queued))))
+      (check "queued conn: nothing reported as lost"
+             0 (:faults (adapter/server-stats server)))
+      (finally (adapter/stop-server server)))))
+
 ;; --- Wave 2 round 2: handler deadline --------------------------------------------
 
 ;; Igropyr kills a worker stuck past stuck-ms and answers through on-failure.
@@ -3800,6 +3909,11 @@
   (run-test "test-accept-loop-survives-one-connections-fault"
             test-accept-loop-survives-one-connections-fault)
   (run-test "test-clean-run-reports-no-faults" test-clean-run-reports-no-faults)
+  (run-test "test-threads-lost-handoff-is-reaped-and-reported"
+            test-threads-lost-handoff-is-reaped-and-reported)
+  (run-test "test-fibers-lost-spawn-is-reaped-and-reported"
+            test-fibers-lost-spawn-is-reaped-and-reported)
+  (run-test "test-queued-connection-is-not-reaped" test-queued-connection-is-not-reaped)
 
   ;; --- Wave 2 round 2: handler deadline ---
   (run-test "test-handler-deadline-threads" test-handler-deadline-threads)

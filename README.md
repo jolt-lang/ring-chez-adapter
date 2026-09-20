@@ -230,7 +230,9 @@ the stop.
 
 `:faults` counts the server's OWN failures — something thrown in the accept
 loop, in a worker's take/claim/release, or in a fiber's teardown, where no
-response can carry it and no caller is left to catch it. A handler's failures
+response can carry it and no caller is left to catch it, plus one failure that
+throws nothing at all: `:unclaimed`, a connection that was accepted, handed to
+a worker or a fiber, and then never claimed by either. A handler's failures
 are not here; `:on-failure` answers those, because they have a request to
 answer. Every such fault is also printed once to stderr (the first twenty, so
 one that repeats per connection cannot become the load itself), and
@@ -245,6 +247,15 @@ busy one — it held the port, `server-stats` answered, in-flight requests
 finished, and new connections waited in the listen backlog where they cost the
 process no fd and showed up in no count. The server now survives all of these
 and says so; a nonzero `:faults` is worth a look even though nothing stopped.
+
+`:unclaimed` is the same shape one connection down. The serving path hangs off
+the claim at the far end of the accept handoff, so a connection that is handed
+on and never claimed is served by nobody, closed by nobody — only an owner may
+free an fd number — and, because no guard is crossed, reported by nobody: the
+peer waits out its own timeout against a server that is answering everyone
+else in a millisecond. A connection still unclaimed five seconds after the
+handoff is now taken over by the sweeper, which wins the same claim a late
+worker or fiber would have to win, closes it, and counts it here.
 
 `swap-handler!` re-points a running server without a restart, including on
 connections already open — the handler is resolved per request, after the read
