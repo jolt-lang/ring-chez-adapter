@@ -806,11 +806,17 @@
                   (and (not @(e :owned?)) (< @(e :claim-by) now))
                   (when (claim-close! e)
                     (unpend! e)
+                    ;; reclaim the fd BEFORE reporting the loss, not after:
+                    ;; this sweeper is the only thing that will ever free this
+                    ;; conn — the claim is taken, so no late owner may touch it
+                    ;; again — and fault! writes to stderr, which can throw. A
+                    ;; report that failed would then cost the very fd it had
+                    ;; just won back, for the life of the process.
+                    (conn-release! conns e stats)
                     (fault! :unclaimed
                             (ex-info "connection accepted and handed on, but never claimed"
                                      {:type :ring-chez/unclaimed-conn
-                                      :peer (:peer e)}))
-                    (conn-release! conns e stats))
+                                      :peer (:peer e)})))
 
                   ;; down, not released: the fiber that owns this conn is the
                   ;; only one allowed to free its fd number, and the shutdown
