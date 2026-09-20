@@ -116,6 +116,51 @@ server-level throw, not a whole-process GC stall (the server kept serving
 between failures), not the client port table. The Mac stall stays open as a
 jolt-side issue; the Linux numbers above are unaffected by it.
 
+Update (same Mac, jolt 0.8.10, matrix re-run after PR #38): the `plain`
+failure signature is now understood well enough to reclassify. During a
+failing run the server keeps serving fresh one-shot requests in ~1 ms at
+~0% CPU with a flat fd/thread count, and the kernel tables show every
+connection already served and closed (the full ~5k TIME_WAIT) — while ab
+sits parked in `kevent` at 0% CPU for the remainder of its 30 s, then
+aborts the whole run. A raw-socket python client (same 5000×10 plain
+workload, no ab) completes 5000/5000 in 0.7 s against both strategies —
+until, across repeated fresh-server runs, it reproduces the drop the ab
+runs were reporting: **exactly one accepted connection in ~5000 (roughly 2
+in 5 runs) never gets served** — connect succeeds, the request never
+answered, the client times out after 5 s, and the connection freezes as
+one `CLOSE_WAIT` on the server (client side `FIN_WAIT_2`): nobody ever
+recv'd, polled, or shut it down. One dropped connection is the whole
+finding: ab aborts its entire run over it, which is why a whole `plain`
+cell reports `AB-FAILED`/`~165 req/s` while every other client and every
+other cell sees a healthy server. The drop reproduced on BOTH strategies
+under connect churn, is timing-racy (startup window), and is invisible in
+the server log (no `fault:` line — meaning no throw crossed a guard; the
+conn was registered but never claimed/served). The accept→handoff→serve
+path was audited layer by layer (serve-loop fault guard, claim-CAS at
+take-time, sweeper deadline) with no unguarded window found by reading, so
+the drop site is now narrowed to the claim/handoff hop or below it in
+jolt runtime machinery (thread/fiber scheduling of the take/claim), and it
+stays open as a jolt-side issue at that scope. The Linux findings above
+are unaffected; `ka` cells are unaffected everywhere; and the harness
+itself is healthy — a run is a stall only when ab aborts AND a non-ab
+client fails too.
+
+Two repro scripts from this investigation, for the next round (in
+`benchmark/probes/`):
+
+- `plain-drop-probe.py` — 5000×10 raw-socket plain client against
+  `127.0.0.1:8081`, per-conn connect-vs-response failure classification
+  (the repro that caught the drop; 2-in-5 fresh servers, both strategies).
+- `plain-drop-hunt.sh` — fresh-server loop (fibers) that runs the probe
+  until a failure, then freezes the scene (server pid, log, `sample`,
+  `lsof`, `netstat`).
+
+Note for run.sh readers: when ab reports `AB-FAILED` on `plain` on this
+machine, check the server log for `fault:` lines and run a non-ab client
+before calling it a server stall — one dropped conn makes ab abort the
+whole cell, so ab alone cannot distinguish a wedged server from one
+dropped connection.
+
 ## Findings (2026-08-20, M-series Mac, colocated, `ab -n 20000`)
 
 Three runs of the whole matrix per strategy, same machine, same sitting, so
