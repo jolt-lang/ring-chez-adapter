@@ -81,6 +81,10 @@ refuses. Chez only; three runs of the whole matrix per strategy.
 | chez `:threads` | 5.31-5.47k | 6.86-6.98k | 5.30-5.37k | 6.91-6.97k |
 | chez `:fibers` | 4.60-4.63k | 6.11-6.17k | 4.87-4.88k | 6.06-6.08k |
 
+Re-run after the server-fault hardening (same machine, same sitting):
+threads 5.05-5.20k plain / 6.56-6.59k ka, fibers 4.32-4.66k plain / 5.81-5.97k
+ka — every cell complete, and the guards cost nothing measurable.
+
 What is worth saying about them:
 
 - **No stall, anywhere.** 40 further cells across `:worker-threads` 1/2/4/16 and
@@ -100,6 +104,17 @@ What is worth saying about them:
   oversubscription; the first three are the interesting shape, and 1.6x from
   four times the workers says most of a request is spent somewhere serialized
   rather than in the workers.
+
+One data point from the Mac that reported the `plain`-mode stall, re-run with
+this branch on jolt 0.8.10 (`N=5000`, well under its 16384-port table): both
+`plain` cells still end `AB-FAILED` with `apr_pollset_poll` timeout — ab was
+connected and the response never came — while both `ka` cells either side of
+them ran at full speed. The server log carries no `fault:` line and no
+GC-rendezvous line, and the port table held ~2.4k TIME_WAIT entries against
+~16k available. So on that machine it is none of the three known causes: not a
+server-level throw, not a whole-process GC stall (the server kept serving
+between failures), not the client port table. The Mac stall stays open as a
+jolt-side issue; the Linux numbers above are unaffected by it.
 
 ## Findings (2026-08-20, M-series Mac, colocated, `ab -n 20000`)
 
