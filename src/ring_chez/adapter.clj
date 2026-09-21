@@ -39,8 +39,9 @@
   "Record and report a fault that is the SERVER's rather than a request's:
   something thrown where no response can carry it and no caller is left to
   catch it — the accept loop, a worker's take/claim/release, a fiber's
-  teardown — or, for :unclaimed, a connection the accept handoff lost, where
-  nothing was thrown at all and the silence was the whole failure.
+  teardown — or, for :unclaimed and :claimed-silent, a connection the accept
+  handoff lost or a worker took and never served, where nothing was thrown at
+  all and the silence was the whole failure.
   :on-failure is not the hook for these, because it answers a REQUEST and
   there is no request here.
 
@@ -812,7 +813,8 @@
 
 (defn- start-sweeper!
   "Every 100ms, take out of service the conns that have run out of time. Both
-  strategies run one; there are two deadlines and they are not the same thing.
+  strategies run one; there are three deadlines and they are not the same
+  thing.
 
   A CONNECTION NOBODY EVER CLAIMED is the first, and it runs on both
   strategies. The accept path registers a conn and then hands it on — onto the
@@ -832,7 +834,15 @@
   loss as a server-level fault. A late owner finds the claim gone and leaves
   the conn alone, which is the rule everywhere else too.
 
-  A FIBER-HELD CONN PAST ITS IDLE DEADLINE is the second, and it is the
+  A CONNECTION CLAIMED BUT NEVER SERVED is the same loss one hop down: the
+  owner won the claim and its serving loop never started. The sweeper cannot
+  take that claim — somebody holds it — so it does what stop-server does with
+  a conn it cannot claim: answers the peer, shuts the conn down so the owner
+  reads EOF whenever it runs, and leaves the fd number for the owner to
+  release. Under a longer deadline than the unclaimed arm's, because an owner
+  can be late without being gone (see claimed-silent-headroom).
+
+  A FIBER-HELD CONN PAST ITS IDLE DEADLINE is the third, and it is the
   counterpart of SO_RCVTIMEO on the threads strategy. conn-down! wakes the
   fiber parked on the fd (forget! resumes registered waiters), so a parked
   read ends as :closed, not a hang — and the fiber, not the sweeper, is what
@@ -844,7 +854,8 @@
   and dropped connections would then accumulate for the life of the process,
   each holding an fd, with the server looking entirely healthy."
   [conns stats fault! unpend!]
-  (let [stop? (atom false)]    (future
+  (let [stop? (atom false)]
+    (future
       (loop []
         (Thread/sleep 100)
         (when-not @stop?
@@ -863,13 +874,29 @@
                   ;; reaping a conn whose owner is about to serve it would
                   ;; close a live connection under ordinary load. The unclaimed
                   ;; arm needs no such margin — nobody has the conn at all.
+                  ;;
+                  ;; SHUTDOWN, NOT RELEASE: this conn has an owner, and only
+                  ;; the owner closes (conn-down!). Closing the number here
+                  ;; hands it to the next accept, and the owner — late, not
+                  ;; gone — then runs its loop on a live connection that
+                  ;; belongs to somebody else. The number stays allocated
+                  ;; until the owner's own finally releases it, the way
+                  ;; stop-server leaves every conn it cannot claim; an owner
+                  ;; that never runs at all costs one fd, and is a lost pool
+                  ;; thread besides. The CAS is conn-down!'s, inlined so the
+                  ;; answer can go out before the shutdown makes writes EPIPE.
+                  ;;
+                  ;; Subtraction, not addition: :claim-by is no-deadline
+                  ;; (Long/MAX_VALUE) until the acceptor arms it, and under
+                  ;; :threads the worker can own the conn before that — a sum
+                  ;; would overflow there, a difference is merely negative.
                   (and @(e :owned?) (not @(e :serving?))
-                       (> now (+ @(e :claim-by) (* sweep-deadline-ms claimed-silent-headroom))))
+                       (> (- now @(e :claim-by))
+                          (* sweep-deadline-ms claimed-silent-headroom)))
                   (when (compare-and-set! (:down? e) false true)
                     (answer-unclaimed! e)
                     (socket/c-shutdown (:conn e) 2)
                     (when (:poller? e) (poller/forget! (:conn e)))
-                    (conn-release! conns e stats)
                     (fault! :claimed-silent
                             (ex-info "connection claimed but never served"
                                      {:type :ring-chez/claimed-silent
@@ -1185,7 +1212,7 @@
                                       ;; keep-alives for the whole claim window
                                       ;; over a loss that is already past the
                                       ;; queue — the ka collapse measured
-                                      ;; 2026-09-30. Once-only either way: the
+                                      ;; 2026-09-20. Once-only either way: the
                                       ;; worker's take-time claim and this both
                                       ;; go through pending-done!'s CAS.
                                       (pending-done! pending entry)

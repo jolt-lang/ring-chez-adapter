@@ -98,7 +98,7 @@ lower `N`, raise the range (`sysctl -w net.inet.ip.portrange.first=16384` on
 macOS), or read the `ka` cells, which reuse a handful of connections and never
 touch it.
 
-## Findings (2026-09-30, M-series Mac, jolt 0.8.10, colocated, `ab -n 20000`)
+## Findings (2026-09-20, M-series Mac, jolt 0.8.10, colocated, `ab -n 20000`)
 
 Same Mac as the 2026-08-20 table below, now on jolt 0.8.10 with the
 server-faults hardening and the unclaimed-connection sweeper merged. Three
@@ -177,7 +177,7 @@ between were proven clean above. Until then, on this Mac the honest matrix
 reads as the table above: JVM references unchanged, chez cells priced by
 the drop.
 
-## Findings (2026-09-30, same Mac, branch `keepalive`: the drop no longer prices the matrix)
+## Findings (2026-09-20, same Mac, branch `keepalive`: the drop no longer prices the matrix)
 
 The sitting above ended in a fix rather than a shrug, and the numbers above
 are now historical. Three changes, all adapter-side, all TDD'd on the
@@ -192,15 +192,17 @@ branch:
 - **A lost conn is answered, not silenced.** The sweeper writes a
   best-effort `503 Service Unavailable` with `Connection: close` before it
   releases the fd — the answer Undertow gives an exchange it cannot serve.
-  One bounded 100ms poll for writability, one send, failure ignored: the
+  One zero-timeout poll for writability, one send, failure ignored: the
   answer is a courtesy, the release is the guarantee.
 - **The backstop is 500ms, and it covers the second loss class too.** A
   conn claimed by a worker whose serving loop never started — the "claim
   hop or below" class from PR #39, which once held an ab run for its full
-  30s poll timeout — gets the same answered close under the same deadline
-  (`:claimed-silent` in server-stats, its own fault kind). The sweep
-  deadline renamed from claim-deadline to sweep-deadline to say what it now
-  measures.
+  30s poll timeout — gets the same answered close after four sweep
+  deadlines (the margin covers an owner that is merely late), reported as
+  `:claimed-silent` in server-stats, its own fault kind. That conn has an
+  owner, so the sweeper shuts it down and leaves the fd number for the
+  owner to release rather than closing it under them. The sweep deadline
+  renamed from claim-deadline to sweep-deadline to say what it now measures.
 
 The same matrix, same machine, same jolt, after (two runs per strategy;
 before, from the table above, in parentheses):
@@ -211,7 +213,7 @@ before, from the table above, in parentheses):
 | chez `:fibers` | 12.4-13.6k (3.1-13.3k) | 15.2-16.2k (15.9-16.6k) | 13.0-13.6k (3.1-13.6k) | 15.2-16.1k (15.3-16.5k) |
 
 Every cell completed — no ab aborts in eight matrices' worth of chez runs,
-where the 2026-09-30 sitting had one and the 2026-08-20 one had several —
+where the 2026-09-20 sitting had one and the 2026-08-20 one had several —
 and the raw-socket probe's verdict on the one cell that did abort
 mid-sitting (`ok=20000 dropped=0`) confirmed every connection now gets an
 answer. Drop counts are unchanged (20 and 20 per threads matrix server,
@@ -291,7 +293,8 @@ saw a healthy server.
 The adapter no longer leaves such a connection lying there: the connection
 sweeper now runs on both strategies and enforces a claim deadline as well as
 an idle one, so a connection nobody has claimed within five seconds of the
-handoff is taken over by the sweeper, closed, and counted as an `:unclaimed`
+handoff (500ms, and answered with a 503, since the `keepalive` findings above)
+is taken over by the sweeper, closed, and counted as an `:unclaimed`
 server fault (`server-stats`). That is a backstop and not a root cause — why
 the handoff loses a connection at all, once in a few thousand and only on that
 machine, is still open — but it bounds what one costs: the peer is closed on

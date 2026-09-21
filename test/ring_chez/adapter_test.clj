@@ -2271,7 +2271,9 @@
                               true
                               (real->!! ch v)))]
         (reset! armed 1)
-        ;; the lost conn sits unclaimed for the whole default 5s claim window
+        ;; the lost conn sits unclaimed until the sweeper answers it; under the
+        ;; old code it counted as accept pressure the whole time, and the
+        ;; first response on the conn beside it already declined keep-alive
         (let [lost (client-connect 8580 3000)]
           (client-send lost "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
           (let [fd (client-connect 8580 3000)]
@@ -2355,7 +2357,15 @@
 ;; not-owned, the keep-alive clock is per-request inside the loop that never
 ;; started, and the peer sits in silence. This is the "claim hop or below"
 ;; class from PR #39's narrowing, and it held an ab run for its full 30s poll
-;; timeout on 2026-09-30 with every unclaimed conn answered around it.
+;; timeout on 2026-09-20 with every unclaimed conn answered around it.
+;;
+;; The answer is the sweeper's; the fd NUMBER is not. The conn is owned, and
+;; only its owner may close it (conn-down!): a number closed under a late
+;; owner is reused by the next accept, and the owner's loop then reads a live
+;; connection belonging to somebody else. So the sweeper shuts the conn down
+;; and leaves the number allocated — :connections stays up until the owner's
+;; own finally runs — exactly as stop-server does for the conns it cannot
+;; claim.
 (defn test-threads-claimed-silent-conn-is-answered []
   (let [server (adapter/run-server handler {:port 8583 :worker-threads 2})
         real-loop @#'ring-chez.adapter/connection-loop
@@ -2369,7 +2379,9 @@
                       (if (take-arm! armed)
                         ;; claimed, then nothing: the loop is never entered,
                         ;; which is what a take that is never scheduled back
-                        ;; looks like from the sweeper
+                        ;; looks like from the sweeper. The owner comes back
+                        ;; 3s in — a second after the sweeper has given up on
+                        ;; it — and its finally is what releases the fd.
                         (Thread/sleep 3000)
                         (apply real-loop args)))]
         (reset! armed 1)
@@ -2379,10 +2391,19 @@
             (let [r (client-recv-until fd "\r\n\r\n")]
               (check "claimed silent: answered 503, not silence"
                      "HTTP/1.1 503 Service Unavailable"
-                     (first (str/split (str r) #"\r\n"))))
+                     (first (str/split (str r) #"\r\n")))
+              (check "claimed silent: declines keep-alive"
+                     true (str/includes? (str/lower-case (str r))
+                                         "connection: close"))
+              ;; answered at ~2.1s; the owner is asleep until 3s, so the
+              ;; number is still its to release
+              (check "claimed silent: fd number left to its owner"
+                     1 (:connections (adapter/server-stats server))))
             (finally (client-close fd)))))
-      (Thread/sleep 700)
+      (Thread/sleep 1200)   ; the owner's finally has run by now
       (let [st (adapter/server-stats server)]
+        (check "claimed silent: owner released it"
+               0 (:connections st))
         (check "claimed silent: reported as its own fault kind"
                :claimed-silent (:kind (:last-fault st))))
       (check "claimed silent: the server still serves"
