@@ -2868,8 +2868,17 @@
         (client-recv fd)
         (let [s1 (adapter/server-stats server)]
           (check "stats: requests counted" 2 (:requests s1))
-          (check "stats: connection counted open" 1 (:connections s1))
-          (check "stats: nothing in flight between requests" 0 (:active s1)))
+          (check "stats: connection counted open" 1 (:connections s1)))
+        ;; :active is decremented in a finally AFTER the response is sent, so
+        ;; the client can hold the response while the worker is still a line
+        ;; short of the decrement — sampled the instant recv returned, this
+        ;; read 1 on a slow CI runner. Give it a moment to settle.
+        (check "stats: nothing in flight between requests"
+               0 (loop [n 0]
+                   (let [a (:active (adapter/server-stats server))]
+                     (if (or (zero? a) (>= n 50))
+                       a
+                       (do (Thread/sleep 10) (recur (inc n)))))))
         (client-close fd))
       (Thread/sleep 300)
       (check "stats: connection no longer open" 0 (:connections (adapter/server-stats server)))
