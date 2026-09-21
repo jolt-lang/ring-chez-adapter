@@ -40,6 +40,7 @@
 (ffi/defcfn c-inet-pton  "inet_pton"  [:int :pointer :pointer] :int)
 
 (def POLLIN  0x001)
+(def POLLOUT 0x004)
 (def ^:private POLLERR  0x008)
 (def ^:private POLLHUP  0x010)
 (def ^:private POLLNVAL 0x020)

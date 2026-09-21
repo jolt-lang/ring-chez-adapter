@@ -232,7 +232,8 @@ the stop.
 loop, in a worker's take/claim/release, or in a fiber's teardown, where no
 response can carry it and no caller is left to catch it, plus one failure that
 throws nothing at all: `:unclaimed`, a connection that was accepted, handed to
-a worker or a fiber, and then never claimed by either. A handler's failures
+a worker or a fiber, and then never claimed by either — and `:claimed-silent`,
+one that a worker did claim and then never served. A handler's failures
 are not here; `:on-failure` answers those, because they have a request to
 answer. Every such fault is also printed once to stderr (the first twenty, so
 one that repeats per connection cannot become the load itself), and
@@ -253,9 +254,20 @@ the claim at the far end of the accept handoff, so a connection that is handed
 on and never claimed is served by nobody, closed by nobody — only an owner may
 free an fd number — and, because no guard is crossed, reported by nobody: the
 peer waits out its own timeout against a server that is answering everyone
-else in a millisecond. A connection still unclaimed five seconds after the
-handoff is now taken over by the sweeper, which wins the same claim a late
-worker or fiber would have to win, closes it, and counts it here.
+else in a millisecond. A connection still unclaimed 500ms after the handoff is
+now taken over by the sweeper, which wins the same claim a late worker or
+fiber would have to win, answers the peer with a best-effort `503 Service
+Unavailable` and `Connection: close` so it fails fast instead of waiting,
+closes it, and counts it here.
+
+`:claimed-silent` is one hop further down: a worker took the connection and
+then never entered its serving loop. That connection has an owner, so the
+sweeper cannot claim it and may not close it — only the owner frees an fd
+number — but it can end it: after four times the same deadline (the margin
+covers a GC pause or a descheduled worker that is merely late) it answers the
+peer the same 503 and shuts the connection down, so the owner, if it ever
+runs, reads EOF and releases the number itself. Both kinds mean the runtime
+lost a handoff; neither should appear on a healthy server.
 
 `swap-handler!` re-points a running server without a restart, including on
 connections already open — the handler is resolved per request, after the read

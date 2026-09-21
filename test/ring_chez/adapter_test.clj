@@ -2168,7 +2168,7 @@
     (try
       (Thread/sleep 150)
       (check "lost handoff: healthy before" "HTTP/1.1 200 OK" (get-within 8576 3000))
-      (with-redefs [ring-chez.adapter/claim-deadline-ms 1500
+      (with-redefs [ring-chez.adapter/sweep-deadline-ms 1500
                     a/>!! (fn [ch v]
                             (if (and (identical? ch work) (take-arm! armed))
                               true
@@ -2206,7 +2206,7 @@
     (try
       (Thread/sleep 250)
       (check "lost spawn: healthy before" "HTTP/1.1 200 OK" (get-within 8577 3000))
-      (with-redefs [ring-chez.adapter/claim-deadline-ms 1500
+      (with-redefs [ring-chez.adapter/sweep-deadline-ms 1500
                     ring-chez.adapter/fiber-serve
                     (fn [conn-info cfg entry conns]
                       (when-not (take-arm! armed)
@@ -2234,7 +2234,7 @@
                                    {:port 8578 :worker-threads 1})]
     (try
       (Thread/sleep 150)
-      (with-redefs [ring-chez.adapter/claim-deadline-ms 200]
+      (with-redefs [ring-chez.adapter/sweep-deadline-ms 200]
         (let [busy   (a/thread (get-within 8578 9000))
               _      (Thread/sleep 150)
               queued (a/thread (get-within 8578 9000))]
@@ -2247,6 +2247,203 @@
       (check "queued conn: nothing reported as lost"
              0 (:faults (adapter/server-stats server)))
       (finally (adapter/stop-server server)))))
+
+;; --- a drop must not cost the connection fleet, and must be answered ---------
+;; Two properties of the same loss. A conn whose handoff rendezvous completed
+;; is not queued behind anybody: it stops counting as accept pressure the
+;; moment the rendezvous answers, not five seconds later at the claim
+;; deadline — or one dropped conn retires every idle keep-alive for its whole
+;; backstop window, which is the ka collapse measured in benchmark/README.md.
+;; And the dropped conn itself is ANSWERED — 503, Connection: close, the way
+;; an overloaded Undertow answers — instead of shutting a silent fd on a peer
+;; that then waits out its own timeout.
+
+(defn test-lost-handoff-does-not-retire-keepalive []
+  (let [server (adapter/run-server handler {:port 8580 :worker-threads 2})
+        work (:work server)
+        real->!! a/>!!
+        armed (atom 0)]
+    (try
+      (Thread/sleep 150)
+      (check "ka under drop: healthy before" "HTTP/1.1 200 OK" (get-within 8580 3000))
+      (with-redefs [a/>!! (fn [ch v]
+                            (if (and (identical? ch work) (take-arm! armed))
+                              true
+                              (real->!! ch v)))]
+        (reset! armed 1)
+        ;; the lost conn sits unclaimed until the sweeper answers it; under the
+        ;; old code it counted as accept pressure the whole time, and the
+        ;; first response on the conn beside it already declined keep-alive
+        (let [lost (client-connect 8580 3000)]
+          (client-send lost "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+          (let [fd (client-connect 8580 3000)]
+            (try
+              (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+              (let [r1 (client-recv-until fd "\r\n\r\n")]
+                (check "ka under drop: first response keeps keep-alive"
+                       false (str/includes? (str/lower-case (str r1))
+                                            "connection: close"))
+                ;; idle past the 2s pressure grace: under the old code the
+                ;; lost conn still counts as pressure and this conn is
+                ;; retired with a close instead of being answered
+                (Thread/sleep 2300)
+                (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+                (let [r2 (client-recv-until fd "\r\n\r\n")]
+                  (check "ka under drop: idle conn still answered"
+                         "HTTP/1.1 200 OK" (first (str/split (str r2) #"\r\n")))))
+              (finally (client-close fd))))
+          (client-close lost)))
+      (finally (reset! armed 0) (adapter/stop-server server)))))
+
+(defn test-threads-lost-handoff-is-answered-503 []
+  (let [server (adapter/run-server handler {:port 8581 :worker-threads 2})
+        work (:work server)
+        real->!! a/>!!
+        armed (atom 0)]
+    (try
+      (Thread/sleep 150)
+      (with-redefs [ring-chez.adapter/sweep-deadline-ms 400
+                    a/>!! (fn [ch v]
+                            (if (and (identical? ch work) (take-arm! armed))
+                              true
+                              (real->!! ch v)))]
+        (reset! armed 1)
+        (let [fd (client-connect 8581 3000)]
+          (try
+            (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+            (let [r (client-recv-until fd "\r\n\r\n")]
+              (check "lost handoff 503: answered, not silence"
+                     "HTTP/1.1 503 Service Unavailable"
+                     (first (str/split (str r) #"\r\n")))
+              (check "lost handoff 503: declines keep-alive"
+                     true (str/includes? (str/lower-case (str r))
+                                         "connection: close")))
+            (finally (client-close fd)))))
+      (Thread/sleep 700)   ; past the shortened claim deadline and a sweep
+      (check "lost handoff 503: still reported as a fault"
+             :unclaimed (:kind (:last-fault (adapter/server-stats server))))
+      (check "lost handoff 503: the server still serves"
+             "HTTP/1.1 200 OK" (get-within 8581 3000))
+      (finally (reset! armed 0) (adapter/stop-server server)))))
+
+(defn test-fibers-lost-spawn-is-answered-503 []
+  (let [server (adapter/run-server handler {:port 8582 :strategy :fibers})
+        real-serve @#'ring-chez.adapter/fiber-serve
+        armed (atom 0)]
+    (try
+      (Thread/sleep 250)
+      (with-redefs [ring-chez.adapter/sweep-deadline-ms 400
+                    ring-chez.adapter/fiber-serve
+                    (fn [conn-info cfg entry conns]
+                      (when-not (take-arm! armed)
+                        (real-serve conn-info cfg entry conns)))]
+        (reset! armed 1)
+        (let [fd (client-connect 8582 3000)]
+          (try
+            (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+            (let [r (client-recv-until fd "\r\n\r\n")]
+              (check "lost spawn 503: answered, not silence"
+                     "HTTP/1.1 503 Service Unavailable"
+                     (first (str/split (str r) #"\r\n"))))
+            (finally (client-close fd)))))
+      (Thread/sleep 700)
+      (check "lost spawn 503: still reported as a fault"
+             :unclaimed (:kind (:last-fault (adapter/server-stats server))))
+      (finally (reset! armed 0) (adapter/stop-server server)))))
+
+;; The other loss class, one hop further down: the worker's take DID answer
+;; — the entry is owned — and then nothing ran. A conn claimed but never
+;; served has no deadline under :threads at all: the unclaimed arm requires
+;; not-owned, the keep-alive clock is per-request inside the loop that never
+;; started, and the peer sits in silence. This is the "claim hop or below"
+;; class from PR #39's narrowing, and it held an ab run for its full 30s poll
+;; timeout on 2026-09-20 with every unclaimed conn answered around it.
+;;
+;; The answer is the sweeper's; the fd NUMBER is not. The conn is owned, and
+;; only its owner may close it (conn-down!): a number closed under a late
+;; owner is reused by the next accept, and the owner's loop then reads a live
+;; connection belonging to somebody else. So the sweeper shuts the conn down
+;; and leaves the number allocated — :connections stays up until the owner's
+;; own finally runs — exactly as stop-server does for the conns it cannot
+;; claim.
+(defn test-threads-claimed-silent-conn-is-answered []
+  (let [server (adapter/run-server handler {:port 8583 :worker-threads 2})
+        real-loop @#'ring-chez.adapter/connection-loop
+        armed (atom 0)]
+    (try
+      (Thread/sleep 150)
+      (check "claimed silent: healthy before" "HTTP/1.1 200 OK" (get-within 8583 3000))
+      (with-redefs [ring-chez.adapter/sweep-deadline-ms 400
+                    ring-chez.adapter/connection-loop
+                    (fn [& args]
+                      (if (take-arm! armed)
+                        ;; claimed, then nothing: the loop is never entered,
+                        ;; which is what a take that is never scheduled back
+                        ;; looks like from the sweeper. The owner comes back
+                        ;; 3s in — a second after the sweeper has given up on
+                        ;; it — and its finally is what releases the fd.
+                        (Thread/sleep 3000)
+                        (apply real-loop args)))]
+        (reset! armed 1)
+        (let [fd (client-connect 8583 4000)]
+          (try
+            (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+            (let [r (client-recv-until fd "\r\n\r\n")]
+              (check "claimed silent: answered 503, not silence"
+                     "HTTP/1.1 503 Service Unavailable"
+                     (first (str/split (str r) #"\r\n")))
+              (check "claimed silent: declines keep-alive"
+                     true (str/includes? (str/lower-case (str r))
+                                         "connection: close"))
+              ;; answered at ~2.1s; the owner is asleep until 3s, so the
+              ;; number is still its to release
+              (check "claimed silent: fd number left to its owner"
+                     1 (:connections (adapter/server-stats server))))
+            (finally (client-close fd)))))
+      (Thread/sleep 1200)   ; the owner's finally has run by now
+      (let [st (adapter/server-stats server)]
+        (check "claimed silent: owner released it"
+               0 (:connections st))
+        (check "claimed silent: reported as its own fault kind"
+               :claimed-silent (:kind (:last-fault st))))
+      (check "claimed silent: the server still serves"
+             "HTTP/1.1 200 OK" (get-within 8583 3000))
+      (finally (reset! armed 0) (adapter/stop-server server)))))
+
+;; The claimed-silent arm must not reap a conn whose owner is merely late:
+;; between the worker's claim and the loop's entry there is a scheduling
+;; window, and a GC pause or a descheduled worker can stretch it past any
+;; base deadline. The claimed arm therefore waits a multiple of the sweep
+;; deadline beyond expiry before giving up — the owner is alive and adjacent
+;; to serving, unlike the unclaimed loss where nobody has it at all.
+(defn test-claimed-silent-arm-waits-for-a-late-owner []
+  (let [server (adapter/run-server handler {:port 8584 :worker-threads 2})
+        real-loop @#'ring-chez.adapter/connection-loop
+        armed (atom 0)]
+    (try
+      (Thread/sleep 150)
+      (with-redefs [ring-chez.adapter/sweep-deadline-ms 400
+                    ring-chez.adapter/connection-loop
+                    (fn [& args]
+                      (if (take-arm! armed)
+                        ;; the owner was descheduled for 1s before entering
+                        ;; its loop: 2.5x the base deadline, inside the
+                        ;; claimed arm's extra headroom
+                        (do (Thread/sleep 1000)
+                            (apply real-loop args))
+                        (apply real-loop args)))]
+        (reset! armed 1)
+        (let [fd (client-connect 8584 5000)]
+          (try
+            (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+            (let [r (client-recv-until fd "\r\n\r\n")]
+              (check "late owner: served, not reaped"
+                     "HTTP/1.1 200 OK" (first (str/split (str r) #"\r\n"))))
+            (finally (client-close fd)))))
+      (Thread/sleep 700)   ; a sweep tick past the whole window
+      (check "late owner: no claimed-silent fault"
+             nil (:kind (:last-fault (adapter/server-stats server))))
+      (finally (reset! armed 0) (adapter/stop-server server)))))
 
 ;; --- Wave 2 round 2: handler deadline --------------------------------------------
 
@@ -2671,8 +2868,17 @@
         (client-recv fd)
         (let [s1 (adapter/server-stats server)]
           (check "stats: requests counted" 2 (:requests s1))
-          (check "stats: connection counted open" 1 (:connections s1))
-          (check "stats: nothing in flight between requests" 0 (:active s1)))
+          (check "stats: connection counted open" 1 (:connections s1)))
+        ;; :active is decremented in a finally AFTER the response is sent, so
+        ;; the client can hold the response while the worker is still a line
+        ;; short of the decrement — sampled the instant recv returned, this
+        ;; read 1 on a slow CI runner. Give it a moment to settle.
+        (check "stats: nothing in flight between requests"
+               0 (loop [n 0]
+                   (let [a (:active (adapter/server-stats server))]
+                     (if (or (zero? a) (>= n 50))
+                       a
+                       (do (Thread/sleep 10) (recur (inc n)))))))
         (client-close fd))
       (Thread/sleep 300)
       (check "stats: connection no longer open" 0 (:connections (adapter/server-stats server)))
@@ -3914,6 +4120,16 @@
   (run-test "test-fibers-lost-spawn-is-reaped-and-reported"
             test-fibers-lost-spawn-is-reaped-and-reported)
   (run-test "test-queued-connection-is-not-reaped" test-queued-connection-is-not-reaped)
+  (run-test "test-lost-handoff-does-not-retire-keepalive"
+            test-lost-handoff-does-not-retire-keepalive)
+  (run-test "test-threads-lost-handoff-is-answered-503"
+            test-threads-lost-handoff-is-answered-503)
+  (run-test "test-fibers-lost-spawn-is-answered-503"
+            test-fibers-lost-spawn-is-answered-503)
+  (run-test "test-threads-claimed-silent-conn-is-answered"
+            test-threads-claimed-silent-conn-is-answered)
+  (run-test "test-claimed-silent-arm-waits-for-a-late-owner"
+            test-claimed-silent-arm-waits-for-a-late-owner)
 
   ;; --- Wave 2 round 2: handler deadline ---
   (run-test "test-handler-deadline-threads" test-handler-deadline-threads)

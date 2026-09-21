@@ -98,6 +98,141 @@ lower `N`, raise the range (`sysctl -w net.inet.ip.portrange.first=16384` on
 macOS), or read the `ka` cells, which reuse a handful of connections and never
 touch it.
 
+## Findings (2026-09-20, M-series Mac, jolt 0.8.10, colocated, `ab -n 20000`)
+
+Same Mac as the 2026-08-20 table below, now on jolt 0.8.10 with the
+server-faults hardening and the unclaimed-connection sweeper merged. Three
+runs of the whole matrix per strategy, `/json` pass on the first. The
+ephemeral-port range was widened to 16384-65535 for the plain cells
+(`sysctl -w net.inet.ip.portrange.first=16384`), so they complete on the
+stock client for the first time.
+
+| server | plain c=10 | ka c=10 | plain c=100 | ka c=100 |
+|---|---:|---:|---:|---:|
+| undertow | 19.0-26.3k | 61.2-79.3k | 21.5-24.2k | 92.4-106.1k |
+| jetty | 17.3-21.1k | 60.2-74.6k | 19.3-21.9k | 92.6-102.1k |
+| chez `:threads` | 1.9-3.4k | 1.8-3.1k | 3.2-3.3k | 3.2-3.3k |
+| chez `:fibers` | 3.1-13.3k | 15.9-16.6k | 3.1-13.6k | 15.3-16.5k |
+
+The fibers `plain` range is bimodal, not spread: 3.1-3.5k on two servers
+that lost connections, 13.3-13.6k on the one that did not.
+
+`/json`, plain, one run — same story as `/plaintext`, so body size remains
+irrelevant:
+
+| server | c=10 | c=100 |
+|---|---:|---:|
+| undertow | 20549 | 21661 |
+| jetty | 21874 | 19004 |
+| chez `:threads` | 2745 | 3495 |
+
+Undertow and Jetty land in their 2026-08-20 classes (ka cells squarely;
+plain cells a touch wider, 17.3-26.3k vs 19.7-23.7k before), which says the
+machine is healthy and the comparison is fair. The chez cells did not, and
+the reason is not the adapter: it is the Mac `plain` drop of PR #39
+now amplified by the sweeper that reclaims it.
+
+What happened, verified step by step on this sitting:
+
+- **Every adapter commit between Aug 31 and today benches 14-16k req/s on
+  `plain c=10` at `N=3000`** — swept one by one from the jolt-0.8.0
+  migration (`23d1fbc`) through main (`6a53b6f`), single server, no
+  diagnosis machinery. There is no adapter regression in that window.
+- **At `N=20000` the same main build falls to ~2.8k req/s with `unclaimed
+  fault:` lines in the server log.** Drop counts per matrix run (42000
+  connections: 2000 warmup plus the two 20000-request plain cells): 20, 20,
+  20 on the three `:threads` servers — one per ~2100 connections, PR #39's
+  rate — and 5, 5, 0 on the `:fibers` ones. Each drop
+  now costs five seconds of sweeper claim-deadline before the fd is
+  reclaimed. Against `ab -c 10`, whose ten slots have ~13 slot-seconds of
+  real work at 15k req/s, twenty drops contribute ~100 slot-seconds of
+  waiting: the cell reads ~2.8k.
+- **The `ka` collapse on `:threads` is the same drop read sideways.** An
+  unclaimed connection counts in `pending` for its whole 5s window, and
+  `idle-poll-recv!` (adapter.clj:355) retires every idle keepalive once
+  `pending` is positive past a 2s grace — so with drops arriving every few
+  hundred milliseconds somewhere in a 20k run, keepalive on `:threads`
+  never engages. That is why `ka` cells sit at the same ~3k as `plain`
+  ones, ~15x below the 47-54k of 2026-08-20.
+- **`:fibers` ka is untouched at 15.3-16.6k, and its one drop-free server
+  ran `plain` at 13.3-13.6k** — 2026-08-20's class (15.0-15.5k). The
+  sweeper's keepalive retirement applies to the threads strategy; a dropped
+  fiber conn costs its own 5s on one connection, and every other connection
+  keeps keepalive. Plain cells collapse on both strategies whenever drops
+  happen — drops are per-connection, and every plain request is its own
+  connection. Three servers per strategy is a small sample, but threads
+  dropped on 3/3 and fibers on 2/3 at a quarter of the count, which points
+  at the `>!!` claim hop rather than the poller handoff.
+- **The 5s backstop itself is working as designed**: fd counts stay flat,
+  no CLOSE_WAIT residue, and every drop is counted and reported as
+  `:unclaimed` in `server-stats` rather than leaking silently. What
+  changed since 2026-08-20 is that the Mac drop acquired a visible,
+  throughput-scale price tag.
+
+What it does not say: that the adapter got slower. A jolt-side fix for the
+lost handoff (the still-open question from PR #39 — why the claim/handoff
+hop loses a connection once in a few thousand, only on this machine) would
+restore the 2026-08-20 numbers on every cell, because the commits in
+between were proven clean above. Until then, on this Mac the honest matrix
+reads as the table above: JVM references unchanged, chez cells priced by
+the drop.
+
+## Findings (2026-09-20, same Mac, branch `keepalive`: the drop no longer prices the matrix)
+
+The sitting above ended in a fix rather than a shrug, and the numbers above
+are now historical. Three changes, all adapter-side, all TDD'd on the
+branch:
+
+- **Pressure leaves at the rendezvous, not at the claim.** A conn whose
+  `>!!` handoff answered is past the queue — nobody is ever going to take
+  it again — so it stops counting as accept pressure the moment the
+  rendezvous completes (once-only, shared with the worker's take-time claim
+  through the same CAS). A lost conn therefore retires nobody's keep-alive:
+  the ka collapse is gone, not mitigated.
+- **A lost conn is answered, not silenced.** The sweeper writes a
+  best-effort `503 Service Unavailable` with `Connection: close` before it
+  releases the fd — the answer Undertow gives an exchange it cannot serve.
+  One zero-timeout poll for writability, one send, failure ignored: the
+  answer is a courtesy, the release is the guarantee.
+- **The backstop is 500ms, and it covers the second loss class too.** A
+  conn claimed by a worker whose serving loop never started — the "claim
+  hop or below" class from PR #39, which once held an ab run for its full
+  30s poll timeout — gets the same answered close after four sweep
+  deadlines (the margin covers an owner that is merely late), reported as
+  `:claimed-silent` in server-stats, its own fault kind. That conn has an
+  owner, so the sweeper shuts it down and leaves the fd number for the
+  owner to release rather than closing it under them. The sweep deadline
+  renamed from claim-deadline to sweep-deadline to say what it now measures.
+
+The same matrix, same machine, same jolt, after (two runs per strategy;
+before, from the table above, in parentheses):
+
+| server | plain c=10 | ka c=10 | plain c=100 | ka c=100 |
+|---|---:|---:|---:|---:|
+| chez `:threads` | 9.1-11.8k (1.9-3.4k) | 37.8-40.2k (1.8-3.1k) | 9.8-11.8k (3.2-3.3k) | 14.2-23.4k (3.2-3.3k) |
+| chez `:fibers` | 12.4-13.6k (3.1-13.3k) | 15.2-16.2k (15.9-16.6k) | 13.0-13.6k (3.1-13.6k) | 15.2-16.1k (15.3-16.5k) |
+
+Every cell completed — no ab aborts in eight matrices' worth of chez runs,
+where the 2026-09-20 sitting had one and the 2026-08-20 one had several —
+and the raw-socket probe's verdict on the one cell that did abort
+mid-sitting (`ok=20000 dropped=0`) confirmed every connection now gets an
+answer. Drop counts are unchanged (20 and 20 per threads matrix server,
+0-6 on fibers): the fix does not stop the jolt-side loss, it stops the loss
+from costing anything but itself. The arithmetic of what remains is exact:
+at ~20 drops per 42000-conn matrix and 500ms per answered drop, plain
+c=10's ten slots lose ~10 slot-seconds of a ~140s run — the observed
+9-12k against the drop-free 13-16k class is that and nothing else.
+
+Keep-alive against the JVM, finally readable: threads ka c=10 lands at
+37.8-40.2k against undertow's 64-78k and jetty's 64-75k on this machine —
+half to two-thirds of the JVM servers rather than a twentieth, with the
+remaining gap the per-request worker-dispatch cost. ka c=100 reads
+14.2-23.4k against 92-106k; that gap is dispatch again, plus a pool of
+default 40 workers against 100 hot connections. The structural floor —
+one OS thread per request under a blocking Ring handler — is the honest
+ceiling on this design, and it is the one thing an adapter-side change
+cannot lift.
+
 ## Findings (2026-09-20, 4-core Linux 6.8, jolt 0.8.10, colocated, `ab -n 20000`)
 
 A second machine and a much smaller one, recorded because the matrix had never
@@ -158,7 +293,8 @@ saw a healthy server.
 The adapter no longer leaves such a connection lying there: the connection
 sweeper now runs on both strategies and enforces a claim deadline as well as
 an idle one, so a connection nobody has claimed within five seconds of the
-handoff is taken over by the sweeper, closed, and counted as an `:unclaimed`
+handoff (500ms, and answered with a 503, since the `keepalive` findings above)
+is taken over by the sweeper, closed, and counted as an `:unclaimed`
 server fault (`server-stats`). That is a backstop and not a root cause — why
 the handoff loses a connection at all, once in a few thousand and only on that
 machine, is still open — but it bounds what one costs: the peer is closed on
