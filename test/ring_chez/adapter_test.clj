@@ -2445,6 +2445,51 @@
              nil (:kind (:last-fault (adapter/server-stats server))))
       (finally (reset! armed 0) (adapter/stop-server server)))))
 
+;; --- a spuriously failing compare-and-set! must not lose the claim ----------------
+;; The root cause of every "lost handoff" above (PR #39, #40): jolt's
+;; compare-and-set! sat on Chez's $record-cas!, one ldxr/stxr on AArch64,
+;; which answers false with the value STILL THE EXPECTED ONE whenever the
+;; core's exclusive monitor is cleared under it — a context switch, or the
+;; acceptor storing into the atom beside :owned? on the same cache line. The
+;; worker read that false as "stop-server owns this conn" and walked away; one
+;; accept in ~1400 under ab on an M-series Mac, never on x86 (jolt-lang/jolt
+;; #1072 makes the primitive strong). The adapter's every once-only step is
+;; such a CAS, so it goes through cas!, which believes a false only once the
+;; value has been seen to be something else. This injects exactly the hardware's
+;; failure — false, atom untouched — into the first claim and expects the conn
+;; served, nothing reaped, no pressure left behind.
+(defn test-claim-survives-a-spurious-cas-failure []
+  (let [server (adapter/run-server handler {:port 8585 :worker-threads 2})
+        real-cas compare-and-set!
+        armed (atom 0)]
+    (try
+      (Thread/sleep 150)
+      (check "spurious cas: healthy before" "HTTP/1.1 200 OK" (get-within 8585 3000))
+      (with-redefs [ring-chez.adapter/sweep-deadline-ms 400
+                    compare-and-set!
+                    (fn [a o n]
+                      ;; false->true with the value false IS the worker's
+                      ;; claim-close! (pending-done! goes the other way, and
+                      ;; the sweeper's claim comes 400ms later); answer it
+                      ;; the way the weak primitive did, exactly once
+                      (if (and (false? o) (true? n) (false? @a) (take-arm! armed))
+                        false
+                        (real-cas a o n)))]
+        (reset! armed 1)
+        (let [fd (client-connect 8585 3000)]
+          (try
+            (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+            (let [r (client-recv-until fd "\r\n\r\n")]
+              (check "spurious cas: the conn is served, not walked away from"
+                     "HTTP/1.1 200 OK" (first (str/split (str r) #"\r\n")))
+              (check "spurious cas: keep-alive kept — no pressure left behind"
+                     false (str/includes? (str/lower-case (str r)) "connection: close")))
+            (finally (client-close fd)))))
+      (Thread/sleep 700)   ; past the shortened sweep deadline
+      (check "spurious cas: nothing reaped" 0 (:faults (adapter/server-stats server)))
+      (check "spurious cas: the arm was consumed" 0 @armed)
+      (finally (reset! armed 0) (adapter/stop-server server)))))
+
 ;; --- Wave 2 round 2: handler deadline --------------------------------------------
 
 ;; Igropyr kills a worker stuck past stuck-ms and answers through on-failure.
@@ -4130,6 +4175,8 @@
             test-threads-claimed-silent-conn-is-answered)
   (run-test "test-claimed-silent-arm-waits-for-a-late-owner"
             test-claimed-silent-arm-waits-for-a-late-owner)
+  (run-test "test-claim-survives-a-spurious-cas-failure"
+            test-claim-survives-a-spurious-cas-failure)
 
   ;; --- Wave 2 round 2: handler deadline ---
   (run-test "test-handler-deadline-threads" test-handler-deadline-threads)

@@ -12,6 +12,7 @@
             [ring-chez.socket :as socket]
             [ring-chez.http :as http]
             [ring-chez.websocket :as ws]
+            [ring-chez.cas :refer [cas!]]
             [jolt.io-poller :as poller]
             [jolt.ffi :as ffi]))
 
@@ -551,7 +552,7 @@
                      ;; once from each path. Whoever claims first reports; the
                      ;; loser's work is abandoned along with the rest of it.
                      claim!   (let [claimed (atom false)]
-                                #(compare-and-set! claimed false true))
+                                #(cas! claimed false true))
                      started  (System/currentTimeMillis)
                      ;; NOT `r`: that is the read, and its :leftover carries
                      ;; the pipelined bytes this loop recurs on
@@ -667,7 +668,7 @@
   retry recv sees EOF, not EAGAIN, so it cannot re-park on a dead
   registration. Only the fibers path has a registration to forget."
   [entry]
-  (when (compare-and-set! (:down? entry) false true)
+  (when (cas! (:down? entry) false true)
     (socket/c-shutdown (:conn entry) 2)
     (when (:poller? entry) (poller/forget! (:conn entry)))))
 
@@ -677,7 +678,7 @@
   ever claimed. A caller that LOSES must not touch the fd again — the winner
   may already have released the number to another socket."
   [entry]
-  (compare-and-set! (:owned? entry) false true))
+  (cas! (:owned? entry) false true))
 
 (defn- pending-done!
   "Take one conn out of the threads strategy's accept-pressure count, exactly
@@ -690,7 +691,7 @@
   under-pressure? stuck true, which is keep-alive declined on every response
   from then on."
   [pending entry]
-  (when (compare-and-set! (:pending? entry) true false)
+  (when (cas! (:pending? entry) true false)
     (swap! pending dec)))
 
 (defn- conn-release!
@@ -707,7 +708,7 @@
   releases before any worker claimed it never reaches a finally at all."
   [conns entry stats]
   (conn-down! entry)
-  (when (compare-and-set! (:released? entry) false true)
+  (when (cas! (:released? entry) false true)
     (when (:poller? entry) (poller/forget! (:conn entry)))
     (socket/c-close (:conn entry))
     (swap! (:open stats) dec))
@@ -893,7 +894,7 @@
                   (and @(e :owned?) (not @(e :serving?))
                        (> (- now @(e :claim-by))
                           (* sweep-deadline-ms claimed-silent-headroom)))
-                  (when (compare-and-set! (:down? e) false true)
+                  (when (cas! (:down? e) false true)
                     (answer-unclaimed! e)
                     (socket/c-shutdown (:conn e) 2)
                     (when (:poller? e) (poller/forget! (:conn e)))
