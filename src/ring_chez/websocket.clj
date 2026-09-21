@@ -14,7 +14,8 @@
    message too big) rather than handing a malformed message to the caller."
   (:require [jolt.ffi :as ffi]
             [jolt.io-poller :as poller]
-            [jolt.crypto :as crypto]))
+            [jolt.crypto :as crypto]
+            [ring-chez.cas :refer [cas!]]))
 
 (ffi/defcfn c-send  "send"  [:int :pointer :size_t :int] :ssize_t :blocking)
 (ffi/defcfn c-recv  "recv"  [:int :pointer :size_t :int] :ssize_t :blocking)
@@ -313,7 +314,7 @@
 (defn close!
   "Send a close frame with no status. Idempotent."
   [session]
-  (when (compare-and-set! (:closed? session) false true)
+  (when (cas! (:closed? session) false true)
     (send-bytes (:fd session) (encode-frame 0x8 empty-bytes)))
   true)
 
@@ -328,7 +329,7 @@
   "Close with a status code (1002 protocol error, 1007 invalid UTF-8, 1009
   message too big, or a peer's own code echoed back)."
   [session code]
-  (when (compare-and-set! (:closed? session) false true)
+  (when (cas! (:closed? session) false true)
     (send-bytes (:fd session)
                 (encode-frame 0x8 (byte-array [(unchecked-byte (bit-shift-right code 8))
                                                (unchecked-byte (bit-and 0xff code))]))))

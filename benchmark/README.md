@@ -233,6 +233,61 @@ one OS thread per request under a blocking Ring handler — is the honest
 ceiling on this design, and it is the one thing an adapter-side change
 cannot lift.
 
+## Findings (2026-09-20, same Mac: the drop was a weak compare-and-swap, and it is gone)
+
+The jolt-side loss that PR #39 left open and the section above priced is
+found and fixed. It was never in the channel or the poller: the worker's
+`(compare-and-set! owned? false true)` — the claim every serving path hangs
+off — answered **false with the atom still false**. jolt's
+`compare-and-set!` sat on Chez's `$record-cas!`, which on AArch64 is a
+single `ldxr`/`stxr` (`s/arm64.ss` `asm-cas`); the `stxr` fails whenever the
+core's exclusive monitor was cleared between the two — a context switch, or
+another core storing into the same reservation granule, which the acceptor
+writing `:claim-by` beside `:owned?` is — and the primitive reports failure
+with the value untouched. The worker read that as "stop-server owns this
+conn" and walked away; the sweeper found it unowned 500ms later. Both
+strategies claim through the same CAS, so both dropped; x86's `cmpxchg`
+cannot fail spuriously, so Linux CI never saw it. Traced by stamping the
+worker's steps on every entry the sweeper reaped: `<!!` returned it at
+t=0, `claim-close!` lost at t=0, and 500ms later the same CAS won for the
+sweeper. Reproduced without the adapter: 50-130 spurious refusals per 3M
+single-owner CASes under neighbour stores (jolt `test/chez/cas-test.ss`).
+
+Two fixes, either sufficient: jolt-lang/jolt#1072 makes `sa-record-cas!`
+strong (retry while a re-read still holds the expected value), and the
+adapter's every once-only claim now goes through `ring-chez.cas/cas!`,
+which does the same over the released primitive until `:jolt/min-version`
+carries the fix.
+
+Same cells, same machine, stock jolt 0.8.10 plus the adapter change — but a
+plainer harness than `run.sh`: `ab -n 20000 -q` straight at a
+`(fn [_] {:status 200 :body "x"})` handler, no warmup and no `/json` pass, so
+the numbers are the drop's absence, not a re-run of the matrix (two to five
+runs per cell; the `keepalive` matrix numbers above in parentheses):
+
+| server | plain c=10 | ka c=10 | plain c=100 | ka c=100 |
+|---|---:|---:|---:|---:|
+| chez `:threads` | 15.5-16.2k (9.1-11.8k) | 34.5-34.9k (37.8-40.2k) | 15.4-15.7k (9.8-11.8k) | 27.1-29.9k (14.2-23.4k) |
+| chez `:fibers` | 13.4-13.7k (12.4-13.6k) | 15.8-16.1k (15.2-16.2k) | 14.4-15.4k (13.0-13.6k) | 16.8-16.9k (15.2-16.1k) |
+
+**Zero drops** — 0 `:unclaimed`, 0 failed requests — over 260k connections
+across every cell, on both strategies, where the same runs on the fixed jolt
+alone read the same (0 in 180k) and stock jolt without the adapter change
+read 12-29 per 20k. The plain cells land in the drop-free class the
+previous section predicted from arithmetic (13-16k); the ka cells sit where
+the `keepalive` matrix put them, harness differences aside. What separates
+threads ka c=10 from 2026-08-20's 47-54k is not answered here.
+
+One thing this sitting saw that is NOT the drop, recorded so it is not
+mistaken for it: on `:threads` ka c=100 — a hundred hot keep-alive
+connections over the default ten-worker pool — about one run in seven takes
+2.7s instead of 0.7s and ab reports ~5 `Length` failures (0-byte responses)
+with `server-stats` at 0 faults. That is a single 2-second stall plus a few
+connections closed on a peer mid-reuse, and it sits in the accept-pressure
+retire path (`idle-poll-recv!`'s 2s grace): with `:worker-threads 100` the
+same cell ran 8/8 clean. Oversubscription policy, not a lost handoff; its
+own issue.
+
 ## Findings (2026-09-20, 4-core Linux 6.8, jolt 0.8.10, colocated, `ab -n 20000`)
 
 A second machine and a much smaller one, recorded because the matrix had never

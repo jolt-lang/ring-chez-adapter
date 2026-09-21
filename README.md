@@ -269,6 +269,18 @@ peer the same 503 and shuts the connection down, so the owner, if it ever
 runs, reads EOF and releases the number itself. Both kinds mean the runtime
 lost a handoff; neither should appear on a healthy server.
 
+They did appear, one in ~1400 accepts on Apple silicon, and the cause was
+not a lost handoff at all: jolt's `compare-and-set!` below
+[jolt-lang/jolt#1072](https://github.com/jolt-lang/jolt/pull/1072) could
+answer false with the atom still holding the expected value (Chez's
+`$record-cas!` is a single `ldxr`/`stxr` on AArch64, and a cleared exclusive
+monitor fails the `stxr`), so a worker's claim on a connection it was alone
+in claiming was refused and it walked away. Every once-only step in the
+adapter is such a claim, and every one now goes through `ring-chez.cas/cas!`,
+which believes a false only once it has seen the value be something else —
+so the count stays at zero on released jolts too. See benchmark/README.md
+for the trace.
+
 `swap-handler!` re-points a running server without a restart, including on
 connections already open — the handler is resolved per request, after the read
 that waits for it.
