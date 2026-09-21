@@ -38,10 +38,10 @@
 ;; the same routine every other client of the sockets API uses, so ":host"
 ;; accepts exactly what the platform accepts and rejects the rest.
 (ffi/defcfn c-inet-pton  "inet_pton"  [:int :pointer :pointer] :int)
-
 (def POLLIN  0x001)
-(def ^:private POLLERR  0x008)
-(def ^:private POLLHUP  0x010)
+(def POLLOUT 0x004)
+(def ^:private POLLERR 0x008)
+(def ^:private POLLHUP 0x010)
 (def ^:private POLLNVAL 0x020)
 
 ;; The conditions under which a recv answers immediately: data waiting, the
@@ -49,6 +49,13 @@
 ;; writability above all — means a recv would BLOCK, for the whole
 ;; SO_RCVTIMEO, on a socket with nothing to read.
 (def poll-readable (bit-or POLLIN POLLERR POLLHUP POLLNVAL))
+
+;; The conditions under which a send can take bytes now: writable, and
+;; nothing else. An errored or hung-up fd must read as NOT writable — the
+;; sweeper's answered-rejection write must skip those rather than attempt a
+;; send that can only fail — and a bad fd is not writable either, so the
+;; bounded poll on it is simply skipped.
+(def poll-writable POLLOUT)
 
 ;; struct pollfd { int fd; short events; short revents; } — fd at 0, events at
 ;; 4-5, revents at 6-7. There is no 16-bit FFI scalar, so the short fields go a
