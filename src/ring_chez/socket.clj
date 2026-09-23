@@ -18,6 +18,7 @@
 (ffi/defcfn c-close      "close"      [:int] :int)
 (ffi/defcfn c-shutdown   "shutdown"   [:int :int] :int)
 (ffi/defcfn c-accept     "accept"     [:int :pointer :pointer] :int :blocking)
+(ffi/defcfn c-getsockname "getsockname" [:int :pointer :pointer] :int)
 (ffi/defcfn c-dup2       "dup2"       [:int :int] :int)
 (ffi/defcfn c-open       "open"       [:string :int] :int)
 ;; One /dev/null for the process, opened on first use: stop-server dup2()s it
@@ -131,6 +132,29 @@
       (c-setsockopt fd sol-socket so-sndtimeo tv 16)
       (ffi/free tv))))
 
+;; F_GETFD / F_SETFD / FD_CLOEXEC are 1 / 2 / 1 on macOS and Linux alike.
+(def ^:private f-getfd 1)
+(def ^:private f-setfd 2)
+(def ^:private fd-cloexec 1)
+
+(defn cloexec?
+  "Whether fd is marked close-on-exec."
+  [fd]
+  (pos? (bit-and (poller/c-fcntl fd f-getfd 0) fd-cloexec)))
+
+(defn close-on-exec!
+  "Mark fd close-on-exec, so a process the application forks does not inherit
+  it. Without it every child an application spawns — a build, a REPL, a test
+  runner — holds a duplicate of the listening socket, and the port stays
+  bound for as long as ANY of them lives: stop the server with one still up
+  and the next start fails with EADDRINUSE against a server that is gone.
+  The same holds for an accepted connection: a child holding one keeps the
+  client's connection open past the server's close. True when the flag is
+  set, read back rather than assumed."
+  [fd]
+  (poller/c-fcntl fd f-setfd fd-cloexec)
+  (cloexec? fd))
+
 (def ^:private f-getfl 3)
 (def ^:private f-setfl 4)
 (def ^:private o-nonblock (if macos? 0x4 0x800))
@@ -223,6 +247,11 @@
       (let [e (errno-info)]
         (throw (ex-info (str "socket() failed: " (:strerror e))
                         (assoc e :syscall "socket")))))
+    (when-not (close-on-exec! fd)
+      (let [e (errno-info)]
+        (c-close fd)
+        (throw (ex-info (str "fcntl(FD_CLOEXEC) failed on the listening socket: " (:strerror e))
+                        (assoc e :syscall "fcntl")))))
     (setsockopt-flag! fd "SO_REUSEADDR" so-reuse)
     ;; SO_REUSEPORT before bind, or it does not apply to it: several processes
     ;; then bind the same port and the kernel spreads new connections over
@@ -252,6 +281,22 @@
         (throw (ex-info (str "listen() failed: " (:strerror e))
                         (assoc e :syscall "listen")))))
     fd)))
+
+(defn local-port
+  "The port fd is bound to — what the kernel picked when bind() was asked for
+  port 0."
+  [fd]
+  (let [sa (ffi/alloc sockaddr-size)
+        len (ffi/alloc 4)]
+    (try
+      (dotimes [i sockaddr-size] (ffi/write sa :uint8 0 i))
+      (ffi/write len :int sockaddr-size 0)
+      (when (neg? (c-getsockname fd sa len))
+        (let [e (errno-info)]
+          (throw (ex-info (str "getsockname() failed: " (:strerror e))
+                          (assoc e :syscall "getsockname")))))
+      (+ (* 256 (ffi/read sa :uint8 2)) (ffi/read sa :uint8 3))
+      (finally (ffi/free sa) (ffi/free len)))))
 
 (def bufsize 65536)
 

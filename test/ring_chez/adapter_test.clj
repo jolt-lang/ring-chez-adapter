@@ -16,7 +16,8 @@
             [clojure.java.io :as io]
             [jolt.ffi :as ffi]
             [ring-chez.socket :as socket]
-            [jolt.io-poller :as poller]))
+            [jolt.io-poller :as poller]
+            [jolt.process]))
 
 ;; --- raw socket test client (keep-alive & later SSE/WS need wire control) ---
 
@@ -1138,10 +1139,38 @@
             (check-has "eaddrinuse: message suggests :port" ":port" (ex-message t)))))
       (finally (adapter/stop-server server)))))
 
+;; --- port 0, and what a forked child inherits -------------------------------------
+
+(defn test-port-zero-binds-a-free-port []
+  (let [server (adapter/run-server handler {:port 0})
+        port (:port server)]
+    (try
+      (check "port 0: the handle names the port the kernel picked" true (and (int? port) (pos? port)))
+      (check "port 0: and the server answers on it" 200
+             (:status (http/get (str "http://127.0.0.1:" port "/"))))
+      (finally (adapter/stop-server server)))))
+
+(defn test-listen-socket-is-close-on-exec []
+  ;; Every process an application forks inherits open fds unless they are
+  ;; marked. A child holding the listening socket keeps the port bound after
+  ;; the server stops, so a restart fails with EADDRINUSE against a server
+  ;; that is gone.
+  (let [server (adapter/run-server handler {:port 0})
+        port (:port server)
+        child (jolt.process/process ["sleep" "20"] {})]
+    (try
+      (check "cloexec: the listening socket is marked" true (socket/cloexec? (:socket server)))
+      (adapter/stop-server server)
+      (let [again (try (adapter/run-server handler {:port port})
+                       (catch Throwable t {:error (ex-message t)}))]
+        (check "cloexec: the port rebinds with a forked child still alive" nil (:error again))
+        (when (:socket again) (adapter/stop-server again)))
+      (finally (try (jolt.process/destroy-tree child) (catch Throwable _ nil))))))
+
 ;; --- RFC-0002: boot-time option validation -------------------------------------
 
 (defn test-boot-validation []
-  (doseq [[k v] [[:port "abc"] [:port 0] [:port 70000]
+  (doseq [[k v] [[:port "abc"] [:port -1] [:port 70000]
                  [:worker-threads 0] [:worker-threads -1]
                  [:keep-alive-timeout-ms 0] [:keep-alive-timeout-ms -5]
                  [:max-request-bytes 0]
@@ -4065,6 +4094,8 @@
       (finally (adapter/stop-server server))))
 
   ;; --- Protocol correctness (adopted from capra) ---
+  (run-test "test-port-zero-binds-a-free-port" test-port-zero-binds-a-free-port)
+  (run-test "test-listen-socket-is-close-on-exec" test-listen-socket-is-close-on-exec)
   (run-test "test-status-reasons" test-status-reasons)
   (run-test "test-connection-header-list" test-connection-header-list)
   (run-test "test-handler-connection-close" test-handler-connection-close)
