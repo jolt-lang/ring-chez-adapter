@@ -106,7 +106,11 @@
                           (when (pos? backoff) (Thread/sleep backoff))
                           (recur (min 100 (if (zero? backoff) 1 (* 2 backoff)))))
             :else
-            (let [;; read the peer BEFORE serve! is entered, so the two faults
+            (let [;; a child the application forks must not inherit the client's
+                  ;; connection (socket/close-on-exec!); best effort — a conn
+                  ;; that could not be marked is still served
+                  _ (try (socket/close-on-exec! conn) (catch Throwable _ nil))
+                  ;; read the peer BEFORE serve! is entered, so the two faults
                   ;; can be told apart. serve! owns the fd from its first
                   ;; instruction — both strategies guard their own body and
                   ;; release the conn on their fault path — so a throw out of
@@ -991,7 +995,7 @@
                 (when-not (socket/ipv4->octets v)
                   (bad! :host v "an IPv4 address (e.g. \"127.0.0.1\" or \"0.0.0.0\")"))))
             (get opts :host))]
-    {:port               (check-num :port 1 65535)
+    {:port               (check-num :port 0 65535)
      :host               (check-host)
      :worker-threads     (check-num :worker-threads 1 ##Inf)
      :ka-ms              (check-num :keep-alive-timeout-ms 1 ##Inf)
@@ -1006,7 +1010,8 @@
 
 (defn run-server
   "Start the server; return a handle {:socket :port :host :running}. opts:
-    :port                  listen port (default 3000)
+    :port                  listen port (default 3000); 0 for any free port,
+                           which the returned handle's :port names
     :host                  interface to bind, as an IPv4 address (default
                            \"127.0.0.1\"); \"0.0.0.0\" for every interface
     :strategy              :threads (default) — fixed worker pool, one thread
@@ -1101,6 +1106,8 @@
                :handler-timeout-ms handler-timeout-ms
                :stats stats}
           fd     (socket/listen-socket host port {:reuse-port? (boolean (:reuse-port v))})
+          ;; port 0 asks the kernel for any free port; the handle says which
+          port   (if (zero? port) (socket/local-port fd) port)
           running? (atom true)]
       (if (= :fibers strategy)
         (let [conns (atom #{})   ; live conn entries; sweeper + stop sweep them

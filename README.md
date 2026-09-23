@@ -30,7 +30,8 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
 
 `run-server` takes an opts map:
 
-- `:port` (default 3000)
+- `:port` (default 3000). `0` asks the kernel for any free port; the
+  returned handle's `:port` says which.
 - `:host` (default `"127.0.0.1"`) — interface to bind, as an IPv4 address.
   `"0.0.0.0"` serves every interface. Parsed by `inet_pton`, so it accepts
   what the platform accepts and anything else fails at boot. The default is
