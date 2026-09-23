@@ -98,6 +98,71 @@ lower `N`, raise the range (`sysctl -w net.inet.ip.portrange.first=16384` on
 macOS), or read the `ka` cells, which reuse a handful of connections and never
 touch it.
 
+## Findings (2026-09-22, M-series Mac, jolt 0.8.11, colocated, `ab -n 20000`)
+
+Stock jolt 0.8.11 carries the strong `$record-cas!` (jolt-lang/jolt#1072) that
+the two sections below spent a sitting pricing and PR #40 worked around. No
+adapter change went in with this run, and the adapter's `ring-chez.cas/cas!`
+shim is still in the tree, now redundant rather than load-bearing. Three runs
+of the whole matrix per strategy, a `/json` pass in every run, ephemeral-port
+range at 16384-65535 as below. Every cell completed: no `TIMEOUT`, no
+`INCOMPLETE`, and no `fault:` line in any chez server log.
+
+Undertow and Jetty are the same server in all six runs (their behaviour does
+not depend on the adapter's strategy), so their cells span six samples; each
+chez row spans the three runs of its own strategy.
+
+| server | plain c=10 | ka c=10 | plain c=100 | ka c=100 |
+|---|---:|---:|---:|---:|
+| undertow | 17.6-20.1k | 62.0-77.4k | 19.0-22.3k | 65.4-109.9k |
+| jetty | 14.6-17.3k | 57.9-75.9k | 15.5-21.5k | 74.6-103.3k |
+| chez `:threads` | 13.1-14.5k | 32.6-34.0k | 12.7-13.9k | 24.1-26.1k |
+| chez `:fibers` | 11.0-12.7k | 14.5-16.1k | 13.4-14.1k | 14.9-16.9k |
+
+`/json`, plain, all six runs — the body is 27 bytes instead of 13 and nothing
+else differs, so body size is again not a factor:
+
+| server | c=10 | c=100 |
+|---|---:|---:|
+| undertow | 18.7-21.5k | 17.2-21.7k |
+| jetty | 16.0-21.2k | 16.9-18.5k |
+| chez `:threads` | 12.8-15.0k | 13.8-16.0k |
+
+The six matrices put 732,000 connections through the adapter (2000 warmup plus
+six 20000-request cells each) and it logged no drop. The `plain` cells hold the
+drop-free class the sections below predicted from arithmetic, so the matrix
+reads as a matrix again.
+
+What the numbers say:
+
+- **The jolt-side drop is gone on stock 0.8.11.** The sections below traced one
+  lost accept in ~1400 to a weak `$record-cas!` and either fixed it in jolt or
+  worked around it in the adapter. On the released fix, with the adapter
+  unchanged and its own shim still in place, the drop count is zero over the
+  whole sitting. `:threads` plain lands at 13.1-14.5k and `:fibers` at
+  11.0-12.7k, the class the drop-free harness of the "weak compare-and-swap"
+  section measured, not the 2.8-3.4k the sweeper sitting read.
+- **`:threads` keepalive at c=100 converges, which is the clearest change.**
+  24.1-26.1k across three runs, where 2026-08-20 recorded a bimodal 4-34k and
+  the 2026-09-20 sweeper sitting read 3.2-3.3k. The low mode is gone rather than
+  reduced, so `:threads` no longer has a cell it collapses in under load.
+- **Against the JVM at keepalive c=10 the adapter is around half.**
+  32.6-34.0k against Undertow's 62.0-77.4k and Jetty's 57.9-75.9k. The gap is
+  the per-request worker hand-off: the JVM connectors pipeline requests on a hot
+  connection, the adapter dispatches one worker per request. It is a fraction,
+  not the twentieth the drop made it look like.
+- **At plain connections the adapter is a similar fraction.** `:threads` at
+  13.1-14.5k against Undertow's 17.6-20.1k and Jetty's 14.6-17.3k, roughly 73%
+  of Undertow and 86% of Jetty on the midpoints.
+- **`:fibers` stays flat across concurrency and keeps its own class.** 11.0-12.7k
+  plain and 14.5-16.9k keepalive, tight at both concurrencies, matching its
+  2026-08-20 keepalive numbers while `:threads` leads it on both plain cells.
+- **The plain cells sit under the 2026-08-20 class** (13.1-14.5k against
+  16.8-18.6k on `:threads`; 11.0-12.7k against 15.0-15.5k on `:fibers`). Both
+  strategies moved by a similar amount on the same sitting, so this reads as a
+  machine-wide shift rather than an adapter change, and the keepalive cells are
+  the ones to compare across sittings.
+
 ## Findings (2026-09-20, M-series Mac, jolt 0.8.10, colocated, `ab -n 20000`)
 
 Same Mac as the 2026-08-20 table below, now on jolt 0.8.10 with the
