@@ -337,7 +337,7 @@
   nothing to read blocks for the whole SO_RCVTIMEO — pinning the worker, and
   with it every connection queued behind it. A signal is likewise not the peer
   going away: EINTR polls again rather than reporting the connection closed."
-  [conn buf ka-ms pending]
+  [conn buf ka-ms retire?]
   (let [pfds (ffi/alloc socket/pollfd-size)]
     (try
       (socket/init-pollfd! pfds conn socket/POLLIN)
@@ -358,7 +358,7 @@
               (and (neg? rc) (poller/eintr?)) (recur)
               (neg? rc) 0
               (>= now deadline) 0
-              (and (>= now grace) (pos? @pending)) 0
+              (and (>= now grace) (retire?)) 0
               :else (recur)))))
       (finally (ffi/free pfds)))))
 
@@ -431,7 +431,7 @@
   ;; own deadlines (ka-ms per read, write-timeout-ms per write) govern it
   (reset! (:serving? entry) true)
   (let [recv!      (:recv! io)
-        idle-recv! (or (:idle-recv! io) recv!)
+        idle-recv! (if-let [f (:idle-recv! io)] #(f %1 %2 entry) recv!)
         send!      (or (:send! io) http/send-all)]
     (loop [acc http/no-bytes]
       ;; deadline: the read of this request (idle wait or mid-request trickle)
@@ -598,9 +598,11 @@
                     ;; it instead of parking on an idle conn while others
                     ;; starve. Only when no pipelined request is already
                     ;; buffered — serving that costs no park.
-                    resp (if (and (io :under-pressure?) ((io :under-pressure?))
+                    resp (if (and (io :retire?)
                                   (http/keep-alive? request)
-                                  (zero? (alength ^bytes (:leftover r))))
+                                  (zero? (alength ^bytes (:leftover r)))
+                                  ;; last: it reserves the retirement
+                                  ((io :retire?) entry))
                            (update resp :headers #(assoc (or % {}) "Connection" "close"))
                            resp)]
                 (let [reusable (try (http/send-response conn request resp (:take! io) send!)
@@ -646,7 +648,8 @@
                        :released? (atom false)
                        :claim-by  (atom no-deadline)
                        :serving?  (atom false)
-                       :pending?  (atom false)}
+                       :pending?  (atom false)
+                       :retiring? (atom false)}
                 poller? (assoc :poller? true
                                ;; the sweeper's deadline; armed by fiber-io
                                :deadline (atom Long/MAX_VALUE)))]
@@ -692,7 +695,7 @@
   Once-only per conn, and not a bare decrement at each of those places,
   because a conn lost between the take and the claim used to leave the count
   raised for the life of the server — and `pending` stuck above zero is
-  under-pressure? stuck true, which is keep-alive declined on every response
+  retirement firing on every response, which is keep-alive declined on every response
   from then on."
   [pending entry]
   (when (cas! (:pending? entry) true false)
@@ -718,6 +721,41 @@
     (swap! (:open stats) dec))
   (swap! conns disj entry))
 
+(defn- retire-for-pressure!
+  "Decide whether this conn's worker should give it up for a conn queued
+  behind the pool, and if so reserve that retirement. True only while more
+  conns are waiting than there are workers already free or on their way to
+  being free — idle ones parked on the channel, and ones that already retired
+  a conn and have not parked yet.
+
+  Both halves were missing. A conn counts as pending from accept until the
+  rendezvous answers, so with idle workers every handoff still read as
+  pressure for its few microseconds; and nothing counted the workers already
+  retiring, so one queued conn retired every keep-alive that answered before
+  it was claimed. Each retirement is a reconnect, and each reconnect is a new
+  pending conn, so under load the two fed each other: ab -k -c 100 against a
+  pool of 10 opened a new connection for ~40% of its requests, and a pool of
+  128, where no conn ever waits, still did for ~25%."
+  [pending pool entry]
+  (loop []
+    (let [p @pending
+          {:keys [idle retiring] :as st} @pool]
+      (cond
+        (<= p (+ idle retiring)) false
+        (compare-and-set! pool st (update st :retiring inc))
+        (do (reset! (:retiring? entry) true) true)
+        :else (recur)))))
+
+(defn- worker-parking!
+  "A worker is about to wait on the work channel: it counts as idle, and the
+  retirement it reserved for prev (if any) is spent — it is now the idle
+  worker that retirement promised. One swap, so the worker is never counted
+  as neither."
+  [pool prev]
+  (let [spent? (and prev (cas! (:retiring? prev) true false))]
+    (swap! pool (fn [st] (cond-> (update st :idle inc)
+                           spent? (update :retiring dec))))))
+
 (defn- worker
   "Serve connections off the work channel until it closes.
 
@@ -736,8 +774,11 @@
   out. start-worker! is the second line of the same defence."
   [base-info cfg io work conns]
   (let [fault! (:fault! cfg)]
-    (loop []
-      (when-let [entry (async/<!! work)]
+    (loop [prev nil]
+      (when-let [entry (if-let [parking! (io :parking!)]
+                         (do (parking! prev)
+                             (try (async/<!! work) (finally ((io :unparked!)))))
+                         (async/<!! work))]
         (try
           ;; claim at take-time: pending then counts only conns accepted but not
           ;; yet claimed — decrementing in the acceptor after >!! leaves a window
@@ -754,7 +795,7 @@
               (catch Throwable _)
               (finally (conn-release! conns entry (:stats cfg)))))
           (catch Throwable t (fault! :worker t)))
-        (recur)))))
+        (recur entry)))))
 
 (defn- start-worker!
   "One pool thread, replaced if it ever leaves for a reason other than the work
@@ -1165,12 +1206,18 @@
         (let [work  (async/chan)  ; unbuffered: acceptor parks when all workers busy
               conns (atom #{})    ; live conn entries; the stop sweep closes them
               pending (atom 0)    ; conns accepted but not yet claimed by a worker
+              ;; workers parked on the channel, and workers that retired a
+              ;; conn under pressure and have not parked yet (see
+              ;; retire-for-pressure!)
+              pool (atom {:idle 0 :retiring 0})
               ;; the claim backstop runs here too: >!! answers only once a
               ;; worker has the conn, so a conn still unclaimed after that is
               ;; one the take/claim hop lost, not one queued behind a busy pool
               sweep (start-sweeper! conns stats fault! #(pending-done! pending %))
                io (assoc threads-io
-                         :under-pressure? #(pos? @pending)
+                         :retire? #(retire-for-pressure! pending pool %)
+                         :parking! #(worker-parking! pool %)
+                         :unparked! #(swap! pool update :idle dec)
                          :claim! #(pending-done! pending %)
                          ;; idle keep-alive first read: wait in poll(2) slices
                          ;; instead of parking a full ka-timeout recv. Enforces
@@ -1179,7 +1226,9 @@
                          ;; after a grace period of quiet — never instantly,
                          ;; or a client mid-reuse would race a reset. Returns
                          ;; the recv contract (n>0 data, 0 closed/retire).
-                         :idle-recv! #(idle-poll-recv! %1 %2 ka-ms pending))]
+                         :idle-recv! (fn [conn buf entry]
+                                       (idle-poll-recv! conn buf ka-ms
+                                                        #(retire-for-pressure! pending pool entry))))]
            (dotimes [_ n] (start-worker! base-info cfg io work conns running?))
           {:socket fd :port port :host host :running running? :work work :conns conns
            :sweep sweep :handler handler-box :ws-handler ws-handler-box :stats stats
