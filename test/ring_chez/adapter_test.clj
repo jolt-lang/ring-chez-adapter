@@ -2324,6 +2324,85 @@
           (client-close lost)))
       (finally (reset! armed 0) (adapter/stop-server server)))))
 
+;; --- accept pressure is conns nobody is free to take -----------------------
+;; Retirement exists so a conn queued behind a busy pool is not starved by
+;; idle keep-alives. Two ways it used to fire when nobody was starving, and
+;; together they made a "keep-alive" ab run open a new connection for ~40%
+;; of its requests (benchmark/README.md): a conn still in the microseconds of
+;; its handoff counted as pressure even with idle workers parked on the
+;; channel, and one queued conn retired EVERY busy keep-alive that answered
+;; before it was claimed, when one freed worker is all it needs.
+
+(defn- response-closes? [r]
+  (str/includes? (str/lower-case (str r)) "connection: close"))
+
+(defn test-handoff-with-idle-workers-is-not-pressure []
+  (let [server (adapter/run-server handler {:port 8596 :worker-threads 4})
+        work (:work server)
+        real->!! a/>!!
+        armed (atom 0)]
+    (try
+      (Thread/sleep 150)
+      (let [fd (client-connect 8596 3000)]
+        (try
+          (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+          (client-recv-until fd "hello get")
+          (with-redefs [a/>!! (fn [ch v]
+                                (if (and (identical? ch work) (take-arm! armed))
+                                  (do (Thread/sleep 500) (real->!! ch v))
+                                  (real->!! ch v)))]
+            (reset! armed 1)
+            ;; the second conn sits in a slow handoff while three workers
+            ;; are idle: nobody is waiting on the pool
+            (let [other (client-connect 8596 3000)]
+              (Thread/sleep 150)
+              (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+              (let [r (client-recv-until fd "hello get")]
+                (check "idle workers: keep-alive kept during a handoff"
+                       false (response-closes? r)))
+              (client-send other "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+              (check-has "idle workers: handed-off conn answered" "200"
+                         (client-recv-until other "hello get"))
+              (client-close other)))
+          (finally (client-close fd))))
+      (finally (reset! armed 0) (adapter/stop-server server)))))
+
+(defn test-one-queued-conn-retires-one-keepalive []
+  (let [server (adapter/run-server handler {:port 8597 :worker-threads 2})
+        work (:work server)
+        real-<!! a/<!!
+        armed (atom 0)]
+    (try
+      (Thread/sleep 150)
+      (let [[a b] (mapv (fn [_] (client-connect 8597 3000)) (range 2))]
+        (try
+          (doseq [fd [a b]]
+            (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+            (client-recv-until fd "hello get"))
+          ;; both workers own a conn; a third queues behind them
+          (let [c (client-connect 8597 3000)]
+            (try
+              (Thread/sleep 150)
+              ;; the worker that frees up is slow to reach the queued conn,
+              ;; which leaves the window in which b answers
+              (with-redefs [a/<!! (fn [ch]
+                                    (when (and (identical? ch work) (take-arm! armed))
+                                      (Thread/sleep 500))
+                                    (real-<!! ch))]
+                (reset! armed 1)
+                (client-send a "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+                (check "one queued: the first answer retires its conn"
+                       true (response-closes? (client-recv-until a "hello get")))
+                (client-send b "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+                (check "one queued: the second keeps keep-alive"
+                       false (response-closes? (client-recv-until b "hello get")))
+                (client-send c "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+                (check-has "one queued: queued conn answered" "200"
+                           (client-recv-until c "hello get")))
+              (finally (client-close c))))
+          (finally (client-close a) (client-close b))))
+      (finally (reset! armed 0) (adapter/stop-server server)))))
+
 (defn test-threads-lost-handoff-is-answered-503 []
   (let [server (adapter/run-server handler {:port 8581 :worker-threads 2})
         work (:work server)
@@ -4198,6 +4277,10 @@
   (run-test "test-queued-connection-is-not-reaped" test-queued-connection-is-not-reaped)
   (run-test "test-lost-handoff-does-not-retire-keepalive"
             test-lost-handoff-does-not-retire-keepalive)
+  (run-test "test-handoff-with-idle-workers-is-not-pressure"
+            test-handoff-with-idle-workers-is-not-pressure)
+  (run-test "test-one-queued-conn-retires-one-keepalive"
+            test-one-queued-conn-retires-one-keepalive)
   (run-test "test-threads-lost-handoff-is-answered-503"
             test-threads-lost-handoff-is-answered-503)
   (run-test "test-fibers-lost-spawn-is-answered-503"
