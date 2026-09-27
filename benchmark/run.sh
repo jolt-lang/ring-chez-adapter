@@ -29,6 +29,9 @@ N="${N:-20000}"
 C_LIST="${C_LIST:-10 100}"
 AB_TIMEOUT="${AB_TIMEOUT:-90}"   # per-run cap; a stalled run is reported as TIMEOUT
 DIAGNOSE="${DIAGNOSE:-1}"        # on an ab failure, ask the server directly (0 to skip)
+SETTLE="${SETTLE:-1}"            # wait for TIME_WAIT to drain before each cell (0 to skip)
+SETTLE_TW="${SETTLE_TW:-500}"    # ...down to this many entries
+SETTLE_MAX="${SETTLE_MAX:-90}"   # ...for at most this many seconds
 PROBE="$ROOT/benchmark/probes/plain-drop-probe.py"
 
 LABEL="chez-${STRATEGY}${WORKERS:+-$WORKERS}"
@@ -126,10 +129,40 @@ wait_up() { # port label logfile
   return 1
 }
 
+# Every connection a cell opens and the server closes leaves a TIME_WAIT entry
+# on the SERVER side of the loopback 4-tuple for 2*MSL. The client's side of it
+# is already CLOSED, so the client kernel happily hands the same ephemeral port
+# to the next cell's connect, whose SYN then lands on the server's TIME_WAIT
+# entry and waits out a retransmit (1-2s) before it gets through. One such
+# connect is the whole tail of a 20000-request run: it measured a chez ka c=100
+# cell at 7.6k req/s against 31-35k in the same session, with p99 unchanged and
+# the max at 2018ms. Waiting for the entries to expire keeps each cell from
+# paying for the one before it.
+time_wait_count() {
+  if command -v ss >/dev/null 2>&1; then
+    ss -Htan state time-wait 2>/dev/null | wc -l | tr -d ' '
+  else
+    netstat -an 2>/dev/null | grep -c TIME_WAIT || true
+  fi
+}
+
+settle() {
+  local i tw
+  [ "$SETTLE" = "1" ] || return 0
+  for i in $(seq 1 "$SETTLE_MAX"); do
+    tw="$(time_wait_count)"
+    [ "${tw:-0}" -le "$SETTLE_TW" ] && return 0
+    sleep 1
+  done
+  printf '%22s (still %s TIME_WAIT entries after %ss; the next cell may stall on a reused port)\n' \
+    "" "$tw" "$SETTLE_MAX"
+}
+
 run_ab() { # label port mode c [path]   (mode: plain|ka)
-  local label="$1" port="$2" mode="$3" c="$4" path="${5:-/plaintext}" out rc rps p50 p99 note=""
+  local label="$1" port="$2" mode="$3" c="$4" path="${5:-/plaintext}" out rc rps p50 p99 max ka note=""
   local flags=(-n "$N" -c "$c")
   if [ "$mode" = "ka" ]; then flags+=(-k); fi
+  settle
   out=$(timeout "$AB_TIMEOUT" ab "${flags[@]}" "http://127.0.0.1:$port$path" 2>&1) && rc=0 || rc=$?
   if [ "$rc" -eq 0 ]; then
     if grep -qE "apr_socket_recv|timed out|Connection reset|Broken pipe" <<<"$out"; then
@@ -138,8 +171,15 @@ run_ab() { # label port mode c [path]   (mode: plain|ka)
     rps=$(awk '/Requests per second/{print $4}' <<<"$out")
     p50=$(awk '$1=="50%"{print $2}' <<<"$out")
     p99=$(awk '$1=="99%"{print $2}' <<<"$out")
-    printf '%-18s %-5s c=%-4s %10s req/s  p50=%-4sms p99=%-5sms%s\n' \
-      "$label" "$mode" "$c" "$rps" "$p50" "$p99" "$note"
+    max=$(awk '$1=="100%"{print $2}' <<<"$out")
+    # in a ka cell, requests ab did NOT count as keep-alive each opened a new
+    # connection: a server declining keep-alive shows up here and nowhere else
+    ka=""
+    if [ "$mode" = "ka" ]; then
+      ka="  ka=$(awk '/Keep-Alive requests/{print $3}' <<<"$out")/$N"
+    fi
+    printf '%-18s %-5s c=%-4s %10s req/s  p50=%-4sms p99=%-5sms max=%-5sms%s%s\n' \
+      "$label" "$mode" "$c" "$rps" "$p50" "$p99" "$max" "$ka" "$note"
   elif [ "$rc" -eq 124 ]; then
     printf '%-18s %-5s c=%-4s %10s  <- no completion within %ss\n' \
       "$label" "$mode" "$c" "TIMEOUT" "$AB_TIMEOUT"

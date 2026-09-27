@@ -23,12 +23,17 @@ WORKERS=200 benchmark/run.sh           # threads with :worker-threads 200
 SERVERS="jetty chez" benchmark/run.sh  # subset of undertow/jetty/chez
 JSON=1 benchmark/run.sh                # add a /json pass
 N=2000 C_LIST="10" benchmark/run.sh    # quick smoke run
+SETTLE=0 benchmark/run.sh              # don't wait for TIME_WAIT between cells
 ```
 
 Requires `ab`, `curl`, `timeout`, `lsof`, the Clojure CLI, and `jolt`.
 Defaults: undertow on :8080, adapter on :8081, jetty on :8082, `N=20000`
 requests, concurrency 10 and 100, plain and keepalive (`-k`) modes. Each line
-prints req/s plus p50/p99 latency. `TIMEOUT` (no completion within
+prints req/s plus p50/p99/max latency, and a `ka` line also prints how many of
+the requests ab counted as keep-alive: every one short of `N` opened a new
+connection. Before each cell the script waits (up to `SETTLE_MAX`, 90s) for the
+machine's TIME_WAIT entries to drain below `SETTLE_TW` (500); see "Ephemeral
+ports" for why. `TIMEOUT` (no completion within
 `AB_TIMEOUT`) or a `<- client errors (stall?)` marker means the run hung or
 dropped connections — that is a finding, not a script failure. `INCOMPLETE`
 means `ab` itself gave up, and the marker beside it says which: `CLIENT-PORTS`
@@ -95,39 +100,56 @@ measured here left 14115 of them behind, which is half the range.
 output and they are not the same finding. Check it with `netstat -an | grep -c
 TIME_WAIT` during a run. To measure the server instead of the port table:
 lower `N`, raise the range (`sysctl -w net.inet.ip.portrange.first=16384` on
-macOS), or read the `ka` cells, which reuse a handful of connections and never
-touch it.
+macOS), or read the `ka` cells, which reuse their connections and barely touch
+it.
+
+The same entries hurt a cell that runs after them even when it does not run out
+of ports. The server closed those connections, so the TIME_WAIT side of each
+4-tuple is the server's and the client's side is already free: the client
+kernel hands the port to the next cell's connect, whose SYN lands on the
+server's TIME_WAIT entry and waits out a retransmit before it gets through. At
+20000 requests one such connect is most of the run. A chez `:threads` `ka c=100`
+cell run straight after a `plain c=100` one measured 7.6k req/s with a 2018 ms
+max, against 31-35k with a 16-34 ms max in the same session, p99 unchanged in
+both. `run.sh` now lets the entries expire before each cell (`SETTLE`).
 
 ## Findings (M-series Mac, jolt 0.8.13, colocated, `ab -n 20000`, 2026-09-27)
 
 Undertow and Jetty are the same server in all six runs (their behaviour does
 not depend on the adapter's strategy), so their cells span six samples; each
-chez row spans the three runs of its own strategy.
+chez row spans the three runs of its own strategy. Every cell ran after the
+TIME_WAIT entries from the one before it had drained, and no cell spreads more
+than 1.2x across its runs.
 
 | server | plain c=10 | ka c=10 | plain c=100 | ka c=100 |
 |---|---:|---:|---:|---:|
-| undertow | 17.6-21.4k | 55.0-84.8k | 18.0-22.3k | 79.3-110.5k |
-| jetty | 15.7-18.4k | 49.7-74.7k | 17.3-20.6k | 52.9-104.3k |
-| chez `:threads` | 12.5-17.1k | 39.4-47.0k | 15.6-16.0k | 7.6-32.1k |
-| chez `:fibers` | 11.0-13.4k | 17.0-18.7k | 14.9-15.7k | 20.1-20.2k |
+| undertow | 22.2-24.1k | 65.4-77.8k | 24.3-26.2k | 98.5-110.5k |
+| jetty | 18.6-20.8k | 60.1-69.5k | 24.5-25.7k | 92.7-105.9k |
+| chez `:threads` | 15.9-16.4k | 42.9-46.2k | 15.9-16.9k | 40.8-43.5k |
+| chez `:fibers` | 15.3-15.9k | 18.9-19.1k | 17.2-17.5k | 20.6-21.0k |
 
-The chez `:threads` `ka c=100` cell is the one unstable spot: its three runs
-came in at 28.9k, 7.6k and 32.1k, a 4.3x spread where the other eleven chez
-cells stay within 1.4x. All three runs completed with no drop and no server
-fault, and the slow run's latency (p50 0 ms, p99 17 ms) is no worse than the
-fast run's (p99 10 ms), so it is run-to-run variance in that cell rather than
-a stall.
+Every `ka` cell kept all 20000 requests on keep-alive except chez `:threads` at
+c=100, which kept 16.3-16.7k. That one is by design: 100 connections share the
+default pool of 10 workers (one per core), so a worker that answers while a
+connection is queued behind the pool gives up its own, and the client
+reconnects. Before this round that rotation fed itself. A conn in the middle of
+its handoff counted as queued even with idle workers waiting, and one queued
+conn retired every busy connection that answered before it was claimed, so the
+cell opened a new connection for ~40% of its requests (32-35k req/s) and a pool
+of 128, where nothing ever queues, still did for ~25% (12-13k req/s). With
+retirement limited to conns nobody is free to take, the same cell measures
+40.8-44.3k at the default pool and 38-43k with every request kept alive at 128
+workers.
 
 `/json`, plain, all six runs — the body is 27 bytes instead of 13 and nothing
 else differs, so body size is again not a factor:
 
 | server | c=10 | c=100 |
 |---|---:|---:|
-| undertow | 18.6-20.6k | 18.0-20.5k |
-| jetty | 18.3-20.9k | 17.4-20.6k |
-| chez `:threads` | 14.6-16.1k | 14.1-15.3k |
-| chez `:fibers` | 13.1-14.3k | 15.8-17.5k |
+| undertow | 24.3-27.3k | 25.3-26.8k |
+| jetty | 23.4-25.9k | 24.3-26.8k |
+| chez `:threads` | 15.8-17.4k | 15.9-17.6k |
+| chez `:fibers` | 15.8-16.2k | 16.4-17.2k |
 
-The six matrices put 732,000 connections through the adapter (2000 warmup plus
+The six matrices put 732,000 requests through the adapter (2000 warmup plus
 six 20000-request cells each) and it logged no drop.
-
