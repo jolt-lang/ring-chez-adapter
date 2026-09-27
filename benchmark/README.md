@@ -98,7 +98,7 @@ lower `N`, raise the range (`sysctl -w net.inet.ip.portrange.first=16384` on
 macOS), or read the `ka` cells, which reuse a handful of connections and never
 touch it.
 
-## Findings (M-series Mac, jolt 0.8.11, colocated, `ab -n 20000`)
+## Findings (M-series Mac, jolt 0.8.13, colocated, `ab -n 20000`, 2026-09-27)
 
 Undertow and Jetty are the same server in all six runs (their behaviour does
 not depend on the adapter's strategy), so their cells span six samples; each
@@ -106,19 +106,27 @@ chez row spans the three runs of its own strategy.
 
 | server | plain c=10 | ka c=10 | plain c=100 | ka c=100 |
 |---|---:|---:|---:|---:|
-| undertow | 17.6-20.1k | 62.0-77.4k | 19.0-22.3k | 65.4-109.9k |
-| jetty | 14.6-17.3k | 57.9-75.9k | 15.5-21.5k | 74.6-103.3k |
-| chez `:threads` | 13.1-14.5k | 32.6-34.0k | 12.7-13.9k | 24.1-26.1k |
-| chez `:fibers` | 11.0-12.7k | 14.5-16.1k | 13.4-14.1k | 14.9-16.9k |
+| undertow | 17.6-21.4k | 55.0-84.8k | 18.0-22.3k | 79.3-110.5k |
+| jetty | 15.7-18.4k | 49.7-74.7k | 17.3-20.6k | 52.9-104.3k |
+| chez `:threads` | 12.5-17.1k | 39.4-47.0k | 15.6-16.0k | 7.6-32.1k |
+| chez `:fibers` | 11.0-13.4k | 17.0-18.7k | 14.9-15.7k | 20.1-20.2k |
+
+The chez `:threads` `ka c=100` cell is the one unstable spot: its three runs
+came in at 28.9k, 7.6k and 32.1k, a 4.3x spread where the other eleven chez
+cells stay within 1.4x. All three runs completed with no drop and no server
+fault, and the slow run's latency (p50 0 ms, p99 17 ms) is no worse than the
+fast run's (p99 10 ms), so it is run-to-run variance in that cell rather than
+a stall.
 
 `/json`, plain, all six runs — the body is 27 bytes instead of 13 and nothing
 else differs, so body size is again not a factor:
 
 | server | c=10 | c=100 |
 |---|---:|---:|
-| undertow | 18.7-21.5k | 17.2-21.7k |
-| jetty | 16.0-21.2k | 16.9-18.5k |
-| chez `:threads` | 12.8-15.0k | 13.8-16.0k |
+| undertow | 18.6-20.6k | 18.0-20.5k |
+| jetty | 18.3-20.9k | 17.4-20.6k |
+| chez `:threads` | 14.6-16.1k | 14.1-15.3k |
+| chez `:fibers` | 13.1-14.3k | 15.8-17.5k |
 
 The six matrices put 732,000 connections through the adapter (2000 warmup plus
 six 20000-request cells each) and it logged no drop.
