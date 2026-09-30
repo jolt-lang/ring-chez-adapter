@@ -42,8 +42,8 @@
   :aliases {:test {:extra-paths ["test"]
                    :extra-deps {jolt-lang/http-client
                                 {:git/url "https://github.com/jolt-lang/http-client"
-                                :git/tag "v0.0.15"
-                                :git/sha "29385f28fac5a139ef090c2d806e1122123ce386"}}
+                                :git/tag "v0.0.16"
+                                :git/sha "183c38c06d60af6a21550b344f09155f07545354"}}
                    :main-opts ["-m" "ring-chez.adapter-test"]}
            :bench {:extra-paths ["test"]
                    :main-opts ["-m" "ring-chez.bench"]}}
