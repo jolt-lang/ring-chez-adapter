@@ -40,6 +40,11 @@
 ;; above 4 GB. Never loading a second copy avoids that class of failure
 ;; entirely, and the candidates below are only for a build that exports none.
 ;;
+;; jolt 0.8.9+ registers its zlib under private jolt_z_* names instead, so on
+;; Linux nothing here resolves from the process; deps.edn declares libz as an
+;; optional :jolt/native, and a native jolt loaded is where the symbols come
+;; from. No name clash is possible with the runtime's copy any more.
+;;
 ;; Failure is not an error: it means no compression, which is always a valid
 ;; way to answer a request.
 (def ^:private zlib

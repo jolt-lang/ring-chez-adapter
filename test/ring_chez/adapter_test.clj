@@ -8,7 +8,6 @@
             [ring-chez.middleware.gzip :as gzip]
             [ring-chez.middleware.static :as static]
             [ring-chez.middleware.proxy :as proxy]
-            [jolt.http.zlib :as zlib-oracle]
             [ring-chez.websocket :as ws]
             [jolt.http-client :as http]
             [clojure.string :as str]
@@ -18,6 +17,13 @@
             [ring-chez.socket :as socket]
             [jolt.io-poller :as poller]
             [jolt.process]))
+
+(defn- gunzip
+  "Test oracle: the runtime's own java.util.zip, a separate implementation from
+  ring-chez.zlib (RFC-0011)."
+  [^bytes bs]
+  (with-open [in (java.util.zip.GZIPInputStream. (java.io.ByteArrayInputStream. bs))]
+    (.readAllBytes in)))
 
 ;; --- raw socket test client (keep-alive & later SSE/WS need wire control) ---
 
@@ -1664,7 +1670,7 @@
         (check-has "static gzip: vary" "Vary: Accept-Encoding" view)
         (check-has "static gzip: distinct etag" "-gz\"" view)
         (check "static gzip: round-trips" true
-               (str/includes? (String. ^bytes (zlib-oracle/gunzip (response-body-bytes raw)) "UTF-8")
+               (str/includes? (String. ^bytes (gunzip (response-body-bytes raw)) "UTF-8")
                               "body { margin: 0; }"))
         ;; served twice: the second comes from the cached compressed copy
         (let [[view2 raw2] (static-get fd "/app.css" "gzip")]
@@ -1759,7 +1765,7 @@
 
 ;; jolt has no java.util.zip, so no existing Ring gzip middleware can load.
 ;; This is Igropyr's policy over a zlib binding; the oracle for every check is
-;; jolt.http.zlib/gunzip, a separate implementation (RFC-0011).
+;; java.util.zip's GZIPInputStream, a separate implementation (RFC-0011).
 
 (def ^:private path-big "/big")
 
@@ -1800,7 +1806,7 @@
         (check "gzip: smaller than the original" true
                (< (alength body) (count (.getBytes gzip-text "UTF-8"))))
         (check "gzip: body round-trips" gzip-text
-               (String. ^bytes (zlib-oracle/gunzip body) "UTF-8"))
+               (String. ^bytes (gunzip body) "UTF-8"))
         ;; the framing has to survive: Content-Length must count the COMPRESSED
         ;; octets, or the next response on this connection starts mid-body
         (let [[view2 body2] (gzip-get fd "/small" "gzip")]
@@ -1809,7 +1815,7 @@
         ;; a seq body is compressed as the octets it concatenates to
         (let [[_ body3] (gzip-get fd "/seq" "gzip")]
           (check "gzip: seq body round-trips" (str gzip-text gzip-text)
-                 (String. ^bytes (zlib-oracle/gunzip body3) "UTF-8")))
+                 (String. ^bytes (gunzip body3) "UTF-8")))
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
