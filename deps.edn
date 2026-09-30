@@ -15,8 +15,9 @@
  ;; wraps its handler with ring-defaults — whose session + CSRF middleware needs
  ;; javax.crypto — just has to (require 'jolt.crypto); no separate dep. It's not
  ;; required here, so a plain adapter server doesn't pull in OpenSSL.
- :deps {jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/jolt-crypto"
-                               :git/sha "44da69bad08a2fd7631bd4061e3fb53938dafff6"}}
+ :deps {jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/crypto"
+                               :git/tag "v0.0.9"
+                               :git/sha "bd19a06c81c92911dbc637b865772c15e1204b05"}}
 
  ;; The test drives the server with the jolt-lang/http-client library (jolt no
  ;; longer ships a built-in HTTP client). v0.0.4 or newer matters here: earlier
@@ -30,8 +31,8 @@
   :aliases {:test {:extra-paths ["test"]
                    :extra-deps {jolt-lang/http-client
                                 {:git/url "https://github.com/jolt-lang/http-client"
-                                :git/tag "v0.0.7"
-                                :git/sha "a9c5d89054c9cdb84b7905e0dfd7cf9ca82793c6"}}
+                                :git/tag "v0.0.15"
+                                :git/sha "29385f28fac5a139ef090c2d806e1122123ce386"}}
                    :main-opts ["-m" "ring-chez.adapter-test"]}
            :bench {:extra-paths ["test"]
                    :main-opts ["-m" "ring-chez.bench"]}}
