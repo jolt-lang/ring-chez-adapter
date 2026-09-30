@@ -32,11 +32,18 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
 
 - `:port` (default 3000). `0` asks the kernel for any free port; the
   returned handle's `:port` says which.
-- `:host` (default `"127.0.0.1"`) — interface to bind, as an IPv4 address.
-  `"0.0.0.0"` serves every interface. Parsed by `inet_pton`, so it accepts
-  what the platform accepts and anything else fails at boot. The default is
-  loopback rather than Igropyr's `0.0.0.0`: this is a library, and a version
-  bump should not put a server that was private on the network.
+- `:host` (default `"127.0.0.1"`) — interface to bind. Three accepted
+  forms: an IPv4 literal (`"0.0.0.0"` serves every v4 interface), an IPv6
+  literal (`"::1"`, `"::"`), or a hostname resolved once at boot with
+  `getaddrinfo` — **every** address the name answers with is bound, so
+  `"localhost"` serves both `::1` and `127.0.0.1` on the one port. Every
+  IPv6 listener is `IPV6_V6ONLY`, so `"::"` is v6-only and dual-stack
+  comes from a name that answers in both families. With `:port 0` the
+  kernel's pick is unified across every family, so the handle's `:port`
+  names one port. A name whose v4 leg collides with a running server
+  aborts the whole bind (no half-bound server). The default is loopback
+  rather than Igropyr's `0.0.0.0`: this is a library, and a version bump
+  should not put a server that was private on the network.
 - `:strategy` (default `:threads`) — concurrency backend for connections:
   - `:threads` — fixed worker pool, one worker thread per busy connection
     (`:worker-threads`, default core count); idle keep-alive connections
