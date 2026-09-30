@@ -9,7 +9,18 @@
  ;; over jolt.ffi. Those live in the C standard library, reached through the
  ;; running process's own symbols — declared here as :process so jolt loads them
  ;; before the namespace is required.
- :jolt/native [{:name "libc (POSIX sockets)" :process true}]
+ ;;
+ ;; zlib backs ring-chez.zlib (gzip middleware). jolt 0.8.9+ registers its own
+ ;; zlib under private jolt_z_* names, so on Linux the process exports no
+ ;; deflate and the symbols only resolve from a declared native. This used to
+ ;; work in the suite only because http-client (test-only) declared libz; apps
+ ;; got a gzip middleware that silently compressed nothing. :optional because
+ ;; no zlib just means uncompressed responses.
+ :jolt/native [{:name "libc (POSIX sockets)" :process true}
+               {:name "z" :optional true
+                :darwin  ["libz.dylib" "/usr/lib/libz.dylib"]
+                :linux   ["libz.so.1" "libz.so"]
+                :windows ["zlib1.dll" "zlib.dll"]}]
 
  ;; jolt-crypto (AES/HMAC/SecureRandom over OpenSSL) rides along so an app that
  ;; wraps its handler with ring-defaults — whose session + CSRF middleware needs
