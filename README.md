@@ -11,13 +11,14 @@ Add the git dependency to `deps.edn`:
 ```
 
 Requires the `jolt` binary (Clojure on Chez Scheme, no JVM); the adapter
-binds BSD sockets through `jolt.ffi`, so there is nothing else to install.
+binds sockets through `jolt.socket.native`, so there is nothing else to install.
 
 # ring adapter for jolt
 
 A Ring HTTP/1.1 server for [jolt](https://github.com/jolt-lang/jolt) (Clojure on
-Chez Scheme). It binds BSD sockets directly through `jolt.ffi` — no jolt
-built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
+Chez Scheme). It runs over jolt's fd-level sockets (`jolt.socket.native`) — no
+java.net, no JVM — and runs synchronous Ring handlers on a worker pool. macOS
+and Linux run both strategies; Windows runs `:threads`.
 
 ```clojure
 (require '[ring-chez.adapter :as adapter])
@@ -54,7 +55,8 @@ built-in, no JVM — and runs synchronous Ring handlers on a worker pool.
     the Ring handler and websocket sessions — still runs on threads, but only
     while actually computing; `:keep-alive-timeout-ms` bounds each parked
     read and `:write-timeout-ms` each parked write, so neither a handler nor
-    a long stream is bounded by the idle timeout.
+    a long stream is bounded by the idle timeout. Not on Windows, where
+    jolt's poller has no backend yet; `:fibers` throws there.
     Anything other than `:threads`/`:fibers` throws.
 - `:worker-threads` (default: core count) — each worker runs one connection
   loop; when all are busy the acceptor parks and the kernel backlog queues

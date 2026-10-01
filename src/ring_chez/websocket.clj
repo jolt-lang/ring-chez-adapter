@@ -13,12 +13,10 @@
    the RFC's status codes (1002 protocol error, 1007 invalid UTF-8, 1009
    message too big) rather than handing a malformed message to the caller."
   (:require [jolt.ffi :as ffi]
-            [jolt.io-poller :as poller]
+            [jolt.socket.native :as native]
             [jolt.crypto :as crypto]
             [ring-chez.cas :refer [cas!]]))
 
-(ffi/defcfn c-send  "send"  [:int :pointer :size_t :int] :ssize_t :blocking)
-(ffi/defcfn c-recv  "recv"  [:int :pointer :size_t :int] :ssize_t :blocking)
 
 ;; Igropyr's caps (websocket.sc:26-28). A declared length is never a memory
 ;; reservation: a frame past max-frame is refused from its header alone, and a
@@ -283,10 +281,10 @@
       (ffi/write-array buf bs)
       (loop [off 0]
         (if (< off n)
-          (let [sent (c-send fd (+ buf off) (- n off) 0)]
+          (let [[sent e] (native/c-send fd (+ buf off) (- n off) native/msg-nosignal)]
             (cond
               (pos? sent) (recur (+ off sent))
-              (and (neg? sent) (poller/eintr?)) (recur off)
+              (and (neg? sent) (native/eintr? e)) (recur off)
               :else false))
           true))
       (finally (ffi/free buf)))))
@@ -349,11 +347,11 @@
   (let [fbuf (ffi/alloc recv-bufsize)]
     (try
       (loop []
-        (let [got (c-recv (:fd session) fbuf recv-bufsize 0)]
+        (let [[got e] (native/c-recv (:fd session) fbuf recv-bufsize 0)]
           (cond
             (pos? got) (do (ib-append! (:buf session) (ffi/read-array fbuf got))
                            true)
-            (and (neg? got) (poller/eintr?)) (recur)
+            (and (neg? got) (native/eintr? e)) (recur)
             :else nil)))
       (finally (ffi/free fbuf)))))
 

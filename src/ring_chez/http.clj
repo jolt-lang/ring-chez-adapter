@@ -7,7 +7,7 @@
             [clojure.core.async :as async]
             [clojure.java.io :as io]
             [ring-chez.socket :as socket]
-            [jolt.io-poller :as poller]
+            [jolt.socket.native :as native]
             [jolt.ffi :as ffi]))
 
 (defn- head-lines
@@ -700,11 +700,11 @@
   [conn buf n wait-write!]
   (loop [off 0]
     (if (< off n)
-      (let [sent (socket/c-send conn (+ buf off) (- n off) 0)]
+      (let [[sent e] (native/c-send conn (+ buf off) (- n off) native/msg-nosignal)]
         (cond
           (pos? sent) (recur (+ off sent))
-          (and (neg? sent) (poller/eintr?)) (recur off)
-          (and (neg? sent) wait-write! (poller/eagain?))
+          (and (neg? sent) (native/eintr? e)) (recur off)
+          (and (neg? sent) wait-write! (native/eagain? e))
           (do (wait-write!) (recur off))
           :else false))
       true)))
