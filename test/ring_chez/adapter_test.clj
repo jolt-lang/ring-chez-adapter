@@ -84,6 +84,22 @@
       (ffi/free sa))
     fd))
 
+(defn client-connect-host
+  "Raw TCP connection to host:port over whichever family host resolves to
+  (RFC-0016 tests dial ::1). Uses the adapter's own resolver, so the client
+  and the server agree on what a host means."
+  ([host port] (client-connect-host host port nil))
+  ([host port rcvtimeo-ms]
+   (let [{:keys [addr addrlen family]} (first (socket/resolve-bind-sockaddrs host port))
+         fd (t-socket family 1 0)]
+     (when (neg? fd) (throw (ex-info "client socket() failed" {})))
+     (swap! t-pending dissoc fd)
+     (when rcvtimeo-ms (t-set-rcvtimeo! fd rcvtimeo-ms))
+     (when (neg? (t-connect fd addr addrlen))
+       (t-close fd) (ffi/free addr) (throw (ex-info (str "connect() to " host " failed") {})))
+     (ffi/free addr)
+     fd)))
+
 (defn- send-buf!
   "Write all n bytes of buf to fd. A short send is normal and gets retried, and
   so does EINTR. The old loop stopped on any non-positive return, which
@@ -3455,7 +3471,7 @@
       (let [r (http/get "http://127.0.0.1:8491/")]
         (check "host: explicit loopback still serves" 200 (:status r)))
       (finally (adapter/stop-server server))))
-  (doseq [bad ["" "not.an.address" "999.1.1.1" 42]]
+  (doseq [bad ["" "no.such.host.invalid" "999.1.1.1" 42]]
     (try
       (let [s (adapter/run-server handler {:port 8492 :host bad})]
         (adapter/stop-server s)
@@ -3463,6 +3479,207 @@
       (catch Throwable t
         (check (str "host: " (pr-str bad) " rejected at boot") :threw :threw)
         (check-has (str "host: " (pr-str bad) " names :host") ":host" (ex-message t))))))
+
+;; --- RFC-0016: hostname and IPv6 bind ---------------------------------------------
+
+(defn test-bind-sockaddrs []
+  ;; the resolver behind :host — getaddrinfo, so literals and names take one
+  ;; path and the port is patched into the family-agnostic bytes 2-3
+  (let [v4 (socket/resolve-bind-sockaddrs "127.0.0.1" 8505)
+        v6 (socket/resolve-bind-sockaddrs "::1" 8506)
+        lo (socket/resolve-bind-sockaddrs "localhost" 8507)
+        port-of (fn [e] (+ (* 256 (ffi/read (:addr e) :uint8 2))
+                           (ffi/read (:addr e) :uint8 3)))]
+    (doseq [[label res n] [["v4 literal" v4 1] ["v6 literal" v6 1]]]
+      (check (str "resolve: one candidate for a " label) n (count res)))
+    (check "resolve: v4 family and length" [socket/af-inet 16]
+           (first (mapv (juxt :family :addrlen) v4)))
+    (check "resolve: v6 family and length" [socket/af-inet6 28]
+           (first (mapv (juxt :family :addrlen) v6)))
+    (check "resolve: v4 port patched in" 8505 (port-of (first v4)))
+    (check "resolve: v6 port patched in" 8506 (port-of (first v6)))
+    (check "resolve: localhost has a v4 answer"
+           true (boolean (some #{socket/af-inet} (map :family lo))))
+    ;; a box with v6 has both answers for localhost — bind-all is the point
+    (when (= 1 (count v6))
+      (check "resolve: localhost has a v6 answer"
+             true (boolean (some #{socket/af-inet6} (map :family lo)))))
+    (try
+      (socket/resolve-bind-sockaddrs "no.such.host.invalid" 8505)
+      (check "resolve: unresolvable name throws" :threw :did-not-throw)
+      (catch Throwable t
+        (check "resolve: unresolvable name throws" :threw :threw)
+        (check "resolve: error names :host" true (str/includes? (ex-message t) ":host"))
+        (check "resolve: error carries :gai-code" true (contains? (ex-data t) :gai-code))))
+    (doseq [all [v4 v6 lo] e all] (ffi/free (:addr e)))))
+
+(defn test-listen-sockets-uniform-port []
+  ;; port 0 must hand back ONE port for every family bound, or the handle's
+  ;; :port would name only the first socket
+  (let [{fds :fds port :port} (socket/listen-sockets "localhost" 0 nil)]
+    (try
+      (check "listen-sockets: at least one fd" true (pos? (count fds)))
+      (check "listen-sockets: every fd on the same port"
+             true (apply = port (map socket/local-port fds)))
+      (check "listen-sockets: every fd close-on-exec"
+             true (every? socket/cloexec? fds))
+      (finally
+        (doseq [fd fds]
+        (socket/c-shutdown fd 2)
+        (socket/c-close fd))))))
+
+(defn test-peer-ip-v6 []
+  ;; accept() now fills a sockaddr_storage; a v6 peer must format back
+  ;; through inet_ntop, not the dotted-quad reader
+  (let [sa (ffi/alloc 28)]
+    (try
+      (dotimes [i 28] (ffi/write sa :uint8 0 i))
+      (if t-macos?
+        (do (ffi/write sa :uint8 28 0) (ffi/write sa :uint8 socket/af-inet6 1))
+        (ffi/write sa :uint8 socket/af-inet6 0))
+      ;; ::1 — last byte of the 16 at offset 8
+      (ffi/write sa :uint8 1 23)
+      (check "peer-ip: ::1" "::1" (socket/peer-ip sa))
+      ;; 2001:db8::1
+      (dotimes [i 28] (ffi/write sa :uint8 0 i))
+      (if t-macos?
+        (do (ffi/write sa :uint8 28 0) (ffi/write sa :uint8 socket/af-inet6 1))
+        (ffi/write sa :uint8 socket/af-inet6 0))
+      (ffi/write sa :uint8 0x20 8) (ffi/write sa :uint8 0x01 9)
+      (ffi/write sa :uint8 0x0d 10) (ffi/write sa :uint8 0xb8 11)
+      (ffi/write sa :uint8 1 23)
+      (check "peer-ip: 2001:db8::1" "2001:db8::1" (socket/peer-ip sa))
+      (finally (ffi/free sa)))))
+
+(defn test-ipv6-bind-and-serve []
+  ;; :host "::1" — a v6-only server; remote-addr must read back as ::1
+  (let [seen (atom nil)
+        server (adapter/run-server (fn [req] (reset! seen (:remote-addr req))
+                                     {:status 200 :body "ok"})
+                                   {:port 8505 :host "::1"})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect-host "::1" 8505 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: [::1]:8505\r\n\r\n")
+        (client-recv fd)
+        (check "ipv6: serves on ::1" "::1" @seen)
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-localhost-binds-both []
+  ;; a name with both answers binds both families on the one port — the
+  ;; bind-all rule of RFC-0016
+  (let [seen (atom nil)
+        server (adapter/run-server (fn [req] (reset! seen (:remote-addr req))
+                                     {:status 200 :body "ok"})
+                                   {:port 8506 :host "localhost"})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect-host "::1" 8506 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: [::1]:8506\r\n\r\n")
+        (client-recv fd)
+        (check "localhost: v6 answer served" "::1" @seen)
+        (client-close fd))
+      (let [fd (client-connect 8506 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+        (client-recv fd)
+        (check "localhost: v4 answer served" "127.0.0.1" @seen)
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-eaddrinuse-aborts-across-families []
+  ;; a name whose v4 leg collides must not leave its v6 leg listening: the
+  ;; abort-all policy, because "port in use" is how you notice a running server
+  (let [first-srv (adapter/run-server handler {:port 8507 :host "127.0.0.1"})]
+    (try
+      (Thread/sleep 250)
+      (try
+        (adapter/stop-server (adapter/run-server handler {:port 8507 :host "localhost"}))
+        (check "eaddrinuse: second server on a taken port throws" :threw :did-not-throw)
+        (catch Throwable t
+          (check "eaddrinuse: second server on a taken port throws" :threw :threw)
+          (check "eaddrinuse: message names the port" true (str/includes? (ex-message t) "8507"))))
+      ;; localhost answers ::1 first here, so the v6 leg was bound before the
+      ;; v4 collision — the abort has to have closed it again
+      (check "eaddrinuse: no v6 leg left listening"
+             :refused
+             (try (t-close (client-connect-host "::1" 8507 500)) :connected
+                  (catch Throwable _ :refused)))
+      (finally (adapter/stop-server first-srv)))))
+
+(defn test-host-non-ascii []
+  ;; the node buffer is sized in UTF-8 octets, not chars — a non-ASCII name
+  ;; must fail resolution cleanly, not write past the buffer
+  (try
+    (adapter/stop-server (adapter/run-server handler {:port 8520 :host "ünïcödé.invalid"}))
+    (check "host: non-ASCII name rejected" :threw :did-not-throw)
+    (catch Throwable t
+      (check "host: non-ASCII name rejected" :threw :threw)
+      (check-has "host: non-ASCII name names :host" ":host" (ex-message t)))))
+
+(defn test-ipv6-any []
+  ;; "::" is the v6 wildcard, v6-only (IPV6_V6ONLY): it serves ::1 and leaves
+  ;; the v4 side of the port alone
+  (let [server (adapter/run-server handler {:port 8521 :host "::"})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect-host "::1" 8521 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n")
+        (check "ipv6 any: serves ::1" true (str/includes? (or (client-recv fd) "") "200"))
+        (client-close fd))
+      (check "ipv6 any: v4 side not bound"
+             :refused
+             (try (t-close (client-connect 8521 500)) :connected
+                  (catch Throwable _ :refused)))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ipv6-fibers []
+  ;; the fibers arm runs its own accept loops — one per family as well
+  (let [seen (atom [])
+        server (adapter/run-server (fn [req] (swap! seen conj (:remote-addr req))
+                                     {:status 200 :body "ok"})
+                                   {:port 8522 :host "localhost" :strategy :fibers})]
+    (try
+      (Thread/sleep 250)
+      (doseq [host ["::1" "127.0.0.1"]]
+        (let [fd (client-connect-host host 8522 3000)]
+          (client-send fd "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+          (client-recv fd)
+          (client-close fd)))
+      (check "ipv6 fibers: both families served" #{"::1" "127.0.0.1"} (set @seen))
+      (finally (adapter/stop-server server)))))
+
+(defn test-stop-closes-all-sockets []
+  ;; stop-server tears down every listen fd, or the v6 leg would keep the
+  ;; port after a stop
+  (let [server (adapter/run-server handler {:port 8508 :host "localhost"})]
+    (Thread/sleep 250)
+    (adapter/stop-server server)
+    (Thread/sleep 150)
+    (doseq [[label host] [["v6" "::1"] ["v4" "127.0.0.1"]]]
+      (check (str "stop: " label " listener closed")
+             :refused
+             (try (t-close (client-connect-host host 8508 500)) :connected
+                  (catch Throwable _ :refused))))))
+
+(defn test-port-zero-one-port-both-families []
+  ;; port 0 + two families: the handle's :port names one port and both
+  ;; families answer on it
+  (let [server (adapter/run-server handler {:port 0 :host "localhost"})]
+    (try
+      (let [port (:port server)]
+        (check "port 0 both: handle names the port" true (pos? port))
+        (check "port 0 both: every fd on that port"
+               true (every? #(= port (socket/local-port %)) (:sockets server)))
+        (Thread/sleep 250)
+        (check "port 0 both: v4 answers" 200
+               (:status (http/get (str "http://127.0.0.1:" port "/"))))
+        (let [fd (client-connect-host "::1" port 3000)]
+          (client-send fd "GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n")
+          (let [resp (client-recv fd)]
+            (check "port 0 both: v6 answers" true (str/includes? (or resp "") "200")))
+          (client-close fd)))
+      (finally (adapter/stop-server server)))))
 
 (defn test-peer-ip-formatting []
   ;; the conversion itself, fed a sockaddr_in built by hand: accept() fills one
@@ -4341,6 +4558,17 @@
 
   ;; --- Round 3: bind address and peer ---
   (run-test "test-bind-host-option" test-bind-host-option)
+  (run-test "test-bind-sockaddrs" test-bind-sockaddrs)
+  (run-test "test-listen-sockets-uniform-port" test-listen-sockets-uniform-port)
+  (run-test "test-peer-ip-v6" test-peer-ip-v6)
+  (run-test "test-ipv6-bind-and-serve" test-ipv6-bind-and-serve)
+  (run-test "test-localhost-binds-both" test-localhost-binds-both)
+  (run-test "test-eaddrinuse-aborts-across-families" test-eaddrinuse-aborts-across-families)
+  (run-test "test-stop-closes-all-sockets" test-stop-closes-all-sockets)
+  (run-test "test-port-zero-one-port-both-families" test-port-zero-one-port-both-families)
+  (run-test "test-host-non-ascii" test-host-non-ascii)
+  (run-test "test-ipv6-any" test-ipv6-any)
+  (run-test "test-ipv6-fibers" test-ipv6-fibers)
   (run-test "test-peer-ip-formatting" test-peer-ip-formatting)
   (run-test "test-request-addressing" test-request-addressing)
   (run-test "test-fiber-request-addressing" test-fiber-request-addressing)

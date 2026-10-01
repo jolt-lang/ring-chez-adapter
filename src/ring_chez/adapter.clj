@@ -1032,9 +1032,11 @@
           (check-host []
             (when (contains? opts :host)
               (let [v (get opts :host)]
-                ;; inet_pton decides, so the message names what it rejected
-                (when-not (socket/ipv4->octets v)
-                  (bad! :host v "an IPv4 address (e.g. \"127.0.0.1\" or \"0.0.0.0\")"))))
+                ;; resolvability is getaddrinfo's call, made at bind time;
+                ;; boot validation checks the shape only, so names and v6
+                ;; literals pass through and a bad one throws from bind
+                (when-not (and (string? v) (pos? (count v)))
+                  (bad! :host v "a non-empty hostname or address string"))))
             (get opts :host))]
     {:port               (check-num :port 0 65535)
      :host               (check-host)
@@ -1146,63 +1148,70 @@
                :write-timeout-ms write-timeout-ms
                :handler-timeout-ms handler-timeout-ms
                :stats stats}
-          fd     (socket/listen-socket host port {:reuse-port? (boolean (:reuse-port v))})
-          ;; port 0 asks the kernel for any free port; the handle says which
-          port   (if (zero? port) (socket/local-port fd) port)
+          binds  (socket/listen-sockets host port {:reuse-port? (boolean (:reuse-port v))})
+          fds    (:fds binds)
+          ;; port 0 asks the kernel for any free port — listen-sockets unifies
+          ;; the choice across every family; the handle says which
+          port   (:port binds)
           running? (atom true)]
       (if (= :fibers strategy)
         (let [conns (atom #{})   ; live conn entries; sweeper + stop sweep them
               ;; nothing to un-count on this strategy: accept pressure and its
               ;; keep-alive retirement are the fixed pool's problem
-              sweep (start-sweeper! conns stats fault! (fn [_]))]
-          {:socket fd :port port :host host :running running? :conns conns :sweep sweep
-           :handler handler-box :ws-handler ws-handler-box :stats stats
-           :acceptor
-           (future (serve-loop fd running?
-                              (fn [conn peer]
-                                (swap! (:open stats) inc)
-                                ;; publish, THEN check — the order is the whole
-                                ;; interlock. stop-server clears running? before
-                                ;; it sweeps, so a conn is either already in
-                                ;; `conns` when the sweep reads it, or this read
-                                ;; sees false and cleans up here. Reading
-                                ;; running? first (serve-loop's cond, which is
-                                ;; where this used to be decided) let a conn land
-                                ;; in `conns` AFTER the sweep had passed over it,
-                                ;; with nobody left to take it down: a stopped
-                                ;; server went on serving it, and its fd leaked.
-                                (let [entry (register-conn! conns conn peer true)]
-                                  ;; the spawn below is the handoff, and from
-                                  ;; here the conn is somebody's: a go block
-                                  ;; that never runs leaves it registered,
-                                  ;; unclaimed and unserved, which is the drop
-                                  ;; the sweeper reaps and reports
-                                  (reset! (:claim-by entry)
-                                          (+ (System/currentTimeMillis) sweep-deadline-ms))
-                                  (if @running?
-                                    ;; the spawn, not the session: a throw here
-                                    ;; means the go block never ran, so this
-                                    ;; conn is still unclaimed and releasing it
-                                    ;; is ours to do. A fault inside the
-                                    ;; session is the fiber's (see fiber-serve).
-                                    ;;
-                                    ;; nonblock! is inside the guard, and it
-                                    ;; used to run before the conn was
-                                    ;; registered at all: a throw from it was
-                                    ;; then a connection nothing had a record
-                                    ;; of, so the fault said a conn was lost
-                                    ;; without leaving anything able to close
-                                    ;; it. Registered first, it is releasable.
-                                    (try (poller/nonblock! conn)
-                                         (fiber-serve (assoc base-info :remote-addr peer)
-                                                      cfg entry conns)
-                                         (catch Throwable t
-                                           (fault! :spawn t)
-                                           (when (claim-close! entry)
-                                             (conn-release! conns entry stats))))
-                                    (when (claim-close! entry)
-                                      (conn-release! conns entry stats)))))
-                              fault!))})
+              sweep (start-sweeper! conns stats fault! (fn [_]))
+              ;; one accept loop per listen fd (RFC-0016: a name with a v4
+              ;; and a v6 answer binds one socket per family); the loops
+              ;; share the serve! path, the conn registry and the stats
+              acceptors (mapv (fn [lfd]
+                                (future (serve-loop lfd running?
+                                                    (fn [conn peer]
+                                                      (swap! (:open stats) inc)
+                                                      ;; publish, THEN check — the order is the whole
+                                                      ;; interlock. stop-server clears running? before
+                                                      ;; it sweeps, so a conn is either already in
+                                                      ;; `conns` when the sweep reads it, or this read
+                                                      ;; sees false and cleans up here. Reading
+                                                      ;; running? first (serve-loop's cond, which is
+                                                      ;; where this used to be decided) let a conn land
+                                                      ;; in `conns` AFTER the sweep had passed over it,
+                                                      ;; with nobody left to take it down: a stopped
+                                                      ;; server went on serving it, and its fd leaked.
+                                                      (let [entry (register-conn! conns conn peer true)]
+                                                        ;; the spawn below is the handoff, and from
+                                                        ;; here the conn is somebody's: a go block
+                                                        ;; that never runs leaves it registered,
+                                                        ;; unclaimed and unserved, which is the drop
+                                                        ;; the sweeper reaps and reports
+                                                        (reset! (:claim-by entry)
+                                                                (+ (System/currentTimeMillis) sweep-deadline-ms))
+                                                        (if @running?
+                                                          ;; the spawn, not the session: a throw here
+                                                          ;; means the go block never ran, so this
+                                                          ;; conn is still unclaimed and releasing it
+                                                          ;; is ours to do. A fault inside the
+                                                          ;; session is the fiber's (see fiber-serve).
+                                                          ;;
+                                                          ;; nonblock! is inside the guard, and it
+                                                          ;; used to run before the conn was
+                                                          ;; registered at all: a throw from it was
+                                                          ;; then a connection nothing had a record
+                                                          ;; of, so the fault said a conn was lost
+                                                          ;; without leaving anything able to close
+                                                          ;; it. Registered first, it is releasable.
+                                                          (try (poller/nonblock! conn)
+                                                               (fiber-serve (assoc base-info :remote-addr peer)
+                                                                            cfg entry conns)
+                                                               (catch Throwable t
+                                                                 (fault! :spawn t)
+                                                                 (when (claim-close! entry)
+                                                                   (conn-release! conns entry stats))))
+                                                          (when (claim-close! entry)
+                                                            (conn-release! conns entry stats)))))
+                                                    fault!)))
+                              fds)]
+          {:sockets fds :socket (first fds) :port port :host host :running running?
+           :conns conns :sweep sweep :acceptors acceptors :acceptor (first acceptors)
+           :handler handler-box :ws-handler ws-handler-box :stats stats})
         (let [work  (async/chan)  ; unbuffered: acceptor parks when all workers busy
               conns (atom #{})    ; live conn entries; the stop sweep closes them
               pending (atom 0)    ; conns accepted but not yet claimed by a worker
@@ -1214,73 +1223,81 @@
               ;; worker has the conn, so a conn still unclaimed after that is
               ;; one the take/claim hop lost, not one queued behind a busy pool
               sweep (start-sweeper! conns stats fault! #(pending-done! pending %))
-               io (assoc threads-io
-                         :retire? #(retire-for-pressure! pending pool %)
-                         :parking! #(worker-parking! pool %)
-                         :unparked! #(swap! pool update :idle dec)
-                         :claim! #(pending-done! pending %)
-                         ;; idle keep-alive first read: wait in poll(2) slices
-                         ;; instead of parking a full ka-timeout recv. Enforces
-                         ;; the ka deadline itself (poll has no timeout), and
-                         ;; under accept pressure retires a connection only
-                         ;; after a grace period of quiet — never instantly,
-                         ;; or a client mid-reuse would race a reset. Returns
-                         ;; the recv contract (n>0 data, 0 closed/retire).
-                         :idle-recv! (fn [conn buf entry]
-                                       (idle-poll-recv! conn buf ka-ms
-                                                        #(retire-for-pressure! pending pool entry))))]
-           (dotimes [_ n] (start-worker! base-info cfg io work conns running?))
-          {:socket fd :port port :host host :running running? :work work :conns conns
-           :sweep sweep :handler handler-box :ws-handler ws-handler-box :stats stats
-           :acceptor
-           (future (serve-loop fd running?
-                              (fn [conn peer]
-                                (swap! (:open stats) inc)
-                                ;; publish, then check — see the fibers arm. The
-                                ;; put is part of the same condition: >!! answers
-                                ;; false on a channel stop-server has closed, and
-                                ;; a conn nobody can take off it needs the same
-                                ;; cleanup as one accepted after the sweep.
-                                ;;
-                                ;; The handoff is its own expression so the
-                                ;; cleanup below runs exactly once whether the
-                                ;; put answered false or threw: pending is
-                                ;; decremented on the not-handed path only, and
-                                ;; a throw out of the release cannot take the
-                                ;; accept loop with it (see serve-loop).
-                                (let [entry (register-conn! conns conn peer false)
-                                      _ (do (reset! (:pending? entry) true)
-                                            (swap! pending inc))
-                                      handed? (try (and @running? (async/>!! work entry))
-                                                   (catch Throwable t
-                                                     (fault! :handoff t)
-                                                     false))]
-                                  (if handed?
-                                    ;; a worker has it — the rendezvous does not
-                                    ;; answer until one does — so from here an
-                                    ;; unclaimed conn is a lost one, not a
-                                    ;; queued one. Arm the backstop.
-                                    (do
-                                      ;; Pressure counts conns no worker has
-                                      ;; taken yet, and the rendezvous
-                                      ;; answering IS the take: past this point
-                                      ;; the conn is nobody's backlog, so
-                                      ;; leaving it counted retires idle
-                                      ;; keep-alives for the whole claim window
-                                      ;; over a loss that is already past the
-                                      ;; queue — the ka collapse measured
-                                      ;; 2026-09-20. Once-only either way: the
-                                      ;; worker's take-time claim and this both
-                                      ;; go through pending-done!'s CAS.
-                                      (pending-done! pending entry)
-                                      (reset! (:claim-by entry)
-                                              (+ (System/currentTimeMillis) sweep-deadline-ms)))
-                                    (do
-                                      (pending-done! pending entry)
-                                      (try (when (claim-close! entry)
-                                             (conn-release! conns entry stats))
-                                           (catch Throwable t (fault! :conn-release t)))))))
-                              fault!))})))))
+              io (assoc threads-io
+                        :retire? #(retire-for-pressure! pending pool %)
+                        :parking! #(worker-parking! pool %)
+                        :unparked! #(swap! pool update :idle dec)
+                        :claim! #(pending-done! pending %)
+                        ;; idle keep-alive first read: wait in poll(2) slices
+                        ;; instead of parking a full ka-timeout recv. Enforces
+                        ;; the ka deadline itself (poll has no timeout), and
+                        ;; under accept pressure retires a connection only
+                        ;; after a grace period of quiet — never instantly,
+                        ;; or a client mid-reuse would race a reset. Returns
+                        ;; the recv contract (n>0 data, 0 closed/retire).
+                        :idle-recv! (fn [conn buf entry]
+                                      (idle-poll-recv! conn buf ka-ms
+                                                       #(retire-for-pressure! pending pool entry))))]
+          (dotimes [_ n] (start-worker! base-info cfg io work conns running?))
+          ;; one accept loop per listen fd (RFC-0016) — same shape as the
+          ;; fibers arm: shared serve! path and registry, per-fd loop
+          (let [acceptors
+                (mapv
+                 (fn [lfd]
+                   (future
+                     (serve-loop
+                      lfd running?
+                      (fn [conn peer]
+                        (swap! (:open stats) inc)
+                        ;; publish, then check — see the fibers arm. The
+                        ;; put is part of the same condition: >!! answers
+                        ;; false on a channel stop-server has closed, and
+                        ;; a conn nobody can take off it needs the same
+                        ;; cleanup as one accepted after the sweep.
+                        ;;
+                        ;; The handoff is its own expression so the
+                        ;; cleanup below runs exactly once whether the
+                        ;; put answered false or threw: pending is
+                        ;; decremented on the not-handed path only, and
+                        ;; a throw out of the release cannot take the
+                        ;; accept loop with it (see serve-loop).
+                        (let [entry (register-conn! conns conn peer false)
+                              _ (do (reset! (:pending? entry) true)
+                                    (swap! pending inc))
+                              handed? (try (and @running? (async/>!! work entry))
+                                           (catch Throwable t
+                                             (fault! :handoff t)
+                                             false))]
+                          (if handed?
+                            ;; a worker has it — the rendezvous does not
+                            ;; answer until one does — so from here an
+                            ;; unclaimed conn is a lost one, not a
+                            ;; queued one. Arm the backstop.
+                            (do
+                              ;; Pressure counts conns no worker has
+                              ;; taken yet, and the rendezvous
+                              ;; answering IS the take: past this point
+                              ;; the conn is nobody's backlog, so
+                              ;; leaving it counted retires idle
+                              ;; keep-alives for the whole claim window
+                              ;; over a loss that is already past the
+                              ;; queue — the ka collapse measured
+                              ;; 2026-09-20. Once-only either way: the
+                              ;; worker's take-time claim and this both
+                              ;; go through pending-done!'s CAS.
+                              (pending-done! pending entry)
+                              (reset! (:claim-by entry)
+                                      (+ (System/currentTimeMillis) sweep-deadline-ms)))
+                            (do
+                              (pending-done! pending entry)
+                              (try (when (claim-close! entry)
+                                     (conn-release! conns entry stats))
+                                   (catch Throwable t (fault! :conn-release t)))))))
+                      fault!)))
+                 fds)]
+            {:sockets fds :socket (first fds) :port port :host host :running running?
+             :work work :conns conns :sweep sweep :acceptors acceptors :acceptor (first acceptors)
+             :handler handler-box :ws-handler ws-handler-box :stats stats}))))))
 
 (defn swap-handler!
   "Point a running server at a new Ring handler (Igropyr http-swap!). Takes
@@ -1391,17 +1408,35 @@
     ;; a worker that took the same conn.
     (doseq [entry @conns]
       (when (claim-close! entry) (conn-release! conns entry (:stats server)))))
-  (let [fd (:socket server)]
-    (socket/c-shutdown fd 2)                    ; Linux: wakes and fails accept(); macOS: ENOTCONN
-    (let [reserved? (not (neg? (socket/c-dup2 @socket/devnull-fd fd)))] ; both: the number is ours until the close below
-      ;; Every accept() from here fails at once, so the wait is bounded by the
-      ;; acceptor's own backoff (<= 100ms) plus scheduling; the timeout guards
-      ;; against a runtime fault. An acceptor still alive past it may yet
-      ;; syscall on the number, so the number is left reserved rather than
-      ;; freed — the safe side of the race, at the cost of one /dev/null fd.
-      (let [acceptor (:acceptor server)
-            exited?  (or (nil? acceptor)
-                         (not= ::timeout (deref acceptor drain-timeout-ms ::timeout)))]
-        (when (or exited? (not reserved?))
+  ;; every listen fd gets the unblock sequence (RFC-0016: one per family) —
+  ;; shutdown+dup2 ALL of them first, so every parked accept fails at once
+  (let [fds (or (:sockets server)
+                (when-let [fd (:socket server)] [fd]))]
+    (let [reserved (into {}
+                         (for [fd fds]
+                           (do (socket/c-shutdown fd 2) ; Linux: wakes and fails accept(); macOS: ENOTCONN
+                               ;; both: the number is ours until the close below
+                               [fd (not (neg? (socket/c-dup2 @socket/devnull-fd fd)))])))
+          ;; Every accept() from here fails at once, so the wait is bounded by
+          ;; the acceptors' own backoff (<= 100ms) plus scheduling; the timeout
+          ;; guards against a runtime fault, and is one deadline for all of
+          ;; them rather than one each. An acceptor still alive past it may yet
+          ;; syscall on the number, so the number is left reserved rather than
+          ;; freed — the safe side of the race, at the cost of one /dev/null fd.
+          ;; A dup2 that failed reserved nothing, though: that fd still holds
+          ;; the bound socket, so it is closed regardless, or the port stays
+          ;; taken by a stopped server.
+          acceptors (or (:acceptors server)
+                        (when-let [a (:acceptor server)] [a]))
+          deadline (+ (System/currentTimeMillis) drain-timeout-ms)
+          all-exited? (every?
+                       (fn [a]
+                         (or (nil? a)
+                             (not= ::timeout
+                                   (deref a (max 0 (- deadline (System/currentTimeMillis)))
+                                          ::timeout))))
+                       acceptors)]
+      (doseq [fd fds]
+        (when (or all-exited? (not (reserved fd)))
           (socket/c-close fd)))))
   nil))
