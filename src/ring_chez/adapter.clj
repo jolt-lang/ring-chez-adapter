@@ -18,9 +18,10 @@
             [jolt.ffi :as ffi]))
 
 ;; --- fiber strategy io: jolt.io-poller ---------------------------------------
-;; Accepted fds are set O_NONBLOCK (poller/nonblock!); reads and writes are
+;; Accepted fds are set non-blocking (poller/nonblock!); reads and writes are
 ;; raw nonblocking syscalls that park the connection's fiber on
-;; jolt.io-poller — kqueue/epoll with persistent, kernel-held registrations
+;; jolt.io-poller — kqueue/epoll with persistent, kernel-held registrations, or
+;; WSAPoll on Windows
 ;; (the old hand-rolled loop rebuilt its pollfd set from scratch on every
 ;; wake). The poller is process-global and never stops, so every teardown path
 ;; must forget! the fd: that keeps the poller table bounded, drops stale
@@ -1077,13 +1078,13 @@
                            (default = available processors); slow or idle
                            keep-alive connections occupy a worker each.
                            :fibers — one fiber-backed go block per connection
-                           parked on jolt.io-poller (kqueue/epoll, persistent
-                           registrations); idle keep-alive connections pin no
+                           parked on jolt.io-poller (kqueue, epoll or
+                           WSAPoll); idle keep-alive connections pin no
                            thread. Blocking handlers and websocket sessions
                            still run on threads, but only while actually
-                           working. Needs a readiness poller, which jolt
-                           has on macOS and Linux and not on Windows; there
-                           it throws.
+                           working. Needs jolt.io-poller's readiness
+                           backend (kqueue, epoll or WSAPoll); throws on a
+                           platform without one.
     :worker-threads        worker pool size (threads strategy)
                             (default = available processors); slow or idle
                             keep-alive connections occupy a worker each,

@@ -17,8 +17,8 @@ binds sockets through `jolt.socket.native`, so there is nothing else to install.
 
 A Ring HTTP/1.1 server for [jolt](https://github.com/jolt-lang/jolt) (Clojure on
 Chez Scheme). It runs over jolt's fd-level sockets (`jolt.socket.native`) — no
-java.net, no JVM — and runs synchronous Ring handlers on a worker pool. macOS
-and Linux run both strategies; Windows runs `:threads`.
+java.net, no JVM — and runs synchronous Ring handlers on a worker pool. Both
+strategies run on macOS, Linux and Windows.
 
 ```clojure
 (require '[ring-chez.adapter :as adapter])
@@ -55,8 +55,8 @@ and Linux run both strategies; Windows runs `:threads`.
     the Ring handler and websocket sessions — still runs on threads, but only
     while actually computing; `:keep-alive-timeout-ms` bounds each parked
     read and `:write-timeout-ms` each parked write, so neither a handler nor
-    a long stream is bounded by the idle timeout. Not on Windows, where
-    jolt's poller has no backend yet; `:fibers` throws there.
+    a long stream is bounded by the idle timeout. The poller is kqueue,
+    epoll or WSAPoll, whichever the platform has.
     Anything other than `:threads`/`:fibers` throws.
 - `:worker-threads` (default: core count) — each worker runs one connection
   loop; when all are busy the acceptor parks and the kernel backlog queues
