@@ -184,13 +184,15 @@
   (let [flags (poller/c-fcntl fd f-getfl 0)]
     (poller/c-fcntl fd f-setfl (bit-and-not flags o-nonblock))))
 
-;; struct addrinfo { int ai_flags; int ai_family; int ai_socktype;
-;;   int ai_protocol; socklen_t ai_addrlen; struct sockaddr *ai_addr;
-;;   char *ai_canonname; struct addrinfo *ai_next; } — identical layout on
-;; macOS and Linux: the four ints at 0/4/8/12, socklen_t ai_addrlen at
-;; 16 (8 bytes, 64-bit), then the pointers — ai_canonname at 24, ai_addr
-;; at 32, ai_next at 40 — 48 bytes total. AI_PASSIVE=1, AF_UNSPEC=0.
+;; struct addrinfo: four ints at 0/4/8/12, socklen_t ai_addrlen at 16 (4
+;; bytes, padded to 8), then three pointers — ai_next at 40, 48 bytes total.
+;; The middle two are NOT in the same order everywhere: the BSDs (macOS) have
+;; ai_canonname at 24 and ai_addr at 32, glibc has ai_addr at 24 and
+;; ai_canonname at 32. Reading the BSD offset on Linux gets ai_canonname,
+;; NULL without AI_CANONNAME, and every candidate is dropped.
+;; AI_PASSIVE=1, AF_UNSPEC=0.
 (def ^:private addrinfo-size 48)
+(def ^:private ai-addr-offset (if macos? 32 24))
 (def ^:private AI-PASSIVE 1)
 
 (defn- gai-message [code]
@@ -204,12 +206,15 @@
    Literals and names take the one getaddrinfo path; the caller frees each
    :addr buffer."
   [host port]
-  (let [node (ffi/alloc (inc (count host)))
+  ;; sized in UTF-8 octets — write-bytes writes those, not chars
+  (let [octets (.getBytes host "UTF-8")
+        n     (alength octets)
+        node  (ffi/alloc (inc n))
         hints (ffi/alloc addrinfo-size)
         resp  (ffi/alloc 8)]
     (try
-      (dotimes [i (inc (count host))] (ffi/write node :uint8 0 i))
-      (ffi/write-bytes node host)             ; zero-filled, so NUL-terminated
+      (dotimes [i (inc n)] (ffi/write node :uint8 0 i))
+      (ffi/write-bytes node octets)           ; zero-filled, so NUL-terminated
       (dotimes [i addrinfo-size] (ffi/write hints :uint8 0 i))
       (ffi/write hints :int AI-PASSIVE 0)
       (ffi/write hints :int 0 4)               ; AF_UNSPEC: every family
@@ -224,16 +229,21 @@
               (throw (ex-info (str "run-server: :host resolved to no addresses: "
                                    (pr-str host))
                               {:key :host :given host :gai-code 0})))
-            (loop [ai head out (transient [])]
+            ;; the same address can come back twice (a name listed on two
+            ;; /etc/hosts lines), and binding it twice is an EADDRINUSE
+            ;; against ourselves — `seen` keys on family + address bytes
+            (loop [ai head out (transient []) seen #{}]
               (if (or (nil? ai) (ffi/null? ai))
                 (do (c-freeaddrinfo head)
                     (persistent! out))
                 (let [family   (ffi/read ai :int 4)
                       addrlen  (ffi/read ai :int 16)
-                      addr-ptr (ffi/read ai :pointer 32)
-                      entry (when (and (or (= family af-inet) (= family af-inet6))
-                                       (pos? addrlen)
-                                       (not (ffi/null? addr-ptr)))
+                      addr-ptr (ffi/read ai :pointer ai-addr-offset)
+                      k (when (and (or (= family af-inet) (= family af-inet6))
+                                   (pos? addrlen)
+                                   (not (ffi/null? addr-ptr)))
+                          [family (mapv #(ffi/read addr-ptr :uint8 %) (range addrlen))])
+                      entry (when (and k (not (contains? seen k)))
                               (let [addr (ffi/alloc addrlen)]
                                 (dotimes [i addrlen]
                                   (ffi/write addr :uint8 (ffi/read addr-ptr :uint8 i) i))
@@ -241,7 +251,8 @@
                                 (ffi/write addr :uint8 (bit-and port 0xff) 3)
                                 {:family family :addr addr :addrlen addrlen}))]
                   (recur (ffi/read ai :pointer 40)
-                         (if entry (conj! out entry) out))))))))
+                         (if entry (conj! out entry) out)
+                         (if k (conj seen k) seen))))))))
       (finally (ffi/free node) (ffi/free hints) (ffi/free resp)))))
 
 (defn peer-ip
@@ -282,7 +293,9 @@
 (defn- setsockopt-flag!
   "Set one boolean socket option, or throw with the errno behind it. The
    2-arity names the protocol level: every option but IPV6_V6ONLY lives at
-   SOL_SOCKET."
+   SOL_SOCKET. Closing fd on failure is the caller's job — listen-sockets
+   closes it on every failure path, and closing it here too was a double
+   close, which can take down whatever socket reused the number between."
   ([fd opt-name opt-const]
    (setsockopt-flag! fd sol-socket opt-name opt-const))
   ([fd level opt-name opt-const]
@@ -291,7 +304,6 @@
      (try
        (when (neg? (c-setsockopt fd level opt-const opt 4))
          (let [e (errno-info)]
-           (c-close fd)
            (throw (ex-info (str "setsockopt(" opt-name ") failed: " (:strerror e))
                            (assoc e :syscall "setsockopt" :option opt-name)))))
        (finally (ffi/free opt))))))
@@ -327,6 +339,8 @@
    (cond-> {:errno errno :strerror strerror :syscall "bind" :port port}
      (= errno eaddrinuse) (assoc :errno-name "EADDRINUSE"))))
 
+(declare listen-sockets*)
+
 (defn listen-sockets
   "Bind and listen on EVERY candidate resolve-bind-sockaddrs returns — a
    name with both a v4 and a v6 answer serves both families on the one
@@ -342,8 +356,24 @@
    whole set: every fd opened so far is closed (shutdown first, per the
    house rule) and the bind error rethrown, because a half-bound server
    (v6 up, v4 not) hides exactly the \"already running\" collision
-   EADDRINUSE exists to report."
+   EADDRINUSE exists to report.
+
+   Port 0 is the exception: the kernel's pick for the first family says
+   nothing about the others, so the second bind can find it taken. That
+   EADDRINUSE is not a running server, and the whole set is retried for a
+   fresh pick."
   ([host port] (listen-sockets host port nil))
+  ([host port opts]
+   (loop [attempt 1]
+     (let [r (try (listen-sockets* host port opts)
+                  (catch Throwable t
+                    (if (and (zero? port) (< attempt 8)
+                             (= "EADDRINUSE" (get (ex-data t) :errno-name)))
+                      ::retry
+                      (throw t))))]
+       (if (identical? r ::retry) (recur (inc attempt)) r)))))
+
+(defn- listen-sockets*
   ([host port {:keys [reuse-port?]}]
    (let [entries (resolve-bind-sockaddrs host port)]
      (loop [remaining entries opened [] chosen nil]
@@ -387,7 +417,7 @@
                          (setsockopt-flag! fd IPPROTO-IPV6 "IPV6_V6ONLY" ipv6-v6only))
                        (when (neg? (c-bind fd addr addrlen))
                          (let [e (errno-info)]
-                           (throw (ex-info "bind" e))))
+                           (throw (ex-info "bind" (assoc e :syscall "bind")))))
                        ;; 511, as Igropyr uses (http.sc:1899): the backlog is
                        ;; what absorbs an accept burst while the acceptor is
                        ;; busy, and 64 is small enough that a modest connection
@@ -415,10 +445,14 @@
                        (do (abandon!)
                            (c-close fd)
                            (ffi/free addr)
-                           (throw (if (map? (ex-data outcome))
-                                    (bind-failure-ex host target
-                                                     (get (ex-data outcome) :errno -1)
-                                                     (get (ex-data outcome) :strerror ""))
+                           ;; only bind's failure is reworded; setsockopt's
+                           ;; already names itself, and listen gets its own
+                           (throw (case (get (ex-data outcome) :syscall)
+                                    "bind" (bind-failure-ex host target errno
+                                                            (get (ex-data outcome) :strerror ""))
+                                    "listen" (ex-info (str "listen() failed on " (pr-str host) ":"
+                                                           target ": " (get (ex-data outcome) :strerror ""))
+                                                      (ex-data outcome))
                                     outcome)))))))))))))))
 
 (def bufsize 65536)

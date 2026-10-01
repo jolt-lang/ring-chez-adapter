@@ -3599,7 +3599,55 @@
         (catch Throwable t
           (check "eaddrinuse: second server on a taken port throws" :threw :threw)
           (check "eaddrinuse: message names the port" true (str/includes? (ex-message t) "8507"))))
+      ;; localhost answers ::1 first here, so the v6 leg was bound before the
+      ;; v4 collision — the abort has to have closed it again
+      (check "eaddrinuse: no v6 leg left listening"
+             :refused
+             (try (t-close (client-connect-host "::1" 8507 500)) :connected
+                  (catch Throwable _ :refused)))
       (finally (adapter/stop-server first-srv)))))
+
+(defn test-host-non-ascii []
+  ;; the node buffer is sized in UTF-8 octets, not chars — a non-ASCII name
+  ;; must fail resolution cleanly, not write past the buffer
+  (try
+    (adapter/stop-server (adapter/run-server handler {:port 8520 :host "ünïcödé.invalid"}))
+    (check "host: non-ASCII name rejected" :threw :did-not-throw)
+    (catch Throwable t
+      (check "host: non-ASCII name rejected" :threw :threw)
+      (check-has "host: non-ASCII name names :host" ":host" (ex-message t)))))
+
+(defn test-ipv6-any []
+  ;; "::" is the v6 wildcard, v6-only (IPV6_V6ONLY): it serves ::1 and leaves
+  ;; the v4 side of the port alone
+  (let [server (adapter/run-server handler {:port 8521 :host "::"})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect-host "::1" 8521 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: [::1]\r\n\r\n")
+        (check "ipv6 any: serves ::1" true (str/includes? (or (client-recv fd) "") "200"))
+        (client-close fd))
+      (check "ipv6 any: v4 side not bound"
+             :refused
+             (try (t-close (client-connect 8521 500)) :connected
+                  (catch Throwable _ :refused)))
+      (finally (adapter/stop-server server)))))
+
+(defn test-ipv6-fibers []
+  ;; the fibers arm runs its own accept loops — one per family as well
+  (let [seen (atom [])
+        server (adapter/run-server (fn [req] (swap! seen conj (:remote-addr req))
+                                     {:status 200 :body "ok"})
+                                   {:port 8522 :host "localhost" :strategy :fibers})]
+    (try
+      (Thread/sleep 250)
+      (doseq [host ["::1" "127.0.0.1"]]
+        (let [fd (client-connect-host host 8522 3000)]
+          (client-send fd "GET / HTTP/1.1\r\nHost: localhost\r\n\r\n")
+          (client-recv fd)
+          (client-close fd)))
+      (check "ipv6 fibers: both families served" #{"::1" "127.0.0.1"} (set @seen))
+      (finally (adapter/stop-server server)))))
 
 (defn test-stop-closes-all-sockets []
   ;; stop-server tears down every listen fd, or the v6 leg would keep the
@@ -4518,6 +4566,9 @@
   (run-test "test-eaddrinuse-aborts-across-families" test-eaddrinuse-aborts-across-families)
   (run-test "test-stop-closes-all-sockets" test-stop-closes-all-sockets)
   (run-test "test-port-zero-one-port-both-families" test-port-zero-one-port-both-families)
+  (run-test "test-host-non-ascii" test-host-non-ascii)
+  (run-test "test-ipv6-any" test-ipv6-any)
+  (run-test "test-ipv6-fibers" test-ipv6-fibers)
   (run-test "test-peer-ip-formatting" test-peer-ip-formatting)
   (run-test "test-request-addressing" test-request-addressing)
   (run-test "test-fiber-request-addressing" test-fiber-request-addressing)
