@@ -14,12 +14,14 @@
             [ring-chez.websocket :as ws]
             [ring-chez.cas :refer [cas!]]
             [jolt.io-poller :as poller]
+            [jolt.socket.native :as native]
             [jolt.ffi :as ffi]))
 
 ;; --- fiber strategy io: jolt.io-poller ---------------------------------------
-;; Accepted fds are set O_NONBLOCK (poller/nonblock!); reads and writes are
+;; Accepted fds are set non-blocking (poller/nonblock!); reads and writes are
 ;; raw nonblocking syscalls that park the connection's fiber on
-;; jolt.io-poller — kqueue/epoll with persistent, kernel-held registrations
+;; jolt.io-poller — kqueue/epoll with persistent, kernel-held registrations, or
+;; WSAPoll on Windows
 ;; (the old hand-rolled loop rebuilt its pollfd set from scratch on every
 ;; wake). The poller is process-global and never stops, so every teardown path
 ;; must forget! the fd: that keeps the poller table bounded, drops stale
@@ -65,12 +67,18 @@
 
 ;; --- the accept loop --------------------------------------------------------
 ;; Clean shutdown: stop-server ends the acceptor and WAITS for it before it
-;; frees the listen fd's number — see stop-server for the two platform halves
-;; of the wake-up. The loop sees `running?` false, or a failing accept() on a
-;; socket that no longer listens, and exits instead of spinning on the dead
-;; fd. It never closes the listen fd itself: the number is freed by
-;; stop-server once this thread has provably stopped using it, under the same
-;; rule conn-down! applies to a connection.
+;; frees the listen fd's number. The listen fd is non-blocking and the acceptor
+;; waits for it in poll slices, so it sees `running?` go false within one slice
+;; on every platform, without anything having to wake a blocked accept(). It
+;; never closes the listen fd itself: the number is freed by stop-server once
+;; this thread has provably stopped using it, under the same rule conn-down!
+;; applies to a connection.
+
+(def ^:private accept-poll-ms
+  "The longest the acceptor waits in one poll before it looks at running?
+  again, and so the longest stop-server waits for it. A connection does not
+  wait for the slice: poll answers as soon as one is queued."
+  50)
 (defn- serve-loop
   "Accept forever, handing each connection and its peer address to serve!.
   accept() fills the sockaddr, which is where :remote-addr comes from — it
@@ -88,17 +96,24 @@
   ExecutionException. So serve! runs under a guard, and a loop that ends while
   the server is running says so."
   [listen-fd running? serve! fault!]
-  (let [[sa salen] (socket/alloc-peer-sockaddr)]
+  (let [[sa salen] (native/alloc-sockaddr)]
     (try
       (loop [backoff 0]
-        (ffi/write salen :int socket/sockaddr-size 0)
-        (let [conn (socket/c-accept listen-fd sa salen)]
+        (ffi/write salen :int native/sockaddr-storage-size 0)
+        (let [[conn e] (if @running? (native/c-accept listen-fd sa salen) [-1 0])]
           (cond
+            ;; nothing queued: wait for a connection, or for the slice to end
+            ;; so running? is looked at again. A poll that fails says so
+            ;; through the accept after it.
+            (and (neg? conn) (native/eagain? e))
+            (do (native/poll-one listen-fd native/pollin accept-poll-ms)
+                (recur 0))
+            (and (neg? conn) (native/eintr? e)) (recur backoff)
             ;; already stopped: nobody downstream will ever see this fd, so
             ;; close it here or it leaks. This is only an early-out — the
             ;; check that actually closes the race is inside serve!, which
             ;; registers the conn BEFORE reading running? (see run-server).
-            (not @running?) (when-not (neg? conn) (socket/c-close conn))
+            (not @running?) (when-not (neg? conn) (native/c-close conn))
             ;; a failing accept that is retried immediately burns a core:
             ;; EMFILE persists until an fd is released, and nothing here
             ;; releases one. Back off, capped, and reset on the next success.
@@ -107,9 +122,16 @@
                           (recur (min 100 (if (zero? backoff) 1 (* 2 backoff)))))
             :else
             (let [;; a child the application forks must not inherit the client's
-                  ;; connection (socket/close-on-exec!); best effort — a conn
+                  ;; connection (native/close-on-exec!); best effort — a conn
                   ;; that could not be marked is still served
-                  _ (try (socket/close-on-exec! conn) (catch Throwable _ nil))
+                  _ (try (native/close-on-exec! conn) (catch Throwable _ nil))
+                  ;; serve! is handed a blocking fd, as it was when the
+                  ;; listener blocked: macOS and Windows hand an accepted
+                  ;; socket the listener's non-blocking mode, Linux does not
+                  ;; and pays nothing here. The fiber strategy makes it
+                  ;; non-blocking again itself.
+                  _ (when native/accept-inherits-nonblocking?
+                      (native/set-blocking! conn true))
                   ;; read the peer BEFORE serve! is entered, so the two faults
                   ;; can be told apart. serve! owns the fd from its first
                   ;; instruction — both strategies guard their own body and
@@ -122,7 +144,7 @@
                   peer (try (socket/peer-ip sa)
                             (catch Throwable t (fault! :peer-addr t) nil))]
               (if (nil? peer)
-                (do (socket/c-shutdown conn 2) (socket/c-close conn))
+                (do (native/c-shutdown conn native/shut-rdwr) (native/c-close conn))
                 (try (serve! conn peer)
                      (catch Throwable t (fault! :accept t))))
               (recur 0)))))
@@ -218,8 +240,8 @@
   that stopped talking."
   [conn buf]
   (loop []
-    (let [n (socket/c-recv conn buf socket/bufsize 0)]
-      (if (and (neg? n) (poller/eintr?)) (recur) n))))
+    (let [[n e] (native/c-recv conn buf socket/bufsize 0)]
+      (if (and (neg? n) (native/eintr? e)) (recur) n))))
 
 (def ^:private stream-idle-check-ms
   "How often a streaming response with nothing to send asks whether its client
@@ -265,10 +287,10 @@
   misdirected a reused fd number's wakeups.)"
   [conn buf]
   (loop []
-    (let [n (socket/c-recv conn buf socket/bufsize 0)]
+    (let [[n e] (native/c-recv conn buf socket/bufsize 0)]
       (cond
-        (and (neg? n) (poller/eintr?)) (recur)
-        (and (neg? n) (poller/eagain?)) (do (poller/wait-ready conn :read) (recur))
+        (and (neg? n) (native/eintr? e)) (recur)
+        (and (neg? n) (native/eagain? e)) (do (poller/wait-ready conn :read) (recur))
         :else n))))
 
 (def ^:private no-deadline Long/MAX_VALUE)
@@ -338,24 +360,24 @@
   with it every connection queued behind it. A signal is likewise not the peer
   going away: EINTR polls again rather than reporting the connection closed."
   [conn buf ka-ms retire?]
-  (let [pfds (ffi/alloc socket/pollfd-size)]
+  (let [pfds (native/alloc-pollfds 1)]
     (try
-      (socket/init-pollfd! pfds conn socket/POLLIN)
+      (native/init-pollfd! pfds conn native/pollin)
       (let [start    (System/currentTimeMillis)
             deadline (+ start ka-ms)
             grace    (+ start 2000)]
         (loop []
-          (let [rc  (socket/c-poll pfds 1 250)
+          (let [[rc e] (native/c-poll pfds 1 250)
                 now (System/currentTimeMillis)]
             (cond
               (and (pos? rc)
-                   (pos? (bit-and (socket/pollfd-revents pfds) socket/poll-readable)))
+                   (pos? (bit-and (native/pollfd-revents pfds) native/poll-readable)))
               ;; poll said readable, but the recv that follows can still be
               ;; interrupted — and a signal here would retire a live
               ;; connection, since the caller reads non-positive as gone
               (blocking-recv! conn buf)
 
-              (and (neg? rc) (poller/eintr?)) (recur)
+              (and (neg? rc) (native/eintr? e)) (recur)
               (neg? rc) 0
               (>= now deadline) 0
               (and (>= now grace) (retire?)) 0
@@ -531,7 +553,7 @@
                                           "Sec-WebSocket-Accept: "
                                           (ws/accept-token (get-in request [:headers "sec-websocket-key"]))
                                           "\r\n\r\n"))
-                     (socket/blocking! conn)
+                     (native/set-blocking! conn true)
                      ;; the session owns the fd now and bounds an idle peer with
                      ;; its own SO_RCVTIMEO; the deadline is already suspended
                      ;; for everything past the read, so the sweeper leaves it be
@@ -676,7 +698,7 @@
   registration. Only the fibers path has a registration to forget."
   [entry]
   (when (cas! (:down? entry) false true)
-    (socket/c-shutdown (:conn entry) 2)
+    (native/c-shutdown (:conn entry) native/shut-rdwr)
     (when (:poller? entry) (poller/forget! (:conn entry)))))
 
 (defn- claim-close!
@@ -717,7 +739,7 @@
   (conn-down! entry)
   (when (cas! (:released? entry) false true)
     (when (:poller? entry) (poller/forget! (:conn entry)))
-    (socket/c-close (:conn entry))
+    (native/c-close (:conn entry))
     (swap! (:open stats) dec))
   (swap! conns disj entry))
 
@@ -839,22 +861,16 @@
   fine: the answer is a courtesy, the release is the guarantee."
   [entry]
   (try
-    (let [conn (:conn entry)
-          pfds (ffi/alloc socket/pollfd-size)]
-      (try
-        (socket/init-pollfd! pfds conn socket/POLLOUT)
-        (let [rc (socket/c-poll pfds 1 0)]
-          (when (and (pos? rc)
-                     (pos? (bit-and (socket/pollfd-revents pfds)
-                                    socket/POLLOUT)))
-            (http/send-all
+    (let [conn (:conn entry)]
+      (when (pos? (bit-and (max 0 (native/poll-one conn native/pollout 0))
+                           native/pollout))
+        (http/send-all
               conn (.getBytes (str "HTTP/1.1 503 Service Unavailable\r\n"
                                    "Content-Type: text/plain\r\n"
                                    "Connection: close\r\n"
                                    "Content-Length: 19\r\n\r\n"
                                    "Service Unavailable")
                               "UTF-8"))))
-        (finally (ffi/free pfds))))
     (catch Throwable _ nil)))
 
 (defn- start-sweeper!
@@ -941,7 +957,7 @@
                           (* sweep-deadline-ms claimed-silent-headroom)))
                   (when (cas! (:down? e) false true)
                     (answer-unclaimed! e)
-                    (socket/c-shutdown (:conn e) 2)
+                    (native/c-shutdown (:conn e) native/shut-rdwr)
                     (when (:poller? e) (poller/forget! (:conn e)))
                     (fault! :claimed-silent
                             (ex-info "connection claimed but never served"
@@ -1062,11 +1078,13 @@
                            (default = available processors); slow or idle
                            keep-alive connections occupy a worker each.
                            :fibers — one fiber-backed go block per connection
-                           parked on jolt.io-poller (kqueue/epoll, persistent
-                           registrations); idle keep-alive connections pin no
+                           parked on jolt.io-poller (kqueue, epoll or
+                           WSAPoll); idle keep-alive connections pin no
                            thread. Blocking handlers and websocket sessions
                            still run on threads, but only while actually
-                           working.
+                           working. Needs jolt.io-poller's readiness
+                           backend (kqueue, epoll or WSAPoll); throws on a
+                           platform without one.
     :worker-threads        worker pool size (threads strategy)
                             (default = available processors); slow or idle
                             keep-alive connections occupy a worker each,
@@ -1092,6 +1110,10 @@
     (when-not (contains? #{:threads :fibers} strategy)
       (throw (ex-info "run-server: :strategy must be :threads or :fibers"
                       {:strategy strategy :given opts})))
+    (when (and (= :fibers strategy) (not (poller/available?)))
+      (throw (ex-info (str "run-server: :strategy :fibers needs jolt.io-poller, "
+                           "which has no backend on this platform; use :threads")
+                      {:key :strategy :given strategy :os native/os})))
     (let [v      (validate-opts! opts)
           port   (or (:port v) 3000)
           n      (or (:worker-threads v) (.availableProcessors (Runtime/getRuntime)))
@@ -1371,16 +1393,14 @@
   place and the acceptor waited for; the number is closed once nothing can
   syscall on it, and the port is free when this returns.
 
-  Ending it in place takes two calls because the platforms disagree.
-  shutdown(SHUT_RDWR) on a listening socket wakes a parked accept() on Linux
-  (EINVAL, and every accept() after it fails the same way) but is ENOTCONN
-  and does nothing on macOS, where close() is what wakes accept() — and
-  close() is the very thing that frees the number. dup2(/dev/null) over the
-  fd is the portable move: it drops the listener's last reference — which on
-  macOS drains the parked accept() (ECONNABORTED) — while the number keeps
-  naming an open file, so an accept() the acceptor makes later is ENOTSOCK
-  rather than a call on somebody else's socket. Linux does not drain a
-  syscall on dup2, hence the shutdown first."
+  Nothing has to wake the acceptor: it never blocks in accept(), only in a
+  poll slice of accept-poll-ms, and leaves at the end of the slice once
+  running? is false. shutdown(SHUT_RDWR) on the listener first ends it sooner
+  where the platform allows — on Linux it wakes the poll and stops new
+  connections queueing; macOS and Windows answer ENOTCONN and wait out the
+  slice. This replaced a dup2(/dev/null) over the listen fd, which was the
+  only way to wake a blocked accept() on macOS without freeing the number,
+  and which Windows has no equivalent of."
   ([server] (stop-server server nil))
   ([server {:keys [drain-timeout-ms] :or {drain-timeout-ms 5000}}]
   (reset! (:running server) false)
@@ -1408,24 +1428,17 @@
     ;; a worker that took the same conn.
     (doseq [entry @conns]
       (when (claim-close! entry) (conn-release! conns entry (:stats server)))))
-  ;; every listen fd gets the unblock sequence (RFC-0016: one per family) —
-  ;; shutdown+dup2 ALL of them first, so every parked accept fails at once
+  ;; every listen fd (RFC-0016: one per family) is shut down first, so on
+  ;; Linux every acceptor wakes at once
   (let [fds (or (:sockets server)
                 (when-let [fd (:socket server)] [fd]))]
-    (let [reserved (into {}
-                         (for [fd fds]
-                           (do (socket/c-shutdown fd 2) ; Linux: wakes and fails accept(); macOS: ENOTCONN
-                               ;; both: the number is ours until the close below
-                               [fd (not (neg? (socket/c-dup2 @socket/devnull-fd fd)))])))
-          ;; Every accept() from here fails at once, so the wait is bounded by
-          ;; the acceptors' own backoff (<= 100ms) plus scheduling; the timeout
-          ;; guards against a runtime fault, and is one deadline for all of
-          ;; them rather than one each. An acceptor still alive past it may yet
-          ;; syscall on the number, so the number is left reserved rather than
-          ;; freed — the safe side of the race, at the cost of one /dev/null fd.
-          ;; A dup2 that failed reserved nothing, though: that fd still holds
-          ;; the bound socket, so it is closed regardless, or the port stays
-          ;; taken by a stopped server.
+    (doseq [fd fds] (native/c-shutdown fd native/shut-rdwr))
+    (let [;; each acceptor leaves within one poll slice, so the wait is
+          ;; bounded by that plus scheduling; the timeout guards against a
+          ;; runtime fault, and is one deadline for all of them rather than
+          ;; one each. An acceptor still alive past it may yet syscall on the
+          ;; number, so the fds are left open rather than freed — the safe
+          ;; side of the race, at the cost of the fds and the port.
           acceptors (or (:acceptors server)
                         (when-let [a (:acceptor server)] [a]))
           deadline (+ (System/currentTimeMillis) drain-timeout-ms)
@@ -1436,7 +1449,6 @@
                                    (deref a (max 0 (- deadline (System/currentTimeMillis)))
                                           ::timeout))))
                        acceptors)]
-      (doseq [fd fds]
-        (when (or all-exited? (not (reserved fd)))
-          (socket/c-close fd)))))
+      (when all-exited?
+        (doseq [fd fds] (native/c-close fd)))))
   nil))

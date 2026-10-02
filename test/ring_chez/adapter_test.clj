@@ -15,6 +15,7 @@
             [clojure.java.io :as io]
             [jolt.ffi :as ffi]
             [ring-chez.socket :as socket]
+            [jolt.socket.native :as native]
             [jolt.io-poller :as poller]
             [jolt.process]))
 
@@ -1096,6 +1097,19 @@
       (check "bad strategy: run-server throws" :threw :threw)
       (check-has "bad strategy: message names :strategy" ":strategy" (ex-message t)))))
 
+;; :fibers parks connections on jolt.io-poller, which has no Windows backend.
+;; Where it has none, run-server refuses the strategy by name rather than
+;; starting a server whose first read fails. Faked here so a POSIX run pins it.
+(defn test-fibers-without-a-poller-throws []
+  (with-redefs [poller/available? (constantly false)]
+    (try
+      (let [server (adapter/run-server handler {:port 8426 :strategy :fibers})]
+        (adapter/stop-server server)
+        (check "no poller: :fibers throws" :threw :did-not-throw))
+      (catch Throwable t
+        (check "no poller: :fibers throws" :threw :threw)
+        (check-has "no poller: message says to use :threads" ":threads" (ex-message t))))))
+
 ;; --- RFC-0001: errno-enriched FFI errors ---------------------------------------
 
 (defn test-bind-failure-carries-errno []
@@ -1181,7 +1195,7 @@
         port (:port server)
         child (jolt.process/process ["sleep" "20"] {})]
     (try
-      (check "cloexec: the listening socket is marked" true (socket/cloexec? (:socket server)))
+      (check "cloexec: the listening socket is marked" true (native/close-on-exec? (:socket server)))
       (adapter/stop-server server)
       (let [again (try (adapter/run-server handler {:port port})
                        (catch Throwable t {:error (ex-message t)}))]
@@ -2063,15 +2077,15 @@
 ;; holding the acceptor between two accepts for longer than the stop and the
 ;; next start take together.
 (defn test-stale-acceptor-does-not-take-the-next-servers-connection []
-  (let [real-accept socket/c-accept
+  (let [real-accept native/c-accept
         gap (atom 0)]
-    (with-redefs [socket/c-accept (fn [fd sa salen]
+    (with-redefs [native/c-accept (fn [fd sa salen]
                                     (when (pos? @gap) (Thread/sleep @gap))
                                     (real-accept fd sa salen))]
       (dotimes [i 8]
         (let [a (adapter/run-server handler {:port 8561})]
           (Thread/sleep 50)
-          ;; the acceptor is parked in accept() already; from here on every
+          ;; the acceptor is waiting for a connection already; from here on every
           ;; accept it makes waits 30ms first
           (reset! gap 30)
           (http/get "http://127.0.0.1:8561/")
@@ -2123,10 +2137,10 @@
 ;; Measured before the fix with a pool of four: four injected faults, four dead
 ;; workers, and every request after them timed out.
 (defn test-worker-survives-a-fault-in-connection-teardown []
-  (let [real-close socket/c-close
+  (let [real-close native/c-close
         pool 4
         armed (atom 0)]
-    (with-redefs [socket/c-close
+    (with-redefs [native/c-close
                   (fn [fd]
                     (let [[was _] (swap-vals! armed (fn [n] (if (pos? n) (dec n) 0)))]
                       (if (pos? was)
@@ -3492,18 +3506,18 @@
                            (ffi/read (:addr e) :uint8 3)))]
     (doseq [[label res n] [["v4 literal" v4 1] ["v6 literal" v6 1]]]
       (check (str "resolve: one candidate for a " label) n (count res)))
-    (check "resolve: v4 family and length" [socket/af-inet 16]
+    (check "resolve: v4 family and length" [native/af-inet 16]
            (first (mapv (juxt :family :addrlen) v4)))
-    (check "resolve: v6 family and length" [socket/af-inet6 28]
+    (check "resolve: v6 family and length" [native/af-inet6 28]
            (first (mapv (juxt :family :addrlen) v6)))
     (check "resolve: v4 port patched in" 8505 (port-of (first v4)))
     (check "resolve: v6 port patched in" 8506 (port-of (first v6)))
     (check "resolve: localhost has a v4 answer"
-           true (boolean (some #{socket/af-inet} (map :family lo))))
+           true (boolean (some #{native/af-inet} (map :family lo))))
     ;; a box with v6 has both answers for localhost — bind-all is the point
     (when (= 1 (count v6))
       (check "resolve: localhost has a v6 answer"
-             true (boolean (some #{socket/af-inet6} (map :family lo)))))
+             true (boolean (some #{native/af-inet6} (map :family lo)))))
     (try
       (socket/resolve-bind-sockaddrs "no.such.host.invalid" 8505)
       (check "resolve: unresolvable name throws" :threw :did-not-throw)
@@ -3522,11 +3536,11 @@
       (check "listen-sockets: every fd on the same port"
              true (apply = port (map socket/local-port fds)))
       (check "listen-sockets: every fd close-on-exec"
-             true (every? socket/cloexec? fds))
+             true (every? native/close-on-exec? fds))
       (finally
         (doseq [fd fds]
-        (socket/c-shutdown fd 2)
-        (socket/c-close fd))))))
+        (native/c-shutdown fd 2)
+        (native/c-close fd))))))
 
 (defn test-peer-ip-v6 []
   ;; accept() now fills a sockaddr_storage; a v6 peer must format back
@@ -3535,16 +3549,16 @@
     (try
       (dotimes [i 28] (ffi/write sa :uint8 0 i))
       (if t-macos?
-        (do (ffi/write sa :uint8 28 0) (ffi/write sa :uint8 socket/af-inet6 1))
-        (ffi/write sa :uint8 socket/af-inet6 0))
+        (do (ffi/write sa :uint8 28 0) (ffi/write sa :uint8 native/af-inet6 1))
+        (ffi/write sa :uint8 native/af-inet6 0))
       ;; ::1 — last byte of the 16 at offset 8
       (ffi/write sa :uint8 1 23)
       (check "peer-ip: ::1" "::1" (socket/peer-ip sa))
       ;; 2001:db8::1
       (dotimes [i 28] (ffi/write sa :uint8 0 i))
       (if t-macos?
-        (do (ffi/write sa :uint8 28 0) (ffi/write sa :uint8 socket/af-inet6 1))
-        (ffi/write sa :uint8 socket/af-inet6 0))
+        (do (ffi/write sa :uint8 28 0) (ffi/write sa :uint8 native/af-inet6 1))
+        (ffi/write sa :uint8 native/af-inet6 0))
       (ffi/write sa :uint8 0x20 8) (ffi/write sa :uint8 0x01 9)
       (ffi/write sa :uint8 0x0d 10) (ffi/write sa :uint8 0xb8 11)
       (ffi/write sa :uint8 1 23)
@@ -3687,6 +3701,11 @@
   (let [sa (ffi/alloc 16)]
     (try
       (dotimes [i 16] (ffi/write sa :uint8 0 i))
+      ;; the family header, as accept() writes it: sin_len + sin_family on
+      ;; macOS, a 16-bit sin_family elsewhere
+      (if (= :macos native/os)
+        (do (ffi/write sa :uint8 16 0) (ffi/write sa :uint8 native/af-inet 1))
+        (ffi/write sa :uint16 native/af-inet 0))
       (doseq [[a b c d] [[127 0 0 1] [10 1 2 3] [192 168 250 17] [255 255 255 255]]]
         (ffi/write sa :uint8 a 4) (ffi/write sa :uint8 b 5)
         (ffi/write sa :uint8 c 6) (ffi/write sa :uint8 d 7)
@@ -4447,6 +4466,7 @@
   (run-test "test-fiber-stop-wakes-parked-conns" test-fiber-stop-wakes-parked-conns)
   (run-test "test-fiber-restart-leaves-poller-clean" test-fiber-restart-leaves-poller-clean)
   (run-test "test-bad-strategy-throws" test-bad-strategy-throws)
+  (run-test "test-fibers-without-a-poller-throws" test-fibers-without-a-poller-throws)
   (run-test "test-bind-failure-carries-errno" test-bind-failure-carries-errno)
   (run-test "test-string-content-length-keep-alive" test-string-content-length-keep-alive)
   (run-test "test-bind-eaddrinuse-friendly" test-bind-eaddrinuse-friendly)

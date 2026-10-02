@@ -1,23 +1,17 @@
-{;; jolt.ffi/write takes the value BEFORE the offset as of jolt 0.8.0, and the
- ;; two spellings are both integers — an older runtime writes to the wrong
- ;; place rather than failing. Declare the floor so it refuses instead.
- :jolt/min-version "0.8.0"
+{;; The sockets are jolt.socket.native's, which jolt ships from 0.8.16. Before
+ ;; it the namespace does not exist and the require fails; declare the floor so
+ ;; the version is what gets named instead.
+ :jolt/min-version "0.8.16"
 
  :paths ["src"]
 
- ;; The server binds BSD sockets (socket/bind/listen/accept/recv/send) directly
- ;; over jolt.ffi. Those live in the C standard library, reached through the
- ;; running process's own symbols — declared here as :process so jolt loads them
- ;; before the namespace is required.
- ;;
  ;; zlib backs ring-chez.zlib (gzip middleware). jolt 0.8.9+ registers its own
  ;; zlib under private jolt_z_* names, so on Linux the process exports no
  ;; deflate and the symbols only resolve from a declared native. This used to
  ;; work in the suite only because http-client (test-only) declared libz; apps
  ;; got a gzip middleware that silently compressed nothing. :optional because
  ;; no zlib just means uncompressed responses.
- :jolt/native [{:name "libc (POSIX sockets)" :process true}
-               {:name "z" :optional true
+ :jolt/native [{:name "z" :optional true
                 :darwin  ["libz.dylib" "/usr/lib/libz.dylib"]
                 :linux   ["libz.so.1" "libz.so"]
                 :windows ["zlib1.dll" "zlib.dll"]}]
