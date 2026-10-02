@@ -4629,4 +4629,6 @@
   (if (zero? @failures)
     (println "all passed")
     (println @failures "FAILED"))
-  (when (pos? @failures) (throw (ex-info "test failures" {:n @failures}))))
+  ;; exit like clojure test runners: the servers' worker pools would otherwise
+  ;; hold the process, as jolt (like the JVM) waits for non-daemon threads
+  (System/exit (if (pos? @failures) 1 0)))
