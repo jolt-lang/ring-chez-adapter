@@ -1357,6 +1357,25 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+(defn test-ws-session-carries-request []
+  ;; the handler sees the upgrade request the guard saw: path, query, headers
+  (let [server (adapter/run-server handler
+                  {:port 8497 :worker-threads 1
+                   :ws-handler (fn [session]
+                                 (let [req (:request session)]
+                                   (ws/send! session (str (:uri req) "?" (:query-string req)
+                                                          " " (get-in req [:headers "host"])))))})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8497 5000)]
+        (ws-handshake fd "/ws?queue=q1")
+        (check-has "session-request: 101 sent" "101" (client-recv-until fd "\r\n\r\n"))
+        (let [f (ws-read-server-frame fd)]
+          (check "session-request: the upgrade request" "/ws?queue=q1 t"
+                 (bytes->str (:payload f))))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
 (defn test-ws-guard-rejects-with-response []
   ;; a response map is served instead of the 101 — unauthenticated peers
   ;; never get the socket — and the conn stays keep-alive-usable
@@ -4476,6 +4495,7 @@
   (run-test "test-nil-response-is-500" test-nil-response-is-500)
   (run-test "test-ws-failure-notifies-hook" test-ws-failure-notifies-hook)
   (run-test "test-ws-guard-accepts" test-ws-guard-accepts)
+  (run-test "test-ws-session-carries-request" test-ws-session-carries-request)
   (run-test "test-ws-guard-rejects-with-response" test-ws-guard-rejects-with-response)
   (run-test "test-ws-guard-nil-is-403" test-ws-guard-nil-is-403)
   (run-test "test-ws-guard-throw-is-request-failure" test-ws-guard-throw-is-request-failure)

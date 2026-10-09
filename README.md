@@ -75,7 +75,7 @@ strategies run on macOS, Linux and Windows.
   this a client sending a byte just inside it holds a worker indefinitely.
   Past the deadline the server answers `408` and closes.
 - `:ws-handler` — fn of a websocket session, run when an upgrade request
-  arrives (below)
+  arrives (below); the session's `:request` is that upgrade request
 - `:on-failure` — fn of `(request throwable)`, consulted for every abnormal
   handler completion: a handler throw, a `nil` response (which Ring defines
   as an error), a `:ws-guard` throw, and post-101 websocket session throws
@@ -542,6 +542,8 @@ test vector) and then your fn owns the connection through a session:
 - `ws/send!` sends a text frame, `ws/send-binary!` a binary frame (byte array,
   or any seq of octets), `ws/close!` a close frame; all return `false` once the
   peer is gone
+- `(:request session)` is the upgrade request (`:uri`, `:query-string`,
+  `:headers`, ...), so a handler can read a filter or the vhost the guard saw
 - the session runs on the worker thread; when your fn returns the connection
   closes. `:keep-alive-timeout-ms` doubles as the idle read timeout for open
   websocket connections

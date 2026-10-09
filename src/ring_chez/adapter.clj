@@ -563,7 +563,11 @@
                      ;; into: a client may pipeline its first frames in the
                      ;; same segment as the upgrade request, and dropping them
                      ;; parked the session on bytes already delivered
-                     ((:run! io) #(try (ws-handler (ws/make-session conn (:leftover r)))
+                     ;; the session carries the upgrade request, so the
+                     ;; handler can read its path, query and headers (the
+                     ;; vhost, a token, a filter) as the guard did
+                     ((:run! io) #(try (ws-handler (assoc (ws/make-session conn (:leftover r))
+                                                          :request request))
                                        (catch Throwable t
                                          (try (when on-failure
                                                 (on-failure
@@ -1104,7 +1108,8 @@
                            connections over them (Linux)
     :max-request-bytes     request cap (default 1048576; 413/431 beyond)
     :ws-handler            fn of a ring-chez.websocket Session, run when a
-                           websocket upgrade request arrives."
+                           websocket upgrade request arrives. The session's
+                           :request is the upgrade request."
   [handler opts]
   (let [strategy (get opts :strategy :threads)]
     (when-not (contains? #{:threads :fibers} strategy)
