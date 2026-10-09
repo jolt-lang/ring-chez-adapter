@@ -309,19 +309,47 @@
   [session bs]
   (send-frame! session 0x2 (->bytes bs)))
 
-(defn close!
-  "Send a close frame with no status. Idempotent."
-  [session]
-  (when (cas! (:closed? session) false true)
-    (send-bytes (:fd session) (encode-frame 0x8 empty-bytes)))
-  true)
-
 (defn- valid-close-code?
   "Codes a peer may legitimately send (RFC 6455 §7.4.1): 1000-1003, 1007-1011,
   1012-1014, and the private range 3000-4999. 1004/1005/1006 are reserved and
   never appear on the wire; below 1000 and 1015..2999 are unassigned."
   [c]
   (or (<= 1000 c 1003) (<= 1007 c 1011) (<= 1012 c 1014) (<= 3000 c 4999)))
+
+(defn- close-payload
+  "A close frame's body: the status code, big-endian, then the reason as
+  UTF-8 (RFC 6455 §5.5.1). A control frame carries at most 125 octets, so the
+  reason at most 123. Throws IllegalArgumentException for a code no peer may
+  see or a reason too long."
+  ^bytes [code reason]
+  (when-not (and (integer? code) (valid-close-code? code))
+    (throw (IllegalArgumentException. (str "not a close code a peer may receive: " code))))
+  (let [^bytes r (.getBytes ^String (str reason) "UTF-8")
+        n (alength r)]
+    (when (> n 123)
+      (throw (IllegalArgumentException. (str "close reason is " n " bytes; at most 123"))))
+    (let [out (byte-array (+ 2 n))]
+      (aset-byte out 0 (unchecked-byte (bit-shift-right code 8)))
+      (aset-byte out 1 (unchecked-byte (bit-and 0xff code)))
+      (System/arraycopy r 0 out 2 n)
+      out)))
+
+(defn close!
+  "Send a close frame: with no status, or with status code and an optional
+  reason (at most 123 UTF-8 bytes), which a browser reports as the
+  CloseEvent's code and reason. Idempotent: only the first close is sent.
+  A code a peer may not receive (1005, 1006, ...) or a reason too long
+  throws IllegalArgumentException."
+  ([session]
+   (when (cas! (:closed? session) false true)
+     (send-bytes (:fd session) (encode-frame 0x8 empty-bytes)))
+   true)
+  ([session code] (close! session code ""))
+  ([session code reason]
+   (let [payload (close-payload code reason)]
+     (when (cas! (:closed? session) false true)
+       (send-bytes (:fd session) (encode-frame 0x8 payload))))
+   true))
 
 (defn- fail!
   "Close with a status code (1002 protocol error, 1007 invalid UTF-8, 1009

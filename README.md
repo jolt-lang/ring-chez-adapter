@@ -541,7 +541,10 @@ test vector) and then your fn owns the connection through a session:
   vanishes). `:binary` data is a byte array.
 - `ws/send!` sends a text frame, `ws/send-binary!` a binary frame (byte array,
   or any seq of octets), `ws/close!` a close frame; all return `false` once the
-  peer is gone
+  peer is gone. `(ws/close! session code)` and `(ws/close! session code
+  reason)` put a status code (and a UTF-8 reason of at most 123 bytes) in the
+  close frame, which a browser reports as the CloseEvent's `code` and
+  `reason`; a code a peer may not receive (such as 1005) throws
 - `(:request session)` is the upgrade request (`:uri`, `:query-string`,
   `:headers`, ...), so a handler can read a filter or the vhost the guard saw
 - the session runs on the worker thread; when your fn returns the connection

@@ -1376,6 +1376,44 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+(defn test-ws-close-with-status []
+  ;; close! with a code (and reason) sends them in the close frame, as a
+  ;; browser's CloseEvent reports them (RFC 6455 §5.5.1); without, the
+  ;; frame stays empty
+  (let [server (adapter/run-server handler
+                  {:port 8598 :worker-threads 1
+                   :ws-handler (fn [session]
+                                 (let [m (ws/recv! session)]
+                                   (case (:data m)
+                                     "reason" (ws/close! session 1011 "cubi vanished")
+                                     "code" (ws/close! session 1000)
+                                     (ws/close! session))))})]
+    (try
+      (Thread/sleep 250)
+      (doseq [[ask expect] [["reason" [3 243 "cubi vanished"]]
+                            ["code" [3 232 ""]]
+                            ["none" nil]]]
+        (let [fd (client-connect 8598 5000)]
+          (ws-handshake fd "/ws")
+          (client-recv-until fd "\r\n\r\n")
+          (t-send-bytes fd (ws-client-frame 0x1 (utf8-bytes ask)))
+          (let [f (ws-read-server-frame fd)
+                p (vec (:payload f))]
+            (check (str "close-status " ask ": close opcode") 8 (:opcode f))
+            (if expect
+              (let [[hi lo reason] expect]
+                (check (str "close-status " ask ": code") [hi lo] (subvec p 0 2))
+                (check (str "close-status " ask ": reason") reason (bytes->str (subvec p 2))))
+              (check (str "close-status " ask ": no status") 0 (count p))))
+          (client-close fd)))
+      (check "close-status: a code a peer may not see is refused" true
+             (try (ws/close! {:closed? (atom false) :fd -1} 1005) false
+                  (catch IllegalArgumentException _ true)))
+      (check "close-status: a reason past 123 bytes is refused" true
+             (try (ws/close! {:closed? (atom false) :fd -1} 1000 (apply str (repeat 124 "x"))) false
+                  (catch IllegalArgumentException _ true)))
+      (finally (adapter/stop-server server)))))
+
 (defn test-ws-guard-rejects-with-response []
   ;; a response map is served instead of the 101 — unauthenticated peers
   ;; never get the socket — and the conn stays keep-alive-usable
@@ -4496,6 +4534,7 @@
   (run-test "test-ws-failure-notifies-hook" test-ws-failure-notifies-hook)
   (run-test "test-ws-guard-accepts" test-ws-guard-accepts)
   (run-test "test-ws-session-carries-request" test-ws-session-carries-request)
+  (run-test "test-ws-close-with-status" test-ws-close-with-status)
   (run-test "test-ws-guard-rejects-with-response" test-ws-guard-rejects-with-response)
   (run-test "test-ws-guard-nil-is-403" test-ws-guard-nil-is-403)
   (run-test "test-ws-guard-throw-is-request-failure" test-ws-guard-throw-is-request-failure)
