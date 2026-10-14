@@ -14,16 +14,21 @@
    and `Vary: Accept-Encoding` are set, and an `ETag` is given a distinct
    value, since a gzipped body is a different entity.
 
-   In-memory bodies only: a string, a byte array, or a seq/vector of those.
-   A `File`, an `InputStream` or a `core.async` channel passes through
-   uncompressed — compressing a stream means framing deflate output chunk by
-   chunk, and the one case where it clearly pays, static files, is better
-   served by caching the compressed copy (see `ring-chez.middleware.static`).
+   In-memory bodies (a string, a byte array, or a seq/vector of those) are
+   compressed whole. A `core.async` channel body — a server-sent event stream,
+   say — is compressed as one gzip stream, each chunk flushed as it is written
+   so the client sees it at once (`:stream?`, default true). The compressor
+   keeps its window across chunks, so a chunk repeating what came before, as
+   consecutive renders of one page mostly do, costs a few octets. A `File` or
+   an `InputStream` passes through uncompressed: the one case where it clearly
+   pays, static files, is better served by caching the compressed copy (see
+   `ring-chez.middleware.static`).
 
    Where zlib is unavailable the middleware is a no-op, which is what
    Igropyr's `gzip-compress` returning #f means: uncompressed is always a
    correct answer."
-  (:require [clojure.string :as str]
+  (:require [clojure.core.async :as async]
+            [clojure.string :as str]
             [ring-chez.zlib :as zlib]))
 
 (def default-min-size
@@ -121,39 +126,83 @@
             (str/split current #",")) headers
       :else (assoc headers "Vary" (str current ", Accept-Encoding")))))
 
+(defn- chunk-bytes ^bytes [v]
+  (if (string? v) (.getBytes ^String v "UTF-8") v))
+
+(defn- gzip-channel
+  "A channel carrying src's chunks as one gzip stream, or nil when no deflater
+  could be made. Each chunk is flushed on its own so it can be decoded on
+  arrival. src closing (or an empty chunk, which the adapter reads as the end)
+  finishes the member. The adapter closes the returned channel when the client
+  goes away; the next chunk then finds it closed and src is closed in turn, so
+  the producer's following put returns false as it would have without us."
+  [src opts]
+  (when-let [d (try (zlib/deflater opts) (catch Throwable _ nil))]
+    (let [out (async/chan)]
+      (async/go
+        (try
+          (loop []
+            (let [v (async/<! src)
+                  ^bytes bs (some-> v chunk-bytes)]
+              (if (or (nil? bs) (zero? (alength bs)))
+                (do (async/>! out (zlib/deflate-finish! d))
+                    (async/close! out))
+                (if (async/>! out (zlib/deflate-chunk! d bs))
+                  (recur)
+                  (async/close! src)))))
+          (catch Throwable _
+            (async/close! out)
+            (async/close! src))
+          (finally (zlib/deflate-close! d))))
+      out)))
+
+(defn- encoded-headers
+  "The response headers for a gzipped entity."
+  [headers]
+  (-> headers
+      (assoc "Content-Encoding" "gzip")
+      assoc-vary
+      (as-> h (if-let [e (header h "etag")]
+                (assoc h "ETag" (gzip-etag e))
+                h))
+      ;; the adapter frames from the octets it actually writes, so a stale
+      ;; length cannot desynchronise the connection — but a wrong one in the
+      ;; map would still be a lie to any middleware between here and it
+      (dissoc "Content-Length" "content-length")))
+
 (defn gzip-response
   "Compress one response for one request, or return it unchanged. opts as in
   `wrap-gzip`."
-  [request response {:keys [min-size types level]
+  [request response {:keys [min-size types level stream? window-bits mem-level]
                      :or   {min-size default-min-size
                             types    default-compressible-types
-                            level    6}}]
+                            level    6
+                            stream?  true}}]
   (let [headers (:headers response)
         body    (:body response)]
-    (if-not (and (map? response)
-                 (gzip-acceptable? (get-in request [:headers "accept-encoding"]))
-                 ;; a handler that encoded its own body owns that decision
-                 (nil? (header headers "content-encoding"))
-                 (compressible-type? types (header headers "content-type"))
-                 (zlib/available?))
+    (cond
+      (not (and (map? response)
+                (gzip-acceptable? (get-in request [:headers "accept-encoding"]))
+                ;; a handler that encoded its own body owns that decision
+                (nil? (header headers "content-encoding"))
+                (compressible-type? types (header headers "content-type"))
+                (zlib/available?)))
       response
+
+      (async/chan? body)
+      (if-let [gz (and stream?
+                       (gzip-channel body (cond-> {:level level}
+                                            window-bits (assoc :window-bits window-bits)
+                                            mem-level   (assoc :mem-level mem-level))))]
+        (assoc response :body gz :headers (encoded-headers headers))
+        response)
+
+      :else
       (let [^bytes raw (body->bytes body)]
         (if-not (and raw (> (alength raw) min-size))
           response
           (if-let [^bytes gz (zlib/gzip raw level)]
-            (-> response
-                (assoc :body gz)
-                (assoc :headers (-> headers
-                                    (assoc "Content-Encoding" "gzip")
-                                    assoc-vary
-                                    (as-> h (if-let [e (header h "etag")]
-                                              (assoc h "ETag" (gzip-etag e))
-                                              h))))
-                ;; the adapter frames from the octets it actually writes, so a
-                ;; stale length cannot desynchronise the connection — but a
-                ;; wrong one in the map would still be a lie to any middleware
-                ;; between here and it
-                (update :headers dissoc "Content-Length" "content-length"))
+            (assoc response :body gz :headers (encoded-headers headers))
             response))))))
 
 (defn wrap-gzip
@@ -163,6 +212,13 @@
      :types     content-type prefixes to compress (default
                 `default-compressible-types`)
      :level     zlib compression level 1..9 (default 6)
+     :stream?   compress channel bodies as a flushed gzip stream (default
+                true)
+     :window-bits, :mem-level
+                zlib state size for each stream (9..15, default 15; 1..9,
+                default 8). A stream holds its compressor for as long as it is
+                open, ~256 KB at the defaults, which adds up across many open
+                event streams; smaller values trade compression for memory
 
    Place it outermost, so it sees the finished response."
   ([handler] (wrap-gzip handler {}))

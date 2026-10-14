@@ -407,10 +407,35 @@ entity.
 client sends it precisely because it cannot decode gzip — and an explicit entry
 beats a wildcard, so `*;q=0, gzip` still compresses.
 
-In-memory bodies only (a string, a byte array, or a seq of those). A `File`, an
-`InputStream` or a channel body passes through uncompressed: compressing a
-stream means framing deflate output chunk by chunk, and the case where that
-clearly pays — static files — is better served by caching the compressed copy.
+In-memory bodies (a string, a byte array, or a seq of those) are compressed
+whole. A channel body — a server-sent event stream, say — is compressed as one
+gzip stream: each chunk is deflated with `Z_SYNC_FLUSH`, so the client can
+decode it the moment it arrives, and the compressor keeps its window between
+chunks, so a chunk that repeats what came before costs a few octets rather than
+its own size. That is what makes re-sending a whole rendered page on every
+change cheap on the wire: an unchanged 10 KB frame goes out as ~170 octets.
+Turn it off with `:stream? false`.
+
+Each open stream holds its compressor for as long as it is open, ~256 KB of
+native memory at zlib's defaults. With many long-lived streams, `:window-bits`
+(9..15, default 15) and `:mem-level` (1..9, default 8) trade compression for
+memory. The window also bounds how far back a match can reach: a frame larger
+than 2^window-bits octets (32 KB at the default) can no longer be matched
+against the whole of the previous one.
+
+A `File` or an `InputStream` passes through uncompressed; the case where that
+would clearly pay — static files — is better served by caching the compressed
+copy.
+
+The same streaming compressor is available directly from `ring-chez.zlib`:
+
+```clojure
+(require '[ring-chez.zlib :as zlib])
+(when-let [d (zlib/deflater {:level 6})]
+  (zlib/deflate-chunk! d (.getBytes "first event" "UTF-8"))  ; flushed octets
+  (zlib/deflate-chunk! d (.getBytes "second event" "UTF-8"))
+  (zlib/deflate-finish! d))                                  ; trailer; releases d
+```
 
 zlib is bound lazily, from the running process first (the Chez runtime links
 one) and only then from a shared object. Where it cannot be bound the
