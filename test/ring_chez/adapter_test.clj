@@ -1859,6 +1859,14 @@
 (def ^:private gzip-text
   (apply str (repeat 400 "the quick brown fox jumps over the lazy dog. ")))
 
+(def ^:private gzip-events
+  ;; varied rows, so the first event does not already compress to nothing and
+  ;; the saving on the repeats is the window's doing
+  (let [rows (apply str (for [i (range 300)] (str "<li id=\"r" i "\">" (* i 7919 i) "</li>")))]
+    (mapv #(str "event: patch\r\ndata: " rows " #" % "\r\n\r\n") (range 3))))
+
+(def ^:private gzip-producer-stopped (atom false))
+
 (defn- gzip-test-handler [{:keys [uri]}]
   (case uri
     "/big"    {:status 200 :headers {"Content-Type" "text/plain"} :body gzip-text}
@@ -1870,6 +1878,19 @@
                                      "Content-Encoding" "br"} :body gzip-text}
     "/seq"    {:status 200 :headers {"Content-Type" "text/plain"}
                :body [gzip-text gzip-text]}
+    "/events" {:status 200 :headers {"Content-Type" "text/event-stream"}
+               :body (let [ch (a/chan)]
+                       (a/go (doseq [e gzip-events] (a/>! ch e))
+                             (a/close! ch))
+                       ch)}
+    "/events-forever"
+    {:status 200 :headers {"Content-Type" "text/event-stream"}
+     :body (let [ch (a/chan)]
+             (a/go (loop []
+                     (if (a/>! ch (first gzip-events))
+                       (do (a/<! (a/timeout 50)) (recur))
+                       (reset! gzip-producer-stopped true))))
+             ch)}
     {:status 404 :headers {"Content-Type" "text/plain"} :body "no"}))
 
 (defn- gzip-get
@@ -1903,6 +1924,60 @@
         (let [[_ body3] (gzip-get fd "/seq" "gzip")]
           (check "gzip: seq body round-trips" (str gzip-text gzip-text)
                  (String. ^bytes (gunzip body3) "UTF-8")))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn- chunk-parts
+  "A chunked transfer body -> its chunks' octets, in order."
+  [^bytes body]
+  (let [view (latin1 body)]
+    (loop [i 0 parts []]
+      (let [e (str/index-of view "\r\n" i)
+            n (Long/parseLong (str/trim (subs view i e)) 16)]
+        (if (pos? n)
+          (recur (+ e 2 n 2) (conj parts (java.util.Arrays/copyOfRange body (+ e 2) (+ e 2 n))))
+          parts)))))
+
+(defn test-gzip-stream []
+  (let [server (adapter/run-server (gzip/wrap-gzip gzip-test-handler) {:port 8548})]
+    (try
+      (Thread/sleep 250)
+      (let [fd  (client-connect 8548 5000)
+            _   (client-send fd "GET /events HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n")
+            raw (client-recv-until-bytes fd "\r\n0\r\n\r\n")
+            view (latin1 raw)
+            body-start (+ 4 (str/index-of view "\r\n\r\n"))
+            body (java.util.Arrays/copyOfRange raw body-start (alength raw))
+            parts (chunk-parts body)
+            plain (apply str gzip-events)]
+        (check-has "gzip stream: Content-Encoding" "Content-Encoding: gzip" view)
+        (check-has "gzip stream: still chunked" "Transfer-Encoding: chunked" view)
+        (check "gzip stream: one chunk per event plus the trailer" 4 (count parts))
+        ;; a sync flush ends on the empty stored block 00 00 ff ff: the client
+        ;; can decode each event without waiting for the next
+        (check "gzip stream: every event flushed" true
+               (every? #(= [0 0 -1 -1] (vec (take-last 4 (seq %)))) (butlast parts)))
+        ;; the window carries over, so a repeated event costs far less than
+        ;; the first
+        (check "gzip stream: repeats are cheap" true
+               (< (* 4 (alength ^bytes (nth parts 1))) (alength ^bytes (first parts))))
+        (check "gzip stream: round-trips" plain
+               (String. ^bytes (gunzip (dechunk body)) "UTF-8"))
+        (client-close fd))
+      ;; a client that goes away still stops the producer
+      (reset! gzip-producer-stopped false)
+      (let [fd (client-connect 8548 5000)]
+        (client-send fd "GET /events-forever HTTP/1.1\r\nHost: t\r\nAccept-Encoding: gzip\r\n\r\n")
+        (client-recv-until-bytes fd "\r\n\r\n")
+        (client-close fd)
+        (Thread/sleep 1500)
+        (check "gzip stream: producer told the client left" true @gzip-producer-stopped))
+      ;; not accepted: the channel is streamed as it is
+      (let [fd (client-connect 8548 5000)
+            _  (client-send fd "GET /events HTTP/1.1\r\nHost: t\r\n\r\n")
+            r  (client-recv-until fd "\r\n0\r\n\r\n")]
+        (check "gzip stream: plain when not accepted" false (str/includes? r "Content-Encoding: gzip"))
+        (check-has "gzip stream: plain events" "#2" r)
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
@@ -4558,6 +4633,7 @@
   (run-test "test-gzip-negotiation" test-gzip-negotiation)
   (run-test "test-gzip-skips" test-gzip-skips)
   (run-test "test-gzip-etag" test-gzip-etag)
+  (run-test "test-gzip-stream" test-gzip-stream)
 
   ;; --- Wave 2 round 3: multipart uploads ---
   (run-test "ring-chez.multipart parser suite" run-parser-suite)
