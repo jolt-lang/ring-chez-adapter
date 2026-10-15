@@ -21,8 +21,8 @@
  ;; javax.crypto — just has to (require 'jolt.crypto); no separate dep. It's not
  ;; required here, so a plain adapter server doesn't pull in OpenSSL.
  :deps {jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/crypto"
-                               :git/tag "v0.0.10"
-                               :git/sha "feb25f70c76ff1030f621817a31723a183ece80b"}}
+                               :git/tag "v0.2.0"
+                               :git/sha "e6981b853adc543120b785a0c29b6d7d6a10f0fe"}}
 
  ;; The test drives the server with the jolt-lang/http-client library (jolt no
  ;; longer ships a built-in HTTP client). v0.0.4 or newer matters here: earlier
@@ -36,8 +36,8 @@
   :aliases {:test {:extra-paths ["test"]
                    :extra-deps {jolt-lang/http-client
                                 {:git/url "https://github.com/jolt-lang/http-client"
-                                :git/tag "v0.0.17"
-                                :git/sha "77d7e310a1aab2c7d5ecc9f6cc10f77b7a7f23ba"}}
+                                :git/tag "v0.1.4"
+                                :git/sha "e0c935e99b92db8e0934867f1cebcf11b3f837a5"}}
                    :main-opts ["-m" "ring-chez.adapter-test"]}
            :bench {:extra-paths ["test"]
                    :main-opts ["-m" "ring-chez.bench"]}}
