@@ -20,9 +20,14 @@
  ;; wraps its handler with ring-defaults — whose session + CSRF middleware needs
  ;; javax.crypto — just has to (require 'jolt.crypto); no separate dep. It's not
  ;; required here, so a plain adapter server doesn't pull in OpenSSL.
+ ;;
+ ;; jolt-lang/multipart is the RFC 7578 parser under ring-chez.middleware.multipart.
  :deps {jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/crypto"
                                :git/tag "v0.2.0"
-                               :git/sha "e6981b853adc543120b785a0c29b6d7d6a10f0fe"}}
+                               :git/sha "e6981b853adc543120b785a0c29b6d7d6a10f0fe"}
+        jolt-lang/multipart {:git/url "https://github.com/jolt-lang/multipart"
+                             :git/tag "v0.1.1"
+                             :git/sha "ca51dd47aff27dac3cc09557682e82ec63720310"}}
 
  ;; The test drives the server with the jolt-lang/http-client library (jolt no
  ;; longer ships a built-in HTTP client). v0.0.4 or newer matters here: earlier

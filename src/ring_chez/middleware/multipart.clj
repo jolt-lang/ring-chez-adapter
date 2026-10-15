@@ -4,7 +4,7 @@
    Ring's own `ring.middleware.multipart-params` is written against Apache
    commons-fileupload, which cannot load under jolt, so a Ring stack here has
    no way to accept a file upload. This is the same middleware over
-   `ring-chez.multipart.core`, an RFC 7578 parser in pure Clojure:
+   `multipart.core` from jolt-lang/multipart, an RFC 7578 parser in pure Clojure:
 
        (require '[ring-chez.middleware.multipart :as multipart])
        (def app (multipart/wrap-multipart-params handler))
@@ -25,7 +25,7 @@
    A request that is not `multipart/form-data` passes through untouched —
    including its `:body`, which this reads only when it is going to parse it."
   (:require [clojure.string :as str]
-            [ring-chez.multipart.core :as multipart]))
+            [multipart.core :as multipart]))
 
 (defn- multipart-form?
   "Ring's own test: the content type names multipart/form-data. Parameters
@@ -60,7 +60,7 @@
 
 (defn multipart-params-request
   "Add `:multipart-params` and `:params` to a multipart request; return any
-   other request unchanged. opts are passed to `ring-chez.multipart.core/parse-form-data`
+   other request unchanged. opts are passed to `multipart.core/parse-form-data`
    (`:charset`, `:strict`, `:max-segment-size`, `:memory-limit`, …)."
   ([request] (multipart-params-request request {}))
   ([request opts]
@@ -80,7 +80,7 @@
 (defn wrap-multipart-params
   "Middleware parsing `multipart/form-data` bodies into `:multipart-params`,
    merged into `:params`. See the namespace docstring for the shape and
-   `ring-chez.multipart.core/parse-form-data` for opts.
+   `multipart.core/parse-form-data` for opts.
 
    Supports Ring's three-arity async handlers as well as the synchronous
    two-arity ones, though this adapter only calls the synchronous shape."

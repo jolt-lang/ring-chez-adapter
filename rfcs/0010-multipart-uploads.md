@@ -7,9 +7,10 @@
 - Depends on: [jolt-lang/multipart](https://github.com/jolt-lang/multipart)
   v0.1.0, an RFC 7578 parser in pure Clojure
 
-Since accepted: that parser was moved into this repo as
-`ring-chez.multipart.*` (Apache-2.0, see `LICENSE-multipart`), so the git dep
-is gone and `multipart.core` below reads `ring-chez.multipart.core`.
+Since accepted: the parser was vendored into this repo as
+`ring-chez.multipart.*` for a while, then moved back out to jolt-lang/multipart
+as a git dep so http-client could share it. `ring-chez.multipart.core` remains
+as a deprecated re-export of `multipart.core`.
 
 ## Summary
 
