@@ -3,8 +3,7 @@
             [ring-chez.sse :as sse]
             [ring-chez.fault :as fault]
             [ring-chez.middleware.multipart :as multipart]
-            [ring-chez.multipart-test]
-            [clojure.test :as ct]
+            [ring-chez.multipart.core :as rc-mp]
             [ring-chez.middleware.gzip :as gzip]
             [ring-chez.middleware.static :as static]
             [ring-chez.middleware.proxy :as proxy]
@@ -2197,6 +2196,19 @@
         (check-has "multipart passthrough: body untouched" "body=name=value" (:body r))
         (check "multipart passthrough: no :multipart-params" nil (:multipart-params @seen)))
       (finally (adapter/stop-server server)))))
+
+;; The parser moved back out to jolt-lang/multipart; ring-chez.multipart.core
+;; stays as a re-export so apps that required it directly keep working.
+(defn test-multipart-core-reexport []
+  (let [boundary "reexportBoundary"
+        req {:headers {"content-type" (str "multipart/form-data; boundary=" boundary)}
+             :body (multipart-body boundary upload-bytes)}
+        {:keys [params files]} (rc-mp/parse-form-data req)]
+    (check "multipart re-export: text field" "a picture" (get params "title"))
+    (check "multipart re-export: upload intact" true
+           (= (seq upload-bytes) (seq (:bytes (get files "file")))))
+    (check "multipart re-export: predicates" true
+           (rc-mp/is-form-request? "multipart/form-data; boundary=x"))))
 
 ;; stop-server used to close the listen fd itself and return without waiting
 ;; for the acceptor thread. An acceptor that had just handed a connection off
@@ -4520,14 +4532,6 @@
          (swap! failures inc)
          (println "  FAIL" nm "— threw" (str t)))))
 
-;; The multipart parser came in from jolt-lang/multipart with its own
-;; clojure.test suite, kept verbatim rather than retyped into check/check-has.
-;; Fold its counts into this runner's so one failing assertion still fails the
-;; run.
-(defn run-parser-suite []
-  (let [{:keys [fail error]} (ct/run-tests 'ring-chez.multipart-test)]
-    (swap! failures + fail error)))
-
 (defn -main [& _]
   (println "ring adapter over jolt.ffi sockets")
 
@@ -4636,11 +4640,11 @@
   (run-test "test-gzip-stream" test-gzip-stream)
 
   ;; --- Wave 2 round 3: multipart uploads ---
-  (run-test "ring-chez.multipart parser suite" run-parser-suite)
   (run-test "test-multipart-upload" test-multipart-upload)
   (run-test "test-multipart-large-chunked" test-multipart-large-chunked)
   (run-test "test-multipart-truncated" test-multipart-truncated)
   (run-test "test-multipart-passthrough" test-multipart-passthrough)
+  (run-test "test-multipart-core-reexport" test-multipart-core-reexport)
   (run-test "test-stale-acceptor-does-not-take-the-next-servers-connection"
             test-stale-acceptor-does-not-take-the-next-servers-connection)
   (run-test "test-worker-survives-a-fault-in-connection-teardown"
