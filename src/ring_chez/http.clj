@@ -502,15 +502,10 @@
       (subs h 0 i)
       h)))
 
-(defn request->ring
-  "Parse a request head (as read-request framed it) and its body octets into
-  {:request ring-map}, or {:error response} when the request is malformed
-  (400) or speaks an unsupported HTTP version (505). HTTP/1.1 requests must
-  carry a Host header (RFC 7230 §5.4).
-
-  conn-info carries what the request itself cannot say: {:server-port
-  :server-name :remote-addr}, where :server-name is the bind address and
-  :remote-addr the peer accept() reported."
+(defn framed-request->ring
+  "request->ring for a head read-request framed, which head-malformed? has
+  already passed. It costs a sixth of parsing the request to ask again, and
+  nothing else may be handed to this: the check is the smuggling boundary."
   [head ^bytes body conn-info]
   (let [lines (str/split head #"\r\n")
         parts (str/split (or (first lines) "") #" ")
@@ -531,12 +526,6 @@
                                        :body msg}})]
     (cond
       (not= 3 (count parts))
-      (bad 400 "Bad Request")
-
-      ;; bare LF, stray CR, obs-fold, a header name that is not a token: the
-      ;; framing decision already refused these, and this keeps the guarantee
-      ;; for anyone calling request->ring directly
-      (head-malformed? head)
       (bad 400 "Bad Request")
 
       (not (contains? #{"HTTP/1.1" "HTTP/1.0"} (nth parts 2)))
@@ -573,6 +562,25 @@
                    ;; default), one that wants bytes reads them unmangled
                    :body           (when (pos? (alength body))
                                      (java.io.ByteArrayInputStream. body))}}))))
+
+(defn request->ring
+  "Parse a request head and its body octets into {:request ring-map}, or {:error
+  response} when the request is malformed (400) or speaks an unsupported HTTP
+  version (505). HTTP/1.1 requests must carry a Host header (RFC 7230 §5.4).
+
+  Bare LF, stray CR, obs-fold and a header name that is not a token are refused
+  here for anyone calling directly; the adapter's own path refuses them in the
+  framing decision and uses framed-request->ring.
+
+  conn-info carries what the request itself cannot say: {:server-port
+  :server-name :remote-addr}, where :server-name is the bind address and
+  :remote-addr the peer accept() reported."
+  [head ^bytes body conn-info]
+  (if (head-malformed? head)
+    {:error {:status 400
+             :headers {"Content-Type" "text/plain"}
+             :body "Bad Request"}}
+    (framed-request->ring head body conn-info)))
 
 ;; --- Ring response -> the response string -----------------------------------
 (def ^:private status-text
@@ -634,13 +642,15 @@
   (no body framing — bodyless status, HEAD, or close-delimited)."
   [resp keep-alive? framing]
   (let [status (or (:status resp) 200)
-        sb (StringBuilder.)]
+        sb (StringBuilder.)
+        has-connection (volatile! false)]
     (.append sb (str "HTTP/1.1 " status " " (get status-text status "Unknown") "\r\n"))
     (doseq [[k v] (:headers resp)]
       (let [kname (if (keyword? k) (name k) (str k))
             kn (str/lower-case kname)
             emit (fn [v] (when (header-safe? v)
                            (.append sb (str kname ": " v "\r\n"))))]
+        (when (= kn "connection") (vreset! has-connection true))
         (when (and (not= kn "content-length") (not= kn "transfer-encoding")
                    (header-safe? kname))
           ;; vector values emit one header line per element
@@ -649,8 +659,7 @@
           (= :chunked framing) (.append sb "Transfer-Encoding: chunked\r\n"))
     ;; the handler's own Connection header (if any) was emitted above; only add
     ;; ours when it did not set one
-    (when-not (some #(= "connection" (str/lower-case (if (keyword? (key %)) (name (key %)) (str (key %)))))
-                    (:headers resp))
+    (when-not @has-connection
       (.append sb (str "Connection: " (if keep-alive? "keep-alive" "close") "\r\n")))
     (.append sb "\r\n")
     (.toString sb)))
@@ -676,11 +685,15 @@
 
 ;; Connection headers are comma-separated token lists, case-insensitive
 ;; (RFC 7230 §6.1): "Keep-Alive, Close" means close.
-(defn- header-tokens [v]
-  (map str/trim (str/split (or v "") #",")))
-
 (defn- conn-token? [tok v]
-  (some #(= tok (str/lower-case %)) (header-tokens v)))
+  (let [v (or v "")
+        n (count v)]
+    (loop [i 0]
+      (let [e (or (str/index-of v "," i) n)]
+        (cond
+          (= tok (str/lower-case (str/trim (subs v i e)))) true
+          (>= e n) nil
+          :else (recur (inc e)))))))
 
 (defn connection-token?
   "True when the request's Connection header carries tok. Connection is a

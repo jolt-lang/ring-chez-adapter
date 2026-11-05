@@ -2823,6 +2823,68 @@
              (:status (http/get (str "http://127.0.0.1:" port "/"))))
       (finally (adapter/stop-server server)))))
 
+;; :handler-on-fiber: no thread between the connection and the handler
+(defn- on-fiber-handler [request]
+  (case (:uri request)
+    "/where"  {:status 200 :body (if (jolt.host/current-fiber) "fiber" "thread")}
+    "/throw"  (throw (ex-info "boom" {}))
+    "/park"   (do (a/<!! (a/timeout 300)) {:status 200 :body "parked"})
+    "/echo"   {:status 200 :body (slurp (:body request))}
+    {:status 404 :body "no"}))
+
+(defn- on-fiber-get [port path]
+  (http/get (str "http://127.0.0.1:" port path) {:throw-exceptions false}))
+
+(defn test-handler-on-fiber []
+  (let [off (adapter/run-server on-fiber-handler {:port 0 :strategy :fibers})]
+    (try
+      (check "default fibers server: handler on a thread" "thread"
+             (:body (on-fiber-get (:port off) "/where")))
+      (finally (adapter/stop-server off))))
+  (let [server (adapter/run-server on-fiber-handler
+                                   {:port 0 :strategy :fibers :handler-on-fiber true
+                                    :on-failure (fn [_ _] {:status 500 :body "caught"})})
+        port (:port server)]
+    (try
+      (check "on-fiber: handler on the fiber" "fiber" (:body (on-fiber-get port "/where")))
+      (let [r (on-fiber-get port "/throw")]
+        (check "on-fiber: a throw reaches :on-failure" 500 (:status r))
+        (check "on-fiber: :on-failure's body" "caught" (:body r)))
+      (check "on-fiber: serves after a throw" "fiber" (:body (on-fiber-get port "/where")))
+      (let [body (apply str (repeat 20000 "x"))
+            r (http/post (str "http://127.0.0.1:" port "/echo")
+                         {:body body :throw-exceptions false})]
+        (check "on-fiber: request body reaches the handler" body (:body r)))
+      ;; 64 waits of 300 ms overlap only if a parked handler lets go of its carrier.
+      ;; Pinning them would take at least 300 ms for every carrier's worth, which is
+      ;; 1.9 s on ten cores and longer on fewer.
+      (let [t0 (System/currentTimeMillis)
+            rs (mapv deref (mapv (fn [_] (future (on-fiber-get port "/park"))) (range 64)))
+            ms (- (System/currentTimeMillis) t0)]
+        (check "on-fiber: every parked handler answers" (repeat 64 "parked") (map :body rs))
+        (check "on-fiber: parked handlers overlap" true (< ms 1500)))
+      (finally (adapter/stop-server server)))))
+
+(defn- refused? [opts]
+  (try
+    (adapter/stop-server (adapter/run-server on-fiber-handler (assoc opts :port 0)))
+    false
+    (catch clojure.lang.ExceptionInfo e (contains? (ex-data e) :key))))
+
+(defn test-handler-on-fiber-options []
+  (check "on-fiber: must be a boolean" true
+         (refused? {:strategy :fibers :handler-on-fiber "yes"}))
+  (check "on-fiber: refused under :threads" true
+         (refused? {:strategy :threads :handler-on-fiber true}))
+  (check "on-fiber: refused under the default strategy" true
+         (refused? {:handler-on-fiber true}))
+  (check "on-fiber: refused with a handler deadline" true
+         (refused? {:strategy :fibers :handler-on-fiber true :handler-timeout-ms 100}))
+  (check "on-fiber: false is fine anywhere" false
+         (refused? {:strategy :threads :handler-on-fiber false :handler-timeout-ms 100}))
+  (check "on-fiber: a zero deadline means none" false
+         (refused? {:strategy :fibers :handler-on-fiber true :handler-timeout-ms 0})))
+
 (defn test-handler-deadline-threads [] (handler-deadline-reclaims :threads 8532))
 (defn test-handler-deadline-fibers  [] (handler-deadline-reclaims :fibers 8533))
 
@@ -4854,6 +4916,160 @@
     (check "framing: decided without splitting into lines" {:expect? false :length 0}
            (framing-of "GET / HTTP/1.1\r\nHost: t\r\nAccept: */*"))))
 
+;; --- the response path and request->ring, against what they replaced ----------
+
+(defn- oracle-conn-token? [tok v]
+  (boolean (some #(= tok (str/lower-case %))
+                 (map str/trim (str/split (or v "") #",")))))
+
+(defn test-connection-tokens-match []
+  (let [values [nil "" "close" "CLOSE" " close " "Close" "keep-alive" "Keep-Alive"
+                "Keep-Alive, Close" "close, keep-alive" "keep-alive,close" ",close" "close,"
+                "," ",," " , " "x,,close" "closed" "unclose" "clo se" "close x"
+                "upgrade" "keep-alive, Upgrade" "\tclose\t" "a,b,c,d,close"]]
+    (doseq [v values, tok ["close" "keep-alive" "upgrade"]]
+      (check (str "conn token: " (pr-str tok) " in " (pr-str v))
+             (oracle-conn-token? tok v)
+             (ring-chez.http/connection-token? {:headers {"connection" v}} tok)))
+    (doseq [[protocol want] [["HTTP/1.1" true] ["HTTP/1.0" false]]]
+      (check (str "keep-alive?: " protocol " with no header") want
+             (boolean (ring-chez.http/keep-alive? {:protocol protocol :headers {}}))))
+    (doseq [v values]
+      (check (str "keep-alive?: 1.1 " (pr-str v))
+             (not (oracle-conn-token? "close" v))
+             (boolean (ring-chez.http/keep-alive? {:protocol "HTTP/1.1" :headers {"connection" v}})))
+      (check (str "keep-alive?: 1.0 " (pr-str v))
+             (and (oracle-conn-token? "keep-alive" v) (not (oracle-conn-token? "close" v)))
+             (boolean (ring-chez.http/keep-alive? {:protocol "HTTP/1.0" :headers {"connection" v}})))))
+  (with-redefs [str/split (fn [& _] (throw (ex-info "regex split" {})))]
+    (check "conn token: read without a regex" false
+           (boolean (ring-chez.http/keep-alive? {:protocol "HTTP/1.1"
+                                                 :headers {"connection" "Keep-Alive, Close"}})))))
+
+(defn test-response-head-is-unchanged []
+  (let [head @#'ring-chez.http/head->string]
+    (doseq [[label resp keep? framing want]
+            [["plain" {:status 200 :headers {"Content-Type" "text/plain"}} true 13
+              "HTTP/1.1 200 OK\r\nContent-Type: text/plain\r\nContent-Length: 13\r\nConnection: keep-alive\r\n\r\n"]
+             ["close" {:status 200 :headers {}} false 0
+              "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"]
+             ["no status, no headers" {} true :none
+              "HTTP/1.1 200 OK\r\nConnection: keep-alive\r\n\r\n"]
+             ["unknown status" {:status 299} true :chunked
+              "HTTP/1.1 299 Unknown\r\nTransfer-Encoding: chunked\r\nConnection: keep-alive\r\n\r\n"]
+             ["handler's Connection wins" {:headers {"Connection" "upgrade"}} true 1
+              "HTTP/1.1 200 OK\r\nConnection: upgrade\r\nContent-Length: 1\r\n\r\n"]
+             ["any case" {:headers {"CONNECTION" "close"}} true 1
+              "HTTP/1.1 200 OK\r\nCONNECTION: close\r\nContent-Length: 1\r\n\r\n"]
+             ["keyword name" {:headers {:connection "close" :x-a "b"}} true 1
+              "HTTP/1.1 200 OK\r\nconnection: close\r\nx-a: b\r\nContent-Length: 1\r\n\r\n"]
+             ["a Connection dropped as unsafe still counts" {:headers {"Connection" "a\r\nb"}} true 1
+              "HTTP/1.1 200 OK\r\nContent-Length: 1\r\n\r\n"]
+             ["unsafe name is not Connection" {:headers {"Connection\r\n" "x"}} true 1
+              "HTTP/1.1 200 OK\r\nContent-Length: 1\r\nConnection: keep-alive\r\n\r\n"]
+             ["vector values" {:headers {"Set-Cookie" ["a=1" "b\n2" "c=3"]}} true 1
+              "HTTP/1.1 200 OK\r\nSet-Cookie: a=1\r\nSet-Cookie: c=3\r\nContent-Length: 1\r\nConnection: keep-alive\r\n\r\n"]
+             ["vector Connection" {:headers {"Connection" ["x" "y"]}} true 1
+              "HTTP/1.1 200 OK\r\nConnection: x\r\nConnection: y\r\nContent-Length: 1\r\n\r\n"]
+             ["handler's framing dropped"
+              {:headers {"Content-Length" "99" "transfer-encoding" "chunked" "A" 1}} true 2
+              "HTTP/1.1 200 OK\r\nA: 1\r\nContent-Length: 2\r\nConnection: keep-alive\r\n\r\n"]]]
+      (check (str "response head: " label) want (head resp keep? framing)))))
+
+(defn- oracle-request-fields
+  "What request->ring derived from a head when it split with regexes: the status
+  it refused with, or the request line's parts and the header map."
+  [head]
+  (let [lines (str/split head #"\r\n")
+        parts (str/split (or (first lines) "") #" ")
+        headers (reduce (fn [m line]
+                          (let [i (str/index-of line ":")]
+                            (if (and i (pos? i))
+                              (let [k (str/lower-case (str/trim (subs line 0 i)))
+                                    v (str/trim (subs line (inc i)))]
+                                (assoc m k (if-let [prev (get m k)] (str prev "," v) v)))
+                              m)))
+                        {} (rest lines))]
+    (cond
+      (not= 3 (count parts)) 400
+      (oracle-malformed? head) 400
+      (not (contains? #{"HTTP/1.1" "HTTP/1.0"} (nth parts 2))) 505
+      (and (= "HTTP/1.1" (nth parts 2)) (not (contains? headers "host"))) 400
+      :else [(str/lower-case (first parts)) (second parts) (nth parts 2) headers])))
+
+(defn- request-fields [head]
+  (let [{:keys [request error]} (ring-chez.http/request->ring head (byte-array 0) {})]
+    (if error
+      (:status error)
+      [(name (:request-method request))
+       (str (:ring-chez/raw-uri request)
+            (when-let [q (:query-string request)] (str "?" q)))
+       (:protocol request)
+       (:headers request)])))
+
+(defn test-request-fields-match []
+  (let [next-rand (fn [s] (mod (+ (* s 1103515245) 12345) 2147483648))
+        pieces (into framing-pieces
+                     ["Host: t" "Host: a" "HOST: b" "Accept: */*" "X: 1" "x: 2" " " "  "
+                      "GET / HTTP/1.1\r\n" "GET /a?b=c HTTP/1.1\r\n" "GET / HTTP/1.0\r\n"
+                      "GET / HTTP/2\r\n" "GET  /  HTTP/1.1\r\n" "GET / HTTP/1.1 \r\n"])
+        heads (concat
+                framing-corpus
+                ["GET / HTTP/1.1\r\nHost: t\r\nX-F: a\r\nx-f: b"
+                 "GET /a?b=c HTTP/1.1\r\nHost: t\r\n"
+                 "GET / HTTP/1.1 \r\nHost: t" "GET  / HTTP/1.1\r\nHost: t" " GET / HTTP/1.1\r\nHost: t"
+                 "GET / HTTP/1.0" "GET / HTTP/2\r\nHost: t" "GET /\r\nHost: t"
+                 "GET / HTTP/1.1\r\nHost: t\r\n\r\n" "GET / HTTP/1.1\r\nHost:\r\nX: y"
+                 "GET / HTTP/1.1\r\nHost: t\r\nEmpty:" "GET / HTTP/1.1\r\nHost:   spaced   "]
+                (loop [i 0 s 99 out []]
+                  (if (= i 20000)
+                    out
+                    (let [s1 (next-rand s)
+                          k (+ 1 (mod (quot s1 65536) 9))
+                          [s2 h] (loop [s s1 k k h (if (odd? (quot s1 4096)) "GET / HTTP/1.1\r\nHost: t" "")]
+                                   (if (zero? k)
+                                     [s h]
+                                     (let [s' (next-rand s)]
+                                       (recur s' (dec k)
+                                              (str h (nth pieces (mod (quot s' 65536) (count pieces))))))))]
+                      (recur (inc i) s2 (conj out h))))))
+        outcomes (atom #{})
+        mismatches (atom [])]
+    (doseq [h heads]
+      (let [want (oracle-request-fields h)
+            got (request-fields h)]
+        (swap! outcomes conj (if (vector? want) :parsed want))
+        (when (not= want got) (swap! mismatches conj [h want got]))))
+    (check "request fields: old and new agree on every head" [] (vec (take 5 @mismatches)))
+    (check "request fields: the cases reached every outcome" #{400 505 :parsed} @outcomes)
+    ;; what read-request hands the adapter has already passed head-malformed?
+    (doseq [h heads]
+      (when-not (ring-chez.http/head-malformed? h)
+        (let [full (ring-chez.http/request->ring h (byte-array 0) {})
+              framed (ring-chez.http/framed-request->ring h (byte-array 0) {})]
+          (when (not= (:error full) (:error framed))
+            (swap! mismatches conj [:error h]))
+          (when (not= (dissoc (:request full) :body) (dissoc (:request framed) :body))
+            (swap! mismatches conj [:request h])))))
+    (check "request fields: the framed path agrees on every valid head" [] (vec (take 5 @mismatches))))
+  (let [real ring-chez.http/head-malformed?
+        calls (atom 0)
+        server (atom nil)]
+    (with-redefs [ring-chez.http/head-malformed? (fn [h] (swap! calls inc) (real h))]
+      (reset! server (adapter/run-server handler {:port 8457 :worker-threads 1}))
+      (try
+        (Thread/sleep 150)
+        (let [fd (client-connect 8457 3000)]
+          (client-send fd "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+          (check-has "request fields: served" "200 OK" (client-recv fd))
+          (client-close fd))
+        (check "request fields: a request is validated once" 1 @calls)
+        (let [fd (client-connect 8457 3000)]
+          (client-send fd "GET / HTTP/1.1\r\nHost : t\r\nConnection: close\r\n\r\n")
+          (check-has "request fields: a malformed head is still refused" "400" (client-recv fd))
+          (client-close fd))
+        (finally (adapter/stop-server @server))))))
+
 (defn run-test
   "Run one test, attributing a throw to it instead of ending the run. A test
   that dies on a socket error — an EPIPE from a peer that closed a beat early,
@@ -5102,6 +5318,11 @@
   (run-test "test-send-buffer-fits-the-payload" test-send-buffer-fits-the-payload)
   (run-test "test-recv-buffers-are-reused" test-recv-buffers-are-reused)
   (run-test "test-framing-matches-the-old-decision" test-framing-matches-the-old-decision)
+  (run-test "test-connection-tokens-match" test-connection-tokens-match)
+  (run-test "test-response-head-is-unchanged" test-response-head-is-unchanged)
+  (run-test "test-request-fields-match" test-request-fields-match)
+  (run-test "test-handler-on-fiber" test-handler-on-fiber)
+  (run-test "test-handler-on-fiber-options" test-handler-on-fiber-options)
 
   (if (zero? @failures)
     (println "all passed")

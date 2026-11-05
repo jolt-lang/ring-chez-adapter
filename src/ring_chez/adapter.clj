@@ -315,8 +315,12 @@
   let the sweeper's close wake the fiber (the woken send answers negative,
   which send-all already reads as peer-gone). This is the fibers counterpart
   of SO_SNDTIMEO on the threads strategy — per park rather than per syscall,
-  and 0 disables it there as here."
-  [conn deadline write-timeout-ms]
+  and 0 disables it there as here.
+
+  on-fiber? runs the handler right here, with no thread and no park between it and
+  the connection. Each handoff is a thread to wake and a carrier to wake again, and
+  on a cheap handler that is about half of what a request costs."
+  [conn deadline write-timeout-ms on-fiber?]
   (let [suspend! #(reset! deadline no-deadline)
         arm-write! (if (pos? write-timeout-ms)
                      #(reset! deadline (+ (System/currentTimeMillis) write-timeout-ms))
@@ -338,7 +342,7 @@
      ;; connection come back; the interrupt reclaims the handler's thread too
      :run-timed! (fn [f ms]
                    (if (zero? ms)
-                     (async/<! (async/thread (f)))
+                     (if on-fiber? (f) (async/<! (async/thread (f))))
                      (let [tok (jolt.host/make-interrupt)
                            ch (async/thread (run-interruptible* tok f))
                            [v p] (async/alts! [ch (async/timeout ms)])]
@@ -490,28 +494,30 @@
             ;; request rather than the one after it
             handler    @handler-box
             ws-handler @ws-handler-box]
+;; identical?, not =: these are literal keywords, and = costs 0.2 us
+        ;; against a map, which is what r almost always is
         (cond
-          (= :bad r) (send! conn (http/response->parts
+          (identical? :bad r) (send! conn (http/response->parts
                                    {:status 400 :headers {"Content-Type" "text/plain"}
                                     :body "Bad Request"} false))
-          (= :too-big r) (send! conn (http/response->parts
+          (identical? :too-big r) (send! conn (http/response->parts
                                        {:status 413 :headers {"Content-Type" "text/plain"
                                                               "Connection" "close"}
                                         :body "Payload Too Large"} false))
-          (= :headers-too-big r) (send! conn (http/response->parts
+          (identical? :headers-too-big r) (send! conn (http/response->parts
                                                {:status 431 :headers {"Content-Type" "text/plain"
                                                                       "Connection" "close"}
                                                 :body "Request Header Fields Too Large"} false))
-          (= :timeout r) (send! conn (http/response->parts
+          (identical? :timeout r) (send! conn (http/response->parts
                                        {:status 408 :headers {"Content-Type" "text/plain"
                                                               "Connection" "close"}
                                         :body "Request Timeout"} false))
-          (= :unsupported r) (send! conn (http/response->parts
+          (identical? :unsupported r) (send! conn (http/response->parts
                                            {:status 501 :headers {"Content-Type" "text/plain"
                                                                   "Connection" "close"}
                                             :body "Not Implemented"} false))
           (map? r)
-          (let [{:keys [request error]} (http/request->ring (:head r) (:body r) conn-info)]
+          (let [{:keys [request error]} (http/framed-request->ring (:head r) (:body r) conn-info)]
             (cond
               error (send! conn (http/response->parts error false))
                ;; A 101 ends HTTP framing: every byte after the head is read
@@ -583,7 +589,7 @@
                      ;; loser's work is abandoned along with the rest of it.
                      claim!   (let [claimed (atom false)]
                                 #(cas! claimed false true))
-                     started  (System/currentTimeMillis)
+                     started  (when (pos? handler-timeout-ms) (System/currentTimeMillis))
                      ;; NOT `r`: that is the read, and its :leftover carries
                      ;; the pipelined bytes this loop recurs on
                      ran ((:run-timed! io)
@@ -601,7 +607,7 @@
                             ;; at its next reduction so its thread is reclaimed
                             ;; (Igropyr stuck-ms kills the worker outright;
                             ;; jolt's interrupt is the cooperative equivalent)
-                            (= timed-out ran)
+                            (identical? timed-out ran)
                             (let [info {:kind :timeout
                                         :elapsed-ms (- (System/currentTimeMillis) started)}
                                   t (ex-info "handler timed out"
@@ -1015,7 +1021,8 @@
         (when (claim-close! entry)
           (try
             (connection-loop conn conn-info cfg
-                             (fiber-io conn deadline (:write-timeout-ms cfg)) deadline entry)
+                             (fiber-io conn deadline (:write-timeout-ms cfg) (:handler-on-fiber cfg))
+                             deadline entry)
             (catch Throwable _ nil)
             ;; the release is guarded for the reason the worker's is: it runs
             ;; in a FINALLY, where a throw beats the catch above it. Here it
@@ -1069,7 +1076,8 @@
      :ws-guard           (check-ifn :ws-guard)
      :write-timeout-ms   (check-num :write-timeout-ms 0 ##Inf)
      :handler-timeout-ms (check-num :handler-timeout-ms 0 ##Inf)
-     :reuse-port         (check-bool :reuse-port)}))
+     :reuse-port         (check-bool :reuse-port)
+     :handler-on-fiber   (check-bool :handler-on-fiber)}))
 
 (defn run-server
   "Start the server; return a handle {:socket :port :host :running}. opts:
@@ -1103,6 +1111,13 @@
                            handler's thread is not reclaimed. Costs a thread
                            handoff per request under :threads (~15-25%
                            throughput), nothing under :fibers
+    :handler-on-fiber      run the handler on the connection's fiber instead of
+                           handing it to a thread (default false; :fibers only,
+                           and not with :handler-timeout-ms, since a deadline
+                           needs a thread to walk away from). Saves two thread
+                           wakes per request. A handler that blocks somewhere
+                           the runtime cannot see holds its carrier and every
+                           fiber on it: see the README
     :reuse-port            bind with SO_REUSEPORT (default false), so several
                            processes can share the port and the kernel spreads
                            connections over them (Linux)
@@ -1120,6 +1135,16 @@
                            "which has no backend on this platform; use :threads")
                       {:key :strategy :given strategy :os native/os})))
     (let [v      (validate-opts! opts)
+          _      (when (:handler-on-fiber v)
+                   (when-not (= :fibers strategy)
+                     (throw (ex-info "run-server: :handler-on-fiber needs :strategy :fibers"
+                                     {:key :handler-on-fiber :given strategy})))
+                   (when (pos? (or (:handler-timeout-ms v) 0))
+                     (throw (ex-info (str "run-server: :handler-on-fiber cannot be combined with "
+                                          ":handler-timeout-ms: a handler on the connection's "
+                                          "fiber cannot be walked away from")
+                                     {:key :handler-on-fiber
+                                      :given (:handler-timeout-ms v)}))))
           port   (or (:port v) 3000)
           n      (or (:worker-threads v) (.availableProcessors (Runtime/getRuntime)))
           ka-ms  (or (:ka-ms v) 30000)
@@ -1174,6 +1199,7 @@
                :request-timeout-ms request-timeout-ms
                :write-timeout-ms write-timeout-ms
                :handler-timeout-ms handler-timeout-ms
+               :handler-on-fiber (boolean (:handler-on-fiber v))
                :stats stats}
           binds  (socket/listen-sockets host port {:reuse-port? (boolean (:reuse-port v))})
           fds    (:fds binds)
