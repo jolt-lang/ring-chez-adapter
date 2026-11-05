@@ -4521,6 +4521,49 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+;; jolt's branch removing (write-array p arr off n) and (read-into! p arr off n)
+;; raises on them, so a body that takes either path has to use the typed form.
+(defn test-ffi-byte-copies []
+  (let [buf (ffi/alloc 8)
+        acc (byte-array 6)
+        read-array ffi/read-array
+        write-array ffi/write-array
+        read-into ffi/read-into!
+        body (vec (take 200000 (cycle (range 256))))
+        server (adapter/run-server binary-response-handler
+                                   {:port 8456 :worker-threads 1
+                                    :keep-alive-timeout-ms 2000})]
+    (try
+      (ffi/write-array buf (byte-array [1 2 3 4]))
+      (with-redefs [ffi/read-array (fn [& _] (throw (ex-info "fill! allocated a chunk" {})))]
+        (#'ring-chez.http/fill! acc 2 buf 3))
+      (check "fill!: chunk lands at the offset, no chunk array" [0 0 1 2 3 0] (vec acc))
+      (Thread/sleep 250)
+      (let [retired? (fn [args] (and (= 4 (count args)) (bytes? (second args))))
+            used (atom [])
+            guard (fn [nm f]
+                    (fn [& args]
+                      (when (retired? args) (swap! used conj nm))
+                      (apply f args)))]
+        (with-redefs [ffi/write-array (guard "write-array" write-array)
+                      ffi/read-into! (guard "read-into!" read-into)]
+          ;; bigger than the send window and than one recv, so the request goes
+          ;; through fill! several times and the response through send-all's
+          ;; packing of head then body
+          (let [fd (client-connect 8456 3000)
+                head (str "POST /echo HTTP/1.1\r\nHost: t\r\n"
+                          "Content-Type: application/octet-stream\r\n"
+                          "Content-Length: " (count body) "\r\n\r\n")]
+            (t-send-bytes fd (concat (utf8-bytes head) body))
+            (let [raw (client-recv-raw fd)]
+              (check "ffi copies: large body round-trips"
+                     (hex (unsigned->bytes body)) (hex (response-body-bytes raw))))
+            (client-close fd)))
+        (check "ffi copies: no byte-index forms" [] @used))
+      (finally
+        (ffi/free buf)
+        (adapter/stop-server server)))))
+
 (defn run-test
   "Run one test, attributing a throw to it instead of ending the run. A test
   that dies on a socket error — an EPIPE from a peer that closed a beat early,
@@ -4764,6 +4807,7 @@
   (run-test "test-binary-response-body" test-binary-response-body)
   (run-test "test-binary-response-chunks" test-binary-response-chunks)
   (run-test "test-binary-round-trip" test-binary-round-trip)
+  (run-test "test-ffi-byte-copies" test-ffi-byte-copies)
 
   (if (zero? @failures)
     (println "all passed")
