@@ -315,8 +315,12 @@
   let the sweeper's close wake the fiber (the woken send answers negative,
   which send-all already reads as peer-gone). This is the fibers counterpart
   of SO_SNDTIMEO on the threads strategy — per park rather than per syscall,
-  and 0 disables it there as here."
-  [conn deadline write-timeout-ms]
+  and 0 disables it there as here.
+
+  on-fiber? runs the handler right here, with no thread and no park between it and
+  the connection. Each handoff is a thread to wake and a carrier to wake again, and
+  on a cheap handler that is about half of what a request costs."
+  [conn deadline write-timeout-ms on-fiber?]
   (let [suspend! #(reset! deadline no-deadline)
         arm-write! (if (pos? write-timeout-ms)
                      #(reset! deadline (+ (System/currentTimeMillis) write-timeout-ms))
@@ -338,7 +342,7 @@
      ;; connection come back; the interrupt reclaims the handler's thread too
      :run-timed! (fn [f ms]
                    (if (zero? ms)
-                     (async/<! (async/thread (f)))
+                     (if on-fiber? (f) (async/<! (async/thread (f))))
                      (let [tok (jolt.host/make-interrupt)
                            ch (async/thread (run-interruptible* tok f))
                            [v p] (async/alts! [ch (async/timeout ms)])]
@@ -1017,7 +1021,8 @@
         (when (claim-close! entry)
           (try
             (connection-loop conn conn-info cfg
-                             (fiber-io conn deadline (:write-timeout-ms cfg)) deadline entry)
+                             (fiber-io conn deadline (:write-timeout-ms cfg) (:handler-on-fiber cfg))
+                             deadline entry)
             (catch Throwable _ nil)
             ;; the release is guarded for the reason the worker's is: it runs
             ;; in a FINALLY, where a throw beats the catch above it. Here it
@@ -1071,7 +1076,8 @@
      :ws-guard           (check-ifn :ws-guard)
      :write-timeout-ms   (check-num :write-timeout-ms 0 ##Inf)
      :handler-timeout-ms (check-num :handler-timeout-ms 0 ##Inf)
-     :reuse-port         (check-bool :reuse-port)}))
+     :reuse-port         (check-bool :reuse-port)
+     :handler-on-fiber   (check-bool :handler-on-fiber)}))
 
 (defn run-server
   "Start the server; return a handle {:socket :port :host :running}. opts:
@@ -1105,6 +1111,13 @@
                            handler's thread is not reclaimed. Costs a thread
                            handoff per request under :threads (~15-25%
                            throughput), nothing under :fibers
+    :handler-on-fiber      run the handler on the connection's fiber instead of
+                           handing it to a thread (default false; :fibers only,
+                           and not with :handler-timeout-ms, since a deadline
+                           needs a thread to walk away from). Saves two thread
+                           wakes per request. A handler that blocks somewhere
+                           the runtime cannot see holds its carrier and every
+                           fiber on it: see the README
     :reuse-port            bind with SO_REUSEPORT (default false), so several
                            processes can share the port and the kernel spreads
                            connections over them (Linux)
@@ -1122,6 +1135,16 @@
                            "which has no backend on this platform; use :threads")
                       {:key :strategy :given strategy :os native/os})))
     (let [v      (validate-opts! opts)
+          _      (when (:handler-on-fiber v)
+                   (when-not (= :fibers strategy)
+                     (throw (ex-info "run-server: :handler-on-fiber needs :strategy :fibers"
+                                     {:key :handler-on-fiber :given strategy})))
+                   (when (pos? (or (:handler-timeout-ms v) 0))
+                     (throw (ex-info (str "run-server: :handler-on-fiber cannot be combined with "
+                                          ":handler-timeout-ms: a handler on the connection's "
+                                          "fiber cannot be walked away from")
+                                     {:key :handler-on-fiber
+                                      :given (:handler-timeout-ms v)}))))
           port   (or (:port v) 3000)
           n      (or (:worker-threads v) (.availableProcessors (Runtime/getRuntime)))
           ka-ms  (or (:ka-ms v) 30000)
@@ -1176,6 +1199,7 @@
                :request-timeout-ms request-timeout-ms
                :write-timeout-ms write-timeout-ms
                :handler-timeout-ms handler-timeout-ms
+               :handler-on-fiber (boolean (:handler-on-fiber v))
                :stats stats}
           binds  (socket/listen-sockets host port {:reuse-port? (boolean (:reuse-port v))})
           fds    (:fds binds)

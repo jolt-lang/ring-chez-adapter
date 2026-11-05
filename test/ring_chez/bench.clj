@@ -26,12 +26,14 @@
         strategy (keyword (or (System/getenv "STRATEGY") "threads"))
         workers (when-let [w (some-> (System/getenv "WORKERS") not-empty)]
                   (Long/parseLong w))
+        on-fiber (= "true" (System/getenv "HANDLER_ON_FIBER"))
         handler-timeout (when-let [t (some-> (System/getenv "HANDLER_TIMEOUT_MS") not-empty)]
                           (Long/parseLong t))]
     (println "listening on 127.0.0.1:" port "strategy:" strategy "workers:" workers
              "handler-timeout-ms:" handler-timeout)
     (adapter/run-server app (merge {:port port :strategy strategy}
                                    (when workers {:worker-threads workers})
+                                   (when on-fiber {:handler-on-fiber true})
                                    (when handler-timeout
                                      {:handler-timeout-ms handler-timeout})))
     ;; -main returning exits the process; park forever
