@@ -10,6 +10,28 @@
 
 (def bufsize 65536)
 
+;; ffi/alloc zeroes through a fresh bytevector, 6.4 us and 64 KB of garbage for
+;; one of these, and recv only ever hands back octets it wrote. So they are kept
+;; between reads. A buffer is held by one reader from take to give; the surplus
+;; beyond the bound goes back to the allocator, so the pool stays at 4 MB however
+;; many connections read at once.
+(def ^:private recv-buffers (atom ()))
+(def ^:private recv-buffers-max 64)
+
+(defn take-recv-buffer!
+  "A bufsize native buffer for this caller alone, its contents unspecified. Hand
+  it back with give-recv-buffer!."
+  []
+  (let [[held _] (swap-vals! recv-buffers #(if (seq %) (rest %) %))]
+    (or (first held) (ffi/alloc bufsize))))
+
+(defn give-recv-buffer!
+  "Return a buffer from take-recv-buffer!. The caller must not touch it after."
+  [buf]
+  (let [[held kept] (swap-vals! recv-buffers
+                                #(if (< (count %) recv-buffers-max) (conj % buf) %))]
+    (when (identical? held kept) (ffi/free buf))))
+
 (defn- fail-ex
   "ex-info for a failed syscall, naming it and the error behind it."
   [what syscall e]

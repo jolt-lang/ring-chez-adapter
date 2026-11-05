@@ -14,6 +14,7 @@
             [clojure.java.io :as io]
             [jolt.ffi :as ffi]
             [ring-chez.socket :as socket]
+            [ring-chez.http]
             [jolt.socket.native :as native]
             [jolt.io-poller :as poller]
             [jolt.process]))
@@ -4596,6 +4597,263 @@
       (check "ws fill!: grows when it must" [4 5 6 7 8 9 10 11 12 13 14 15] (contents))
       (check "ws fill!: growth allocates a new array" 4096 (alength ^bytes (:bs @ibuf))))))
 
+;; A 64 KB ffi/alloc zeroes the block through a fresh 64 KB bytevector, which was
+;; the largest single cost of a small request, twice over.
+(defn test-send-buffer-fits-the-payload []
+  (let [window 65536
+        send-all @#'ring-chez.http/send-all
+        alloc ffi/alloc
+        send-through (fn [parts]
+                       (let [sizes (atom [])
+                             wire (atom [])]
+                         (with-redefs [ffi/alloc (fn [n] (swap! sizes conj n) (alloc n))
+                                       native/c-send (fn [_ p n _]
+                                                       (swap! wire into (vec (ffi/read-array p n)))
+                                                       [n 0])]
+                           {:ok (send-all -1 parts)
+                            :sizes @sizes
+                            :wire @wire})))
+        bs (fn [n v] (byte-array n (byte v)))]
+    (let [{:keys [ok sizes wire]} (send-through [(bs 100 1) (bs 13 2)])]
+      (check "send buffer: small response succeeds" true ok)
+      (check "send buffer: holds just the payload" [113] sizes)
+      (check "send buffer: octets in order"
+             (concat (repeat 100 1) (repeat 13 2)) (seq wire)))
+    (let [{:keys [ok sizes wire]} (send-through [(bs 0 0)])]
+      (check "send buffer: empty payload succeeds" true ok)
+      (check "send buffer: empty payload sends nothing" [] wire)
+      (check "send buffer: empty payload still allocates something" true (pos? (first sizes))))
+    (doseq [total [(dec window) window (inc window) (+ 5 (* 2 window))]]
+      (let [{:keys [ok sizes wire]} (send-through [(bs 7 1) (bs (- total 7) 2)])]
+        (check (str "send buffer: " total " succeeds") true ok)
+        (check (str "send buffer: " total " stays within the window")
+               [(min total window)] sizes)
+        (check (str "send buffer: " total " all octets arrive") total (count wire))
+        (check (str "send buffer: " total " order")
+               [1 2] [(nth wire 6) (nth wire 7)])))))
+
+(defn test-recv-buffers-are-reused []
+  (let [pool @#'ring-chez.socket/recv-buffers
+        alloc ffi/alloc
+        free ffi/free
+        allocs (atom 0)
+        frees (atom [])
+        saved @pool
+        req "GET /a HTTP/1.1\r\nHost: t\r\n\r\n"
+        read-one (fn [recv!]
+                   (ring-chez.http/read-request -1 (byte-array 0) 1048576 recv! recv!))
+        stub-recv (fn [_ buf]
+                    (ffi/write-array buf (.getBytes ^String req "UTF-8"))
+                    (count req))]
+    (reset! pool ())
+    (try
+      (with-redefs [ffi/alloc (fn [n] (when (= n socket/bufsize) (swap! allocs inc)) (alloc n))
+                    ffi/free (fn [p] (swap! frees conj p) (free p))]
+        (check "recv pool: first request parses" true (map? (read-one stub-recv)))
+        (check "recv pool: first request allocates" 1 @allocs)
+        (check "recv pool: second request parses" true (map? (read-one stub-recv)))
+        (check "recv pool: second request reuses it" 1 @allocs)
+        (check "recv pool: a throwing recv gives the buffer back"
+               :threw (try (read-one (fn [_ _] (throw (ex-info "recv" {}))))
+                           (catch Throwable _ :threw)))
+        (check "recv pool: still one buffer after the throw" 1 (count @pool))
+        (let [a (socket/take-recv-buffer!)
+              b (socket/take-recv-buffer!)]
+          (check "recv pool: buffers in use are distinct" true (not= a b))
+          (socket/give-recv-buffer! a)
+          (socket/give-recv-buffer! b))
+        (check "recv pool: nothing freed while under the bound" [] @frees)
+        (let [extra (mapv (fn [_] (ffi/alloc socket/bufsize))
+                          (range (+ 3 @#'ring-chez.socket/recv-buffers-max)))]
+          (doseq [p extra] (socket/give-recv-buffer! p))
+          (check "recv pool: holds no more than its bound"
+                 @#'ring-chez.socket/recv-buffers-max (count @pool))
+          (check "recv pool: the surplus is freed" true (pos? (count @frees))))
+        (let [session (ws/make-session -1)]
+          (with-redefs [native/c-recv (fn [_ _ _ _] [0 0])]
+            (let [before @allocs]
+              (#'ring-chez.websocket/fill! session)
+              (check "recv pool: websocket reads share it" before @allocs)))))
+      (finally
+        (doseq [p @pool] (free p))
+        (reset! pool saved)))))
+
+;; --- the framing decision, against the implementation it replaced ------------
+;; This decision is where disagreeing with a proxy is a request-smuggling bug, so
+;; the line-splitting original stays here as the oracle for the single-pass one.
+
+(defn- oracle-lines [head]
+  (let [n (count head)]
+    (loop [i (if-let [b (str/index-of head "\r\n")] (+ b 2) n)
+           out []]
+      (if (>= i n)
+        out
+        (let [e (or (str/index-of head "\r\n" i) n)]
+          (recur (+ e 2) (conj out (subs head i e))))))))
+
+(defn- oracle-tchar? [c]
+  (or (<= (int \a) (int c) (int \z))
+      (<= (int \A) (int c) (int \Z))
+      (<= (int \0) (int c) (int \9))
+      (contains? #{\! \# \$ \% \& \' \* \+ \- \. \^ \_ \` \| \~} c)))
+
+(defn- oracle-malformed? [head]
+  (let [n (count head)]
+    (or
+      (loop [i 0]
+        (cond
+          (>= i n) false
+          (= \newline (.charAt ^String head i))
+          (if (and (pos? i) (= \return (.charAt ^String head (dec i)))) (recur (inc i)) true)
+          (= \return (.charAt ^String head i))
+          (if (and (< (inc i) n) (= \newline (.charAt ^String head (inc i)))) (recur (inc i)) true)
+          :else (recur (inc i))))
+      (boolean
+        (some (fn [line]
+                (let [i (str/index-of line ":")]
+                  (or (zero? (count line))
+                      (contains? #{\space \tab} (.charAt ^String line 0))
+                      (not (and i (pos? i)))
+                      (not (every? oracle-tchar? (subs line 0 i))))))
+              (oracle-lines head))))))
+
+(defn- oracle-named [head]
+  (reduce (fn [m line]
+            (let [i (str/index-of line ":")]
+              (if-not (and i (pos? i))
+                m
+                (let [k (str/lower-case (str/trim (subs line 0 i)))]
+                  (if (contains? #{"content-length" "transfer-encoding" "expect"} k)
+                    (update m k (fnil conj []) (str/trim (subs line (inc i))))
+                    m)))))
+          {} (oracle-lines head)))
+
+(defn- oracle-framing
+  "What the old resolve-framing answered, minus the :head and offsets."
+  [head]
+  (let [comma-parts (fn [vals] (mapcat #(map str/trim (str/split % #"," -1)) vals))
+        digits? (fn [s] (and (pos? (count s)) (every? #(<= (int \0) (int %) (int \9)) s)))
+        version (let [e (or (str/index-of head "\r\n") (count head))
+                      line (subs head 0 e)
+                      i (str/last-index-of line " ")]
+                  (when (and i (< (inc i) (count line))) (subs line (inc i))))
+        f (if (oracle-malformed? head)
+            :bad
+            (let [named (oracle-named head)
+                  tes (get named "transfer-encoding")
+                  te (cond (empty? tes) :absent
+                           (= ["chunked"] (map str/lower-case (comma-parts tes))) :chunked
+                           :else :unsupported)
+                  parts (comma-parts (get named "content-length"))
+                  cl (cond (empty? parts) :absent
+                           (not (every? digits? parts)) :bad
+                           :else (let [ns (map parse-long parts)]
+                                   (if (apply = ns) (first ns) :bad)))]
+              (cond (= :bad cl) :bad
+                    (= :unsupported te) :unsupported
+                    (and (= :chunked te) (not= :absent cl)) :bad
+                    (and (= :chunked te) (= "HTTP/1.0" version)) :bad
+                    (= :chunked te) :chunked
+                    (= :absent cl) 0
+                    :else cl)))
+        expect? (boolean (some #(= "100-continue" (str/lower-case %))
+                               (get (oracle-named head) "expect")))]
+    (cond
+      (= :chunked f) {:chunked? true :expect? expect?}
+      (number? f) {:length f :expect? (and expect? (pos? f))}
+      :else f)))
+
+(defn- framing-of
+  "The live resolve-framing's answer for head, in oracle-framing's shape."
+  [head]
+  (let [bs (.getBytes ^String (str head "\r\n\r\n") "UTF-8")
+        r (#'ring-chez.http/resolve-framing bs 0 (alength bs))]
+    (if (map? r)
+      (cond-> {:expect? (boolean (:expect? r))}
+        (:chunked? r) (assoc :chunked? true)
+        (:to r) (assoc :length (- (:to r) (:from r))))
+      r)))
+
+(def ^:private framing-corpus
+  ["GET / HTTP/1.1\r\nHost: t"
+   "" "GET / HTTP/1.1" "GET / HTTP/1.1\r\n" "\r\n" "\r\nHost: t"
+   "GET / HTTP/1.1\r\n\r\nHost: t"
+   "GET / HTTP/1.1\nHost: t" "GET / HTTP/1.1\rHost: t" "GET / HTTP/1.1\r\nHost: t\n"
+   "GET / HTTP/1.1\r\nHost: t\r" "\nGET" "\rGET" "GET / HTTP/1.1\r\nA: b\r\r\nC: d"
+   "GET / HTTP/1.1\n\r\nA: b" "GET / HTTP/1.1\r\n\nA: b"
+   "GET / HTTP/1.1\r\n folded: x" "GET / HTTP/1.1\r\n\tfolded: x"
+   "GET / HTTP/1.1\r\nA: b\r\n continued"
+   "GET / HTTP/1.1\r\nHost : t" "GET / HTTP/1.1\r\n: novalue" "GET / HTTP/1.1\r\nnocolon"
+   "GET / HTTP/1.1\r\nA:" "GET / HTTP/1.1\r\nA(b: c" "GET / HTTP/1.1\r\nnaéme: c"
+   "GET / HTTP/1.1\r\nX-Note: content-length: 9"
+   "GET / HTTP/1.1\r\nX: y\r\nnocolon\r\nZ: a:b"
+   "POST / HTTP/1.1\r\nContent-Length: 5" "POST / HTTP/1.1\r\nCONTENT-LENGTH:5"
+   "POST / HTTP/1.1\r\ncontent-length:   5  " "POST / HTTP/1.1\r\nContent-Length: 5, 5"
+   "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 5"
+   "POST / HTTP/1.1\r\nContent-Length: 5\r\nContent-Length: 7"
+   "POST / HTTP/1.1\r\nContent-Length: 5, 7" "POST / HTTP/1.1\r\nContent-Length: +5"
+   "POST / HTTP/1.1\r\nContent-Length: -5" "POST / HTTP/1.1\r\nContent-Length:"
+   "POST / HTTP/1.1\r\nContent-Length: 0x5" "POST / HTTP/1.1\r\nContent-Lengthx: 5"
+   "POST / HTTP/1.1\r\nContent_Length: 5" "POST / HTTP/1.1\r\nContent-Lengt: 5"
+   "POST / HTTP/1.1\r\nTransfer-Encoding: chunked"
+   "POST / HTTP/1.1\r\ntransfer-encoding: CHUNKED"
+   "POST / HTTP/1.0\r\nTransfer-Encoding: chunked"
+   "POST / HTTP/1.1\r\nTransfer-Encoding: gzip, chunked"
+   "POST / HTTP/1.1\r\nTransfer-Encoding: chunked, chunked"
+   "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nTransfer-Encoding: chunked"
+   "POST / HTTP/1.1\r\nTransfer-Encoding:"
+   "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nContent-Length: 5"
+   "POST / HTTP/1.1\r\nContent-Length: 5\r\nExpect: 100-continue"
+   "POST / HTTP/1.1\r\nContent-Length: 0\r\nExpect: 100-continue"
+   "POST / HTTP/1.1\r\nTransfer-Encoding: chunked\r\nexpect: 100-CONTINUE"
+   "GET / HTTP/1.1\r\nExpect: 100-continue" "POST / HTTP/1.1\r\nExpect: nope\r\nContent-Length: 1"
+   "POST / HTTP/1.1\r\nExpectx: 100-continue\r\nContent-Length: 1"])
+
+(def ^:private framing-pieces
+  ["\r\n" "\r\n" "\r\n" "\r\n" "\r" "\n" ":" ":" " " "\t" "," "a" "(" "é" "x-y" "Host"
+   "Content-Length" "content-length" "CONTENT-LENGTH" "Content-Lengt" "Transfer-Encoding"
+   "transfer-encoding" "Expect" "expect" "100-continue" "chunked" "CHUNKED" "gzip"
+   "5" "7" "0" "GET / HTTP/1.1" "POST / HTTP/1.0" "Content-Length: 5" "Transfer-Encoding: chunked"
+   "Expect: 100-continue" "A: b"])
+
+(defn test-framing-matches-the-old-decision []
+  (let [next-rand (fn [s] (mod (+ (* s 1103515245) 12345) 2147483648))
+        rand-head (fn [seed]
+                    (loop [s (next-rand seed)
+                           k (+ 1 (mod (quot s 65536) 12))
+                           out "GET / HTTP/1.1\r\n"]
+                      (if (zero? k)
+                        [s out]
+                        (let [s' (next-rand s)
+                              piece (nth framing-pieces (mod (quot s' 65536) (count framing-pieces)))]
+                          (recur s' (dec k) (str out piece))))))
+        seen (atom #{})
+        mismatches (atom [])
+        compare! (fn [raw]
+                   ;; head-end stops at the first terminator, so that is the head
+                   (let [head (subs raw 0 (or (str/index-of raw "\r\n\r\n") (count raw)))
+                         want (oracle-framing head)
+                         got (framing-of head)]
+                     (swap! seen conj (cond (map? want) (if (:chunked? want) :chunked :length)
+                                            :else want))
+                     (when (not= (oracle-malformed? raw) (ring-chez.http/head-malformed? raw))
+                       (swap! mismatches conj [:malformed raw]))
+                     (when (not= want got)
+                       (swap! mismatches conj [:framing head want got]))))]
+    (doseq [h framing-corpus] (compare! h))
+    (loop [i 0 s 20261105]
+      (when (< i 20000)
+        (let [[s' h] (rand-head s)]
+          (compare! h)
+          (recur (inc i) s'))))
+    (check "framing oracle: both agree on every head" [] (vec (take 5 @mismatches)))
+    (check "framing oracle: the cases reached every outcome"
+           #{:bad :unsupported :chunked :length} @seen))
+  ;; the point of the rewrite: no substring per line, on any path through here
+  (with-redefs [ring-chez.http/head-lines (fn [_] (throw (ex-info "split the head" {})))]
+    (check "framing: decided without splitting into lines" {:expect? false :length 0}
+           (framing-of "GET / HTTP/1.1\r\nHost: t\r\nAccept: */*"))))
+
 (defn run-test
   "Run one test, attributing a throw to it instead of ending the run. A test
   that dies on a socket error — an EPIPE from a peer that closed a beat early,
@@ -4841,6 +5099,9 @@
   (run-test "test-binary-round-trip" test-binary-round-trip)
   (run-test "test-ffi-byte-copies" test-ffi-byte-copies)
   (run-test "test-ws-fill-without-chunk-array" test-ws-fill-without-chunk-array)
+  (run-test "test-send-buffer-fits-the-payload" test-send-buffer-fits-the-payload)
+  (run-test "test-recv-buffers-are-reused" test-recv-buffers-are-reused)
+  (run-test "test-framing-matches-the-old-decision" test-framing-matches-the-old-decision)
 
   (if (zero? @failures)
     (println "all passed")

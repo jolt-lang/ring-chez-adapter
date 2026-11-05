@@ -23,15 +23,31 @@
         (let [e (or (str/index-of head "\r\n" i) n)]
           (recur (+ e 2) (conj out (subs head i e))))))))
 
-(defn- tchar?
-  "RFC 7230 §3.2.6 token character. A header name is a token and nothing else:
-   a space before the colon (\"Host : t\") is not a fussy detail but a
-   smuggling wedge, since parsers disagree about whether to trim it."
-  [c]
-  (or (<= (int \a) (int c) (int \z))
-      (<= (int \A) (int c) (int \Z))
-      (<= (int \0) (int c) (int \9))
-      (contains? #{\! \# \$ \% \& \' \* \+ \- \. \^ \_ \` \| \~} c)))
+(def ^:private token-chars
+  "RFC 7230 §3.2.6 token characters, as a table indexed by char. A header name
+   is a token and nothing else: a space before the colon (\"Host : t\") is not
+   a fussy detail but a smuggling wedge, since parsers disagree about whether
+   to trim it."
+  (let [t (byte-array 128)]
+    (doseq [c (str "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ"
+                   "0123456789!#$%&'*+-.^_`|~")]
+      (aset t (int c) (byte 1)))
+    t))
+
+(defn- token?
+  "True when head[from,to) holds only token characters."
+  [^String head from to]
+  (let [^bytes table token-chars]
+    (loop [i from]
+      (or (>= i to)
+          (let [c (int (.charAt head i))]
+            (and (< c 128) (pos? (aget table c)) (recur (inc i))))))))
+
+(defn- field-line-malformed?
+  "True unless head[from,to) has a non-empty token before its first colon."
+  [^String head from to]
+  (let [colon (str/index-of head ":" from)]
+    (not (and colon (< from colon to) (token? head from colon)))))
 
 (defn head-malformed?
   "True when the head breaks the rules a framing decision has to be able to
@@ -44,27 +60,30 @@
    and are rejected rather than guessed at, and a header name must be a token.
 
    The head as read-request hands it over excludes the terminating CRLFCRLF, so
-   the last line legitimately has no CRLF of its own."
+   the last line legitimately has no CRLF of its own.
+
+   One pass over the head, allocating nothing: this runs twice per request. The
+   first CR and first LF from the start of a line have to be a CRLF pair, or
+   one of them is stray. A folded line starts with whitespace, which is not a
+   token character, so the name check refuses it."
   [head]
   (let [n (count head)]
-    (or
-      ;; no bare LF, no stray CR
-      (loop [i 0]
-        (cond
-          (>= i n) false
-          (= \newline (.charAt ^String head i))
-          (if (and (pos? i) (= \return (.charAt ^String head (dec i)))) (recur (inc i)) true)
-          (= \return (.charAt ^String head i))
-          (if (and (< (inc i) n) (= \newline (.charAt ^String head (inc i)))) (recur (inc i)) true)
-          :else (recur (inc i))))
-      (boolean
-        (some (fn [line]
-                (let [i (str/index-of line ":")]
-                  (or (zero? (count line))
-                      (contains? #{\space \tab} (.charAt ^String line 0))   ; obs-fold
-                      (not (and i (pos? i)))
-                      (not (every? tchar? (subs line 0 i))))))
-              (head-lines head))))))
+    (loop [i 0, request-line? true]
+      (if (>= i n)
+        false
+        (let [cr (str/index-of head "\r" i)
+              lf (str/index-of head "\n" i)]
+          (cond
+            (and (nil? cr) (nil? lf))
+            (and (not request-line?) (field-line-malformed? head i n))
+
+            (not (and cr lf (= lf (inc cr))))
+            true
+
+            (and (not request-line?) (field-line-malformed? head i cr))
+            true
+
+            :else (recur (+ cr 2) false)))))))
 
 (defn- head-version
   "The HTTP version token off the request line, or nil."
@@ -78,17 +97,26 @@
   "The head's Content-Length / Transfer-Encoding / Expect values, keyed by
    field name. Reading the field name off each line — rather than scanning the
    whole head for \"content-length:\" — keeps a value like \"X-Note:
-   content-length: 9\" from being mistaken for framing."
+   content-length: 9\" from being mistaken for framing.
+
+   Only for a head head-malformed? passed, which is what lets it take every line
+   to have a colon and an untrimmed name. Only names of the right length are
+   decoded, so a request with no framing headers allocates nothing for them."
   [head]
-  (reduce (fn [m line]
-            (let [i (str/index-of line ":")]
-              (if-not (and i (pos? i))
-                m
-                (let [k (str/lower-case (str/trim (subs line 0 i)))]
-                  (if (contains? #{"content-length" "transfer-encoding" "expect"} k)
-                    (update m k (fnil conj []) (str/trim (subs line (inc i))))
-                    m)))))
-          {} (head-lines head)))
+  (let [n (count head)]
+    (loop [i (if-let [b (str/index-of head "\r\n")] (+ b 2) n)
+           m {}]
+      (if (>= i n)
+        m
+        (let [e (or (str/index-of head "\r\n" i) n)
+              colon (str/index-of head ":" i)
+              k (case (- colon i)
+                  (6 14 17) (str/lower-case (subs head i colon))
+                  nil)]
+          (recur (+ e 2)
+                 (if (contains? #{"content-length" "transfer-encoding" "expect"} k)
+                   (update m k (fnil conj []) (str/trim (subs head (inc colon) e)))
+                   m)))))))
 
 (defn- comma-parts [vals]
   (mapcat #(map str/trim (str/split % #"," -1)) vals))
@@ -125,27 +153,25 @@
   "How the head says its body is delimited: a non-negative octet count, or
    :chunked, or :bad / :unsupported.
 
-   :bad covers a head that is malformed at all (above), a Content-Length that
-   is not one or more identical non-negative integers, a request that declares
+   named is framing-headers' answer for a head head-malformed? passed. :bad
+   covers a Content-Length that is not one or more identical non-negative
+   integers, a request that declares
    both Content-Length and Transfer-Encoding — two framings, and the peer at
    each end may believe a different one, which is the whole mechanism of
    request smuggling — and chunked on HTTP/1.0, which is HTTP/1.1 framing an
    HTTP/1.0 intermediary would read differently. :unsupported is a transfer
    coding this server does not implement (501, per RFC 9112 §7)."
-  [head]
-  (if (head-malformed? head)
-    :bad
-    (let [named (framing-headers head)
-          te (transfer-encoding-value (get named "transfer-encoding"))
-          cl (content-length-value (get named "content-length"))]
-      (cond
-        (= :bad cl) :bad
-        (= :unsupported te) :unsupported
-        (and (= :chunked te) (not= :absent cl)) :bad
-        (and (= :chunked te) (= "HTTP/1.0" (head-version head))) :bad
-        (= :chunked te) :chunked
-        (= :absent cl) 0
-        :else cl))))
+  [head named]
+  (let [te (transfer-encoding-value (get named "transfer-encoding"))
+        cl (content-length-value (get named "content-length"))]
+    (cond
+      (= :bad cl) :bad
+      (= :unsupported te) :unsupported
+      (and (= :chunked te) (not= :absent cl)) :bad
+      (and (= :chunked te) (= "HTTP/1.0" (head-version head))) :bad
+      (= :chunked te) :chunked
+      (= :absent cl) 0
+      :else cl)))
 
 (def no-bytes (byte-array 0))
 
@@ -209,7 +235,7 @@
   (let [line (String. bs start (- end start) "UTF-8")
         i (str/index-of line ":")]
     (and i (pos? i)
-         (every? tchar? (subs line 0 i))
+         (token? line 0 i)
          (not (contains? forbidden-trailer-fields (str/lower-case (subs line 0 i)))))))
 
 (defn- parse-chunked-body
@@ -323,9 +349,10 @@
   [^bytes acc scanned have]
   (when-let [he (head-end acc scanned have)]
     (let [head (String. acc 0 he "UTF-8")
-          f (body-framing head)
+          named (when-not (head-malformed? head) (framing-headers head))
+          f (if named (body-framing head named) :bad)
           from (+ he 4)
-          expect? (expect-continue? (framing-headers head))]
+          expect? (expect-continue? named)]
       (cond
         (= :chunked f) {:head head :from from :chunked? true :expect? expect?}
         (number? f) {:head head :from from :to (+ from f)
@@ -348,7 +375,7 @@
   ([conn acc {:keys [max-bytes max-header-bytes recv! idle-recv! continue!
                      request-timeout-ms arm-read!]
               :or {max-header-bytes 8192 request-timeout-ms 0}}]
-  (let [buf (ffi/alloc socket/bufsize)
+  (let [buf (socket/take-recv-buffer!)
         ;; a head can never be allowed past the whole-request cap either: with
         ;; :max-request-bytes below the header limit the tighter one governs,
         ;; or a run-on head would sit unchecked between the two
@@ -440,7 +467,7 @@
             :else
             (let [r (more! acc have scanned framing state)]
               (if (keyword? r) r (let [[a h sc fr st] r] (recur a h sc fr st)))))))
-      (finally (ffi/free buf))))))
+      (finally (socket/give-recv-buffer! buf))))))
 
 ;; --- request -> Ring map ----------------------------------------------------
 (defn normalize-path
@@ -716,7 +743,11 @@
   ([conn data] (send-all conn data nil))
   ([conn data wait-write!]
    (let [parts (mapv part-bytes (if (vector? data) data [data]))
-         buf (ffi/alloc send-window)]
+         total (reduce (fn [n ^bytes p] (+ n (alength p))) 0 parts)
+         ;; never more than the payload: ffi/alloc zeroes what it hands out, and
+         ;; a whole window of that was 6 us on every small response
+         window (max 1 (min send-window total))
+         buf (ffi/alloc window)]
      ;; try/finally, not a free after the loop: a throw mid-write leaked the
      ;; buffer and nothing ever gave it back
      (try
@@ -728,12 +759,12 @@
 
            (= off (alength ^bytes (first ps))) (recur (next ps) 0 held)
 
-           (= held send-window)
+           (= held window)
            (if (send-window! conn buf held wait-write!) (recur ps off 0) false)
 
            :else
            (let [^bytes p (first ps)
-                 n (min (- (alength p) off) (- send-window held))]
+                 n (min (- (alength p) off) (- window held))]
              (ffi/write-array buf :byte p held off n)
              (recur ps (+ off n) (+ held n)))))
        (finally (ffi/free buf))))))
