@@ -490,28 +490,30 @@
             ;; request rather than the one after it
             handler    @handler-box
             ws-handler @ws-handler-box]
+;; identical?, not =: these are literal keywords, and = costs 0.2 us
+        ;; against a map, which is what r almost always is
         (cond
-          (= :bad r) (send! conn (http/response->parts
+          (identical? :bad r) (send! conn (http/response->parts
                                    {:status 400 :headers {"Content-Type" "text/plain"}
                                     :body "Bad Request"} false))
-          (= :too-big r) (send! conn (http/response->parts
+          (identical? :too-big r) (send! conn (http/response->parts
                                        {:status 413 :headers {"Content-Type" "text/plain"
                                                               "Connection" "close"}
                                         :body "Payload Too Large"} false))
-          (= :headers-too-big r) (send! conn (http/response->parts
+          (identical? :headers-too-big r) (send! conn (http/response->parts
                                                {:status 431 :headers {"Content-Type" "text/plain"
                                                                       "Connection" "close"}
                                                 :body "Request Header Fields Too Large"} false))
-          (= :timeout r) (send! conn (http/response->parts
+          (identical? :timeout r) (send! conn (http/response->parts
                                        {:status 408 :headers {"Content-Type" "text/plain"
                                                               "Connection" "close"}
                                         :body "Request Timeout"} false))
-          (= :unsupported r) (send! conn (http/response->parts
+          (identical? :unsupported r) (send! conn (http/response->parts
                                            {:status 501 :headers {"Content-Type" "text/plain"
                                                                   "Connection" "close"}
                                             :body "Not Implemented"} false))
           (map? r)
-          (let [{:keys [request error]} (http/request->ring (:head r) (:body r) conn-info)]
+          (let [{:keys [request error]} (http/framed-request->ring (:head r) (:body r) conn-info)]
             (cond
               error (send! conn (http/response->parts error false))
                ;; A 101 ends HTTP framing: every byte after the head is read
@@ -583,7 +585,7 @@
                      ;; loser's work is abandoned along with the rest of it.
                      claim!   (let [claimed (atom false)]
                                 #(cas! claimed false true))
-                     started  (System/currentTimeMillis)
+                     started  (when (pos? handler-timeout-ms) (System/currentTimeMillis))
                      ;; NOT `r`: that is the read, and its :leftover carries
                      ;; the pipelined bytes this loop recurs on
                      ran ((:run-timed! io)
@@ -601,7 +603,7 @@
                             ;; at its next reduction so its thread is reclaimed
                             ;; (Igropyr stuck-ms kills the worker outright;
                             ;; jolt's interrupt is the cooperative equivalent)
-                            (= timed-out ran)
+                            (identical? timed-out ran)
                             (let [info {:kind :timeout
                                         :elapsed-ms (- (System/currentTimeMillis) started)}
                                   t (ex-info "handler timed out"
