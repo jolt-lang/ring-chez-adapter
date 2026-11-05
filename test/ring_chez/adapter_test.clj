@@ -1368,7 +1368,7 @@
       (Thread/sleep 250)
       (let [fd (client-connect 8497 5000)]
         (ws-handshake fd "/ws?queue=q1")
-        (check-has "session-request: 101 sent" "101" (client-recv-until fd "\r\n\r\n"))
+        (check-has "session-request: 101 sent" "101" (ws-read-handshake! fd))
         (let [f (ws-read-server-frame fd)]
           (check "session-request: the upgrade request" "/ws?queue=q1 t"
                  (bytes->str (:payload f))))
