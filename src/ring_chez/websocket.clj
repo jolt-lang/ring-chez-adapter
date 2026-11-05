@@ -15,8 +15,8 @@
   (:require [jolt.ffi :as ffi]
             [jolt.socket.native :as native]
             [jolt.crypto :as crypto]
-            [ring-chez.cas :refer [cas!]]))
-
+            [ring-chez.cas :refer [cas!]]
+            [ring-chez.socket :as socket]))
 
 ;; Igropyr's caps (websocket.sc:26-28). A declared length is never a memory
 ;; reservation: a frame past max-frame is refused from its header alone, and a
@@ -26,7 +26,6 @@
 (def ^:const max-message 8388608)   ; reassembled multi-frame message cap
 (def ^:const max-fragments 16384)   ; bound per-frame allocation overhead
 
-(def ^:private recv-bufsize 65536)
 
 ;; --- base64 ------------------------------------------------------------------
 
@@ -373,16 +372,16 @@
   session: that is the idle peer being reaped, which is what the timeout is
   for."
   [session]
-  (let [fbuf (ffi/alloc recv-bufsize)]
+  (let [fbuf (socket/take-recv-buffer!)]
     (try
       (loop []
-        (let [[got e] (native/c-recv (:fd session) fbuf recv-bufsize 0)]
+        (let [[got e] (native/c-recv (:fd session) fbuf socket/bufsize 0)]
           (cond
             (pos? got) (do (ib-fill! (:buf session) fbuf got)
                            true)
             (and (neg? got) (native/eintr? e)) (recur)
             :else nil)))
-      (finally (ffi/free fbuf)))))
+      (finally (socket/give-recv-buffer! fbuf)))))
 
 (defn- next-frame!
   "Block until a whole frame is available. A frame map, or :protocol-error /

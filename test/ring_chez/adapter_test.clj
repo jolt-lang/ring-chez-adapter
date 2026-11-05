@@ -14,6 +14,7 @@
             [clojure.java.io :as io]
             [jolt.ffi :as ffi]
             [ring-chez.socket :as socket]
+            [ring-chez.http]
             [jolt.socket.native :as native]
             [jolt.io-poller :as poller]
             [jolt.process]))
@@ -4596,6 +4597,87 @@
       (check "ws fill!: grows when it must" [4 5 6 7 8 9 10 11 12 13 14 15] (contents))
       (check "ws fill!: growth allocates a new array" 4096 (alength ^bytes (:bs @ibuf))))))
 
+;; A 64 KB ffi/alloc zeroes the block through a fresh 64 KB bytevector, which was
+;; the largest single cost of a small request, twice over.
+(defn test-send-buffer-fits-the-payload []
+  (let [window 65536
+        send-all @#'ring-chez.http/send-all
+        alloc ffi/alloc
+        send-through (fn [parts]
+                       (let [sizes (atom [])
+                             wire (atom [])]
+                         (with-redefs [ffi/alloc (fn [n] (swap! sizes conj n) (alloc n))
+                                       native/c-send (fn [_ p n _]
+                                                       (swap! wire into (vec (ffi/read-array p n)))
+                                                       [n 0])]
+                           {:ok (send-all -1 parts)
+                            :sizes @sizes
+                            :wire @wire})))
+        bs (fn [n v] (byte-array n (byte v)))]
+    (let [{:keys [ok sizes wire]} (send-through [(bs 100 1) (bs 13 2)])]
+      (check "send buffer: small response succeeds" true ok)
+      (check "send buffer: holds just the payload" [113] sizes)
+      (check "send buffer: octets in order"
+             (concat (repeat 100 1) (repeat 13 2)) (seq wire)))
+    (let [{:keys [ok sizes wire]} (send-through [(bs 0 0)])]
+      (check "send buffer: empty payload succeeds" true ok)
+      (check "send buffer: empty payload sends nothing" [] wire)
+      (check "send buffer: empty payload still allocates something" true (pos? (first sizes))))
+    (doseq [total [(dec window) window (inc window) (+ 5 (* 2 window))]]
+      (let [{:keys [ok sizes wire]} (send-through [(bs 7 1) (bs (- total 7) 2)])]
+        (check (str "send buffer: " total " succeeds") true ok)
+        (check (str "send buffer: " total " stays within the window")
+               [(min total window)] sizes)
+        (check (str "send buffer: " total " all octets arrive") total (count wire))
+        (check (str "send buffer: " total " order")
+               [1 2] [(nth wire 6) (nth wire 7)])))))
+
+(defn test-recv-buffers-are-reused []
+  (let [pool @#'ring-chez.socket/recv-buffers
+        alloc ffi/alloc
+        free ffi/free
+        allocs (atom 0)
+        frees (atom [])
+        saved @pool
+        req "GET /a HTTP/1.1\r\nHost: t\r\n\r\n"
+        read-one (fn [recv!]
+                   (ring-chez.http/read-request -1 (byte-array 0) 1048576 recv! recv!))
+        stub-recv (fn [_ buf]
+                    (ffi/write-array buf (.getBytes ^String req "UTF-8"))
+                    (count req))]
+    (reset! pool ())
+    (try
+      (with-redefs [ffi/alloc (fn [n] (when (= n socket/bufsize) (swap! allocs inc)) (alloc n))
+                    ffi/free (fn [p] (swap! frees conj p) (free p))]
+        (check "recv pool: first request parses" true (map? (read-one stub-recv)))
+        (check "recv pool: first request allocates" 1 @allocs)
+        (check "recv pool: second request parses" true (map? (read-one stub-recv)))
+        (check "recv pool: second request reuses it" 1 @allocs)
+        (check "recv pool: a throwing recv gives the buffer back"
+               :threw (try (read-one (fn [_ _] (throw (ex-info "recv" {}))))
+                           (catch Throwable _ :threw)))
+        (check "recv pool: still one buffer after the throw" 1 (count @pool))
+        (let [a (socket/take-recv-buffer!)
+              b (socket/take-recv-buffer!)]
+          (check "recv pool: buffers in use are distinct" true (not= a b))
+          (socket/give-recv-buffer! a)
+          (socket/give-recv-buffer! b))
+        (check "recv pool: nothing freed while under the bound" [] @frees)
+        (let [extra (mapv (fn [_] (ffi/alloc socket/bufsize))
+                          (range (+ 3 @#'ring-chez.socket/recv-buffers-max)))]
+          (doseq [p extra] (socket/give-recv-buffer! p))
+          (check "recv pool: holds no more than its bound"
+                 @#'ring-chez.socket/recv-buffers-max (count @pool))
+          (check "recv pool: the surplus is freed" true (pos? (count @frees))))
+        (let [session (ws/make-session -1)]
+          (with-redefs [native/c-recv (fn [_ _ _ _] [0 0])]
+            (let [before @allocs]
+              (#'ring-chez.websocket/fill! session)
+              (check "recv pool: websocket reads share it" before @allocs)))))
+      (finally
+        (doseq [p @pool] (free p))
+        (reset! pool saved)))))
+
 (defn run-test
   "Run one test, attributing a throw to it instead of ending the run. A test
   that dies on a socket error — an EPIPE from a peer that closed a beat early,
@@ -4841,6 +4923,8 @@
   (run-test "test-binary-round-trip" test-binary-round-trip)
   (run-test "test-ffi-byte-copies" test-ffi-byte-copies)
   (run-test "test-ws-fill-without-chunk-array" test-ws-fill-without-chunk-array)
+  (run-test "test-send-buffer-fits-the-payload" test-send-buffer-fits-the-payload)
+  (run-test "test-recv-buffers-are-reused" test-recv-buffers-are-reused)
 
   (if (zero? @failures)
     (println "all passed")

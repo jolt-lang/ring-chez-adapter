@@ -348,7 +348,7 @@
   ([conn acc {:keys [max-bytes max-header-bytes recv! idle-recv! continue!
                      request-timeout-ms arm-read!]
               :or {max-header-bytes 8192 request-timeout-ms 0}}]
-  (let [buf (ffi/alloc socket/bufsize)
+  (let [buf (socket/take-recv-buffer!)
         ;; a head can never be allowed past the whole-request cap either: with
         ;; :max-request-bytes below the header limit the tighter one governs,
         ;; or a run-on head would sit unchecked between the two
@@ -440,7 +440,7 @@
             :else
             (let [r (more! acc have scanned framing state)]
               (if (keyword? r) r (let [[a h sc fr st] r] (recur a h sc fr st)))))))
-      (finally (ffi/free buf))))))
+      (finally (socket/give-recv-buffer! buf))))))
 
 ;; --- request -> Ring map ----------------------------------------------------
 (defn normalize-path
@@ -716,7 +716,11 @@
   ([conn data] (send-all conn data nil))
   ([conn data wait-write!]
    (let [parts (mapv part-bytes (if (vector? data) data [data]))
-         buf (ffi/alloc send-window)]
+         total (reduce (fn [n ^bytes p] (+ n (alength p))) 0 parts)
+         ;; never more than the payload: ffi/alloc zeroes what it hands out, and
+         ;; a whole window of that was 6 us on every small response
+         window (max 1 (min send-window total))
+         buf (ffi/alloc window)]
      ;; try/finally, not a free after the loop: a throw mid-write leaked the
      ;; buffer and nothing ever gave it back
      (try
@@ -728,12 +732,12 @@
 
            (= off (alength ^bytes (first ps))) (recur (next ps) 0 held)
 
-           (= held send-window)
+           (= held window)
            (if (send-window! conn buf held wait-write!) (recur ps off 0) false)
 
            :else
            (let [^bytes p (first ps)
-                 n (min (- (alength p) off) (- send-window held))]
+                 n (min (- (alength p) off) (- window held))]
              (ffi/write-array buf :byte p held off n)
              (recur ps (+ off n) (+ held n)))))
        (finally (ffi/free buf))))))
