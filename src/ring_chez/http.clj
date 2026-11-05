@@ -285,9 +285,7 @@
 (defn- fill!
   "Copy the first n bytes of the FFI buffer buf into acc at off."
   [^bytes acc off buf n]
-  ;; jolt.ffi/read-array allocates the chunk and we copy it in; jolt.ffi's
-  ;; read-into! (unreleased) reads straight into acc and drops this copy.
-  (System/arraycopy (ffi/read-array buf n) 0 acc off n))
+  (ffi/read-into! buf :byte acc 0 off n))
 
 (defn- head-end
   "Index of the \r\n\r\n that ends the request head within bs[0,have), or nil.
@@ -736,7 +734,7 @@
            :else
            (let [^bytes p (first ps)
                  n (min (- (alength p) off) (- send-window held))]
-             (ffi/write-array (+ buf held) p off n)
+             (ffi/write-array buf :byte p held off n)
              (recur ps (+ off n) (+ held n)))))
        (finally (ffi/free buf))))))
 

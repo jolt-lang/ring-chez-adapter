@@ -1368,7 +1368,7 @@
       (Thread/sleep 250)
       (let [fd (client-connect 8497 5000)]
         (ws-handshake fd "/ws?queue=q1")
-        (check-has "session-request: 101 sent" "101" (client-recv-until fd "\r\n\r\n"))
+        (check-has "session-request: 101 sent" "101" (ws-read-handshake! fd))
         (let [f (ws-read-server-frame fd)]
           (check "session-request: the upgrade request" "/ws?queue=q1 t"
                  (bytes->str (:payload f))))
@@ -4521,6 +4521,81 @@
         (client-close fd))
       (finally (adapter/stop-server server)))))
 
+;; jolt's branch removing (write-array p arr off n) and (read-into! p arr off n)
+;; raises on them, so a body that takes either path has to use the typed form.
+(defn test-ffi-byte-copies []
+  (let [buf (ffi/alloc 8)
+        acc (byte-array 6)
+        read-array ffi/read-array
+        write-array ffi/write-array
+        read-into ffi/read-into!
+        body (vec (take 200000 (cycle (range 256))))
+        server (adapter/run-server binary-response-handler
+                                   {:port 8456 :worker-threads 1
+                                    :keep-alive-timeout-ms 2000})]
+    (try
+      (ffi/write-array buf (byte-array [1 2 3 4]))
+      (with-redefs [ffi/read-array (fn [& _] (throw (ex-info "fill! allocated a chunk" {})))]
+        (#'ring-chez.http/fill! acc 2 buf 3))
+      (check "fill!: chunk lands at the offset, no chunk array" [0 0 1 2 3 0] (vec acc))
+      (Thread/sleep 250)
+      (let [retired? (fn [args] (and (= 4 (count args)) (bytes? (second args))))
+            used (atom [])
+            guard (fn [nm f]
+                    (fn [& args]
+                      (when (retired? args) (swap! used conj nm))
+                      (apply f args)))]
+        (with-redefs [ffi/write-array (guard "write-array" write-array)
+                      ffi/read-into! (guard "read-into!" read-into)]
+          ;; bigger than the send window and than one recv, so the request goes
+          ;; through fill! several times and the response through send-all's
+          ;; packing of head then body
+          (let [fd (client-connect 8456 3000)
+                head (str "POST /echo HTTP/1.1\r\nHost: t\r\n"
+                          "Content-Type: application/octet-stream\r\n"
+                          "Content-Length: " (count body) "\r\n\r\n")]
+            (t-send-bytes fd (concat (utf8-bytes head) body))
+            (let [raw (client-recv-raw fd)]
+              (check "ffi copies: large body round-trips"
+                     (hex (unsigned->bytes body)) (hex (response-body-bytes raw))))
+            (client-close fd)))
+        (check "ffi copies: no byte-index forms" [] @used))
+      (finally
+        (ffi/free buf)
+        (adapter/stop-server server)))))
+
+;; each recv lands in the session buffer without a chunk array between them, for
+;; all three shapes of append: room at the end, room after compacting, and growth
+(defn test-ws-fill-without-chunk-array []
+  (let [session (ws/make-session -1)
+        ibuf (:buf session)
+        fill! @#'ring-chez.websocket/fill!
+        chunk (atom nil)
+        contents (fn []
+                   (let [{:keys [bs start end]} @ibuf]
+                     (vec (take (- end start) (drop start bs)))))]
+    (with-redefs [native/c-recv (fn [_ buf _ _]
+                                  (ffi/write-array buf (byte-array @chunk))
+                                  [(count @chunk) 0])
+                  ffi/read-array (fn [& _] (throw (ex-info "fill! allocated a chunk" {})))]
+      (reset! ibuf {:bs (byte-array 8) :start 0 :end 2})
+      (aset-byte (:bs @ibuf) 0 1) (aset-byte (:bs @ibuf) 1 2)
+      (reset! chunk [3 4])
+      (check "ws fill!: reports a read" true (fill! session))
+      (check "ws fill!: appends in place" [1 2 3 4] (contents))
+      (check "ws fill!: end advances" 4 (:end @ibuf))
+      (swap! ibuf assoc :start 3)
+      (let [before (:bs @ibuf)]
+        (reset! chunk [5 6 7 8 9 10])
+        (fill! session)
+        (check "ws fill!: compacts when that makes room" [4 5 6 7 8 9 10] (contents))
+        (check "ws fill!: compacting keeps the array" true (identical? before (:bs @ibuf)))
+        (check "ws fill!: compacting resets start" 0 (:start @ibuf)))
+      (reset! chunk [11 12 13 14 15])
+      (fill! session)
+      (check "ws fill!: grows when it must" [4 5 6 7 8 9 10 11 12 13 14 15] (contents))
+      (check "ws fill!: growth allocates a new array" 4096 (alength ^bytes (:bs @ibuf))))))
+
 (defn run-test
   "Run one test, attributing a throw to it instead of ending the run. A test
   that dies on a socket error — an EPIPE from a peer that closed a beat early,
@@ -4764,6 +4839,8 @@
   (run-test "test-binary-response-body" test-binary-response-body)
   (run-test "test-binary-response-chunks" test-binary-response-chunks)
   (run-test "test-binary-round-trip" test-binary-round-trip)
+  (run-test "test-ffi-byte-copies" test-ffi-byte-copies)
+  (run-test "test-ws-fill-without-chunk-array" test-ws-fill-without-chunk-array)
 
   (if (zero? @failures)
     (println "all passed")

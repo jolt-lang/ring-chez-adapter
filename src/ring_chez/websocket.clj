@@ -234,22 +234,23 @@
 
 (def ^:private empty-bytes (byte-array 0))
 
-(defn- ib-append!
-  [ibuf ^bytes chunk]
+(defn- ib-fill!
+  "Append the n octets at the native pointer p, reading straight into the
+  session buffer."
+  [ibuf p n]
   (swap! ibuf
          (fn [{:keys [^bytes bs start end]}]
-           (let [n (alength chunk)]
-             (if (<= (+ end n) (alength bs))
-               (do (System/arraycopy chunk 0 bs end n)
-                   {:bs bs :start start :end (+ end n)})
-               (let [used (- end start)
-                     need (+ used n)
-                     ;; System/arraycopy is memmove-safe, so compacting in
-                     ;; place is fine when the array is already big enough
-                     ^bytes out (if (<= need (alength bs)) bs (byte-array (max 4096 (* 2 need))))]
-                 (System/arraycopy bs start out 0 used)
-                 (System/arraycopy chunk 0 out used n)
-                 {:bs out :start 0 :end need}))))))
+           (if (<= (+ end n) (alength bs))
+             (do (ffi/read-into! p :byte bs 0 end n)
+                 {:bs bs :start start :end (+ end n)})
+             (let [used (- end start)
+                   need (+ used n)
+                   ;; System/arraycopy is memmove-safe, so compacting in
+                   ;; place is fine when the array is already big enough
+                   ^bytes out (if (<= need (alength bs)) bs (byte-array (max 4096 (* 2 need))))]
+               (System/arraycopy bs start out 0 used)
+               (ffi/read-into! p :byte out 0 used n)
+               {:bs out :start 0 :end need})))))
 
 (defn- ib-consume! [ibuf k]
   (swap! ibuf (fn [{:keys [bs start end]}]
@@ -377,7 +378,7 @@
       (loop []
         (let [[got e] (native/c-recv (:fd session) fbuf recv-bufsize 0)]
           (cond
-            (pos? got) (do (ib-append! (:buf session) (ffi/read-array fbuf got))
+            (pos? got) (do (ib-fill! (:buf session) fbuf got)
                            true)
             (and (neg? got) (native/eintr? e)) (recur)
             :else nil)))
