@@ -2823,6 +2823,68 @@
              (:status (http/get (str "http://127.0.0.1:" port "/"))))
       (finally (adapter/stop-server server)))))
 
+;; :handler-on-fiber: no thread between the connection and the handler
+(defn- on-fiber-handler [request]
+  (case (:uri request)
+    "/where"  {:status 200 :body (if (jolt.host/current-fiber) "fiber" "thread")}
+    "/throw"  (throw (ex-info "boom" {}))
+    "/park"   (do (a/<!! (a/timeout 300)) {:status 200 :body "parked"})
+    "/echo"   {:status 200 :body (slurp (:body request))}
+    {:status 404 :body "no"}))
+
+(defn- on-fiber-get [port path]
+  (http/get (str "http://127.0.0.1:" port path) {:throw-exceptions false}))
+
+(defn test-handler-on-fiber []
+  (let [off (adapter/run-server on-fiber-handler {:port 0 :strategy :fibers})]
+    (try
+      (check "default fibers server: handler on a thread" "thread"
+             (:body (on-fiber-get (:port off) "/where")))
+      (finally (adapter/stop-server off))))
+  (let [server (adapter/run-server on-fiber-handler
+                                   {:port 0 :strategy :fibers :handler-on-fiber true
+                                    :on-failure (fn [_ _] {:status 500 :body "caught"})})
+        port (:port server)]
+    (try
+      (check "on-fiber: handler on the fiber" "fiber" (:body (on-fiber-get port "/where")))
+      (let [r (on-fiber-get port "/throw")]
+        (check "on-fiber: a throw reaches :on-failure" 500 (:status r))
+        (check "on-fiber: :on-failure's body" "caught" (:body r)))
+      (check "on-fiber: serves after a throw" "fiber" (:body (on-fiber-get port "/where")))
+      (let [body (apply str (repeat 20000 "x"))
+            r (http/post (str "http://127.0.0.1:" port "/echo")
+                         {:body body :throw-exceptions false})]
+        (check "on-fiber: request body reaches the handler" body (:body r)))
+      ;; 64 waits of 300 ms overlap only if a parked handler lets go of its carrier.
+      ;; Pinning them would take at least 300 ms for every carrier's worth, which is
+      ;; 1.9 s on ten cores and longer on fewer.
+      (let [t0 (System/currentTimeMillis)
+            rs (mapv deref (mapv (fn [_] (future (on-fiber-get port "/park"))) (range 64)))
+            ms (- (System/currentTimeMillis) t0)]
+        (check "on-fiber: every parked handler answers" (repeat 64 "parked") (map :body rs))
+        (check "on-fiber: parked handlers overlap" true (< ms 1500)))
+      (finally (adapter/stop-server server)))))
+
+(defn- refused? [opts]
+  (try
+    (adapter/stop-server (adapter/run-server on-fiber-handler (assoc opts :port 0)))
+    false
+    (catch clojure.lang.ExceptionInfo e (contains? (ex-data e) :key))))
+
+(defn test-handler-on-fiber-options []
+  (check "on-fiber: must be a boolean" true
+         (refused? {:strategy :fibers :handler-on-fiber "yes"}))
+  (check "on-fiber: refused under :threads" true
+         (refused? {:strategy :threads :handler-on-fiber true}))
+  (check "on-fiber: refused under the default strategy" true
+         (refused? {:handler-on-fiber true}))
+  (check "on-fiber: refused with a handler deadline" true
+         (refused? {:strategy :fibers :handler-on-fiber true :handler-timeout-ms 100}))
+  (check "on-fiber: false is fine anywhere" false
+         (refused? {:strategy :threads :handler-on-fiber false :handler-timeout-ms 100}))
+  (check "on-fiber: a zero deadline means none" false
+         (refused? {:strategy :fibers :handler-on-fiber true :handler-timeout-ms 0})))
+
 (defn test-handler-deadline-threads [] (handler-deadline-reclaims :threads 8532))
 (defn test-handler-deadline-fibers  [] (handler-deadline-reclaims :fibers 8533))
 
@@ -5259,6 +5321,8 @@
   (run-test "test-connection-tokens-match" test-connection-tokens-match)
   (run-test "test-response-head-is-unchanged" test-response-head-is-unchanged)
   (run-test "test-request-fields-match" test-request-fields-match)
+  (run-test "test-handler-on-fiber" test-handler-on-fiber)
+  (run-test "test-handler-on-fiber-options" test-handler-on-fiber-options)
 
   (if (zero? @failures)
     (println "all passed")

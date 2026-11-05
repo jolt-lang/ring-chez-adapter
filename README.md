@@ -116,6 +116,22 @@ strategies run on macOS, Linux and Windows.
   then. So still keep the value generous enough that only a genuinely stuck
   handler trips it. It bounds handler *execution*, not the response: a
   handler that returns a channel and streams for an hour is untouched.
+- `:handler-on-fiber` (default false, `:fibers` only) — run the handler on the
+  connection's fiber instead of handing it to a thread. Each handoff wakes a thread
+  and then wakes the carrier again, and on a cheap handler that is the larger part
+  of what a request costs: plaintext with `ab -k -c 8` goes from 21k to 38k req/s.
+  It is about 20 us per request, so a handler doing a millisecond of work won't
+  notice.
+
+  The handler has to be one that does not block where the runtime cannot see it.
+  Channel ops, `Thread/sleep` and jolt's own socket and subprocess I/O park and are
+  fine. A foreign call that blocks, such as a database driver over FFI, holds the
+  carrier, and every connection on that carrier waits with it. That shows up as
+  errors as well as latency: a new connection placed behind a held carrier is not
+  claimed in time and is answered `503` (44 of 64 in a test with 300 ms handlers on
+  ten carriers), so this is off by default. Wrap such a call in
+  `clojure.core.async/thread` and take the result, which parks. It cannot be combined with `:handler-timeout-ms`, which needs a
+  thread to walk away from, and `run-server` refuses the combination.
 - `:reuse-port` (default false) — bind with `SO_REUSEPORT`, so several
   processes can listen on the same port and the kernel spreads new connections
   across them (Linux; the BSDs allow the bind without the balancing). Off by
