@@ -644,6 +644,33 @@ idle TLS connection also holds more native memory than a plain one, for OpenSSL'
 Not included: client certificates, SNI with more than one certificate, and ALPN, so
 clients always get HTTP/1.1.
 
+## Tuning `:fibers`
+
+Most of what a cheap request costs under `:fibers` is waking OS threads: the poller
+when bytes arrive, then the carrier thread that runs the connection's fiber, then a
+handler thread unless `:handler-on-fiber` is set. So the number of carriers matters more
+than it looks. There is one per core by default, and with fewer, each is more likely to
+be awake already with work queued. Plaintext with `ab -k -c 8` on ten cores:
+
+| carriers | `:handler-on-fiber` | CPU per request | default | CPU per request |
+|---:|---:|---:|---:|---:|
+| 10 (default) | 38k req/s | 114 us | 18k req/s | 248 us |
+| 4 | 40k req/s | 85 us | | |
+| 2 | 32k req/s | 68 us | 18k req/s | 130 us |
+| 1 | 19k req/s | 63 us | | |
+
+Set it before the server starts:
+
+```clojure
+(alter-var-root #'clojure.core.async/*fiber-carrier-count* (constantly 4))
+```
+
+This only helps while handlers are cheap and don't block. With `:handler-on-fiber`, a
+handler doing real CPU work needs the carriers, and a blocking foreign call holds up
+more connections when there are fewer of them. Measure with your own handlers. Spinning
+carriers or the poller briefly before they sleep was tried and is not worth having:
+at c=8 it cost 30-50% of throughput for about 20% at c=1.
+
 ## Test
 
 ```bash
