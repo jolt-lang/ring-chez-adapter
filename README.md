@@ -132,6 +132,8 @@ strategies run on macOS, Linux and Windows.
   ten carriers), so this is off by default. Wrap such a call in
   `clojure.core.async/thread` and take the result, which parks. It cannot be combined with `:handler-timeout-ms`, which needs a
   thread to walk away from, and `run-server` refuses the combination.
+- `:tls` (default none) — `{:cert-file "cert.pem" :key-file "key.pem"}` serves HTTPS
+  and `wss` on this port, under either strategy. See [TLS](#tls).
 - `:reuse-port` (default false) — bind with `SO_REUSEPORT`, so several
   processes can listen on the same port and the kernel spreads new connections
   across them (Linux; the BSDs allow the bind without the balancing). Off by
@@ -608,6 +610,39 @@ an `upgrade` token in `Connection`, `Sec-WebSocket-Version: 13`, and a
 websocket without meeting all of that gets `400`, as does an upgrade that also
 declares a request body (its octets would otherwise be read as frames). Other
 requests go to the Ring handler as usual.
+
+## TLS
+
+```clojure
+(adapter/run-server handler {:port 8443
+                             :tls {:cert-file "fullchain.pem"
+                                   :key-file  "privkey.pem"}})
+```
+
+Both files are PEM, and `:cert-file` may hold the whole chain, leaf first. `run-server`
+throws if a file is missing or the key doesn't match the certificate, rather than let
+every handshake fail later. Requests carry `:scheme :https`, and websockets work over
+it unchanged. Changing a certificate takes a restart.
+
+It needs OpenSSL at runtime (`libssl.so.3` on Linux, Homebrew's `openssl@3` on macOS),
+loaded only when `:tls` is set. macOS's system LibreSSL is not used. TLS 1.2 is the
+floor, and client-initiated renegotiation is refused. It runs in the suite on macOS and
+Linux; on Windows it has not been run.
+
+OpenSSL is only the codec here: ciphertext moves over the same blocking or parking I/O
+as plaintext, so `:keep-alive-timeout-ms`, `:request-timeout-ms` and
+`:write-timeout-ms` all bound a TLS connection the same way. A handshake must also
+finish within the smaller of `:keep-alive-timeout-ms` and 10 seconds as a whole, so a
+client feeding it a byte at a time can't hold a worker. A client that doesn't speak TLS
+is disconnected with no HTTP answer.
+
+Keep-alive traffic costs little: plaintext with `ab -k -c 8`, an EC P-256 certificate,
+went from 73k to 59k req/s on `:threads` and 19k to 18k on `:fibers`. New connections
+are where the cost is, at about 500 full handshakes a second, so keep keep-alive on. An
+idle TLS connection also holds more native memory than a plain one, for OpenSSL's state.
+
+Not included: client certificates, SNI with more than one certificate, and ALPN, so
+clients always get HTTP/1.1.
 
 ## Test
 

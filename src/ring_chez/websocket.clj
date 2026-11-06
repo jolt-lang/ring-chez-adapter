@@ -263,35 +263,50 @@
   "A session over conn. leftover is whatever the handshake read overshot into:
   a client may pipeline its first frames in the same segment as the upgrade
   request, and dropping those bytes left the session parked forever on a
-  message it had already been handed."
+  message it had already been handed.
+
+  io is how the session reaches the peer when that isn't the bare socket:
+  {:read! (fn [buf]) :write! (fn [p n])}, the recv and send contracts over a native
+  buffer. TLS is what uses it."
   ([fd] (make-session fd empty-bytes))
-  ([fd ^bytes leftover]
-   (->Session fd
+  ([fd leftover] (make-session fd leftover nil))
+  ([fd ^bytes leftover io]
+   (assoc
+    (->Session fd
               (atom (if (pos? (alength leftover))
                       {:bs leftover :start 0 :end (alength leftover)}
                       {:bs (byte-array 4096) :start 0 :end 0}))
-              (atom false))))
+              (atom false))
+    :io io
+    :send-lock (Object.))))
 
 (defn- send-bytes
-  "Raw octets onto fd; true on success, false once the peer is gone."
-  [fd ^bytes bs]
+  "Raw octets to the peer; true on success, false once the peer is gone. One at a
+  time: any thread may send on a session, and a send that came back short would
+  otherwise have another thread's frame written into the middle of its own."
+  [session ^bytes bs]
   (let [n (alength bs)
+        fd (:fd session)
+        write! (:write! (:io session))
         buf (ffi/alloc (max 1 n))]
     (try
       (ffi/write-array buf bs)
-      (loop [off 0]
-        (if (< off n)
-          (let [[sent e] (native/c-send fd (+ buf off) (- n off) native/msg-nosignal)]
-            (cond
-              (pos? sent) (recur (+ off sent))
-              (and (neg? sent) (native/eintr? e)) (recur off)
-              :else false))
-          true))
+      (locking (:send-lock session)
+        (if write!
+          (write! buf n)
+          (loop [off 0]
+            (if (< off n)
+              (let [[sent e] (native/c-send fd (+ buf off) (- n off) native/msg-nosignal)]
+                (cond
+                  (pos? sent) (recur (+ off sent))
+                  (and (neg? sent) (native/eintr? e)) (recur off)
+                  :else false))
+              true))))
       (finally (ffi/free buf)))))
 
 (defn- send-frame! [session op ^bytes payload]
   (and (not @(:closed? session))
-       (send-bytes (:fd session) (encode-frame op payload))))
+       (send-bytes session (encode-frame op payload))))
 
 (defn send!
   "Send a text frame. Returns false when the peer is gone."
@@ -342,13 +357,13 @@
   throws IllegalArgumentException."
   ([session]
    (when (cas! (:closed? session) false true)
-     (send-bytes (:fd session) (encode-frame 0x8 empty-bytes)))
+     (send-bytes session (encode-frame 0x8 empty-bytes)))
    true)
   ([session code] (close! session code ""))
   ([session code reason]
    (let [payload (close-payload code reason)]
      (when (cas! (:closed? session) false true)
-       (send-bytes (:fd session) (encode-frame 0x8 payload))))
+       (send-bytes session (encode-frame 0x8 payload))))
    true))
 
 (defn- fail!
@@ -356,7 +371,7 @@
   message too big, or a peer's own code echoed back)."
   [session code]
   (when (cas! (:closed? session) false true)
-    (send-bytes (:fd session)
+    (send-bytes session
                 (encode-frame 0x8 (byte-array [(unchecked-byte (bit-shift-right code 8))
                                                (unchecked-byte (bit-and 0xff code))]))))
   true)
@@ -372,14 +387,17 @@
   session: that is the idle peer being reaped, which is what the timeout is
   for."
   [session]
-  (let [fbuf (socket/take-recv-buffer!)]
+  (let [fbuf (socket/take-recv-buffer!)
+        read! (:read! (:io session))]
     (try
       (loop []
-        (let [[got e] (native/c-recv (:fd session) fbuf socket/bufsize 0)]
+        (let [[got e] (if read!
+                        [(read! fbuf) nil]
+                        (native/c-recv (:fd session) fbuf socket/bufsize 0))]
           (cond
             (pos? got) (do (ib-fill! (:buf session) fbuf got)
                            true)
-            (and (neg? got) (native/eintr? e)) (recur)
+            (and (neg? got) e (native/eintr? e)) (recur)
             :else nil)))
       (finally (socket/give-recv-buffer! fbuf)))))
 

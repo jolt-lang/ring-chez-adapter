@@ -250,15 +250,21 @@
   been gone since the last chunk."
   1000)
 
+(defn- blocking-take!
+  "A channel take on a worker, asking gone? when the channel stays quiet."
+  [ch conn gone?]
+  (loop []
+    (let [[v p] (async/alts!! [ch (async/timeout stream-idle-check-ms)])]
+      (cond
+        (= p ch)    v
+        (gone? conn) http/peer-gone
+        :else       (recur)))))
+
 (def ^:private threads-io
   {:recv! blocking-recv!
-   :take! (fn [ch conn]
-            (loop []
-              (let [[v p] (async/alts!! [ch (async/timeout stream-idle-check-ms)])]
-                (cond
-                  (= p ch)                 v
-                  (socket/peer-gone? conn) http/peer-gone
-                  :else                    (recur)))))
+   :write-raw! (fn [conn p n] (http/send-window! conn p n nil))
+   :take-via! blocking-take!
+   :take! (fn [ch conn] (blocking-take! ch conn socket/peer-gone?))
    :run!  (fn [f] (f))
    :run-timed! (fn [f ms]
                  (if (zero? ms)
@@ -295,6 +301,16 @@
 
 (def ^:private no-deadline Long/MAX_VALUE)
 
+(defn- parking-take!
+  "A channel take on a fiber, asking gone? when the channel stays quiet."
+  [ch conn gone?]
+  (loop []
+    (let [[v p] (async/alts! [ch (async/timeout stream-idle-check-ms)])]
+      (cond
+        (= p ch)     v
+        (gone? conn) http/peer-gone
+        :else        (recur)))))
+
 (defn- fiber-io
   "Fiber-strategy io for one connection. Must only be used inside the owning
   fiber-backed go block (see fiber-serve): recv! parks the fiber on read
@@ -329,13 +345,14 @@
      :send! (fn [c s]
               (try (http/send-all c s (fn [] (arm-write!) (poller/wait-ready c :write)))
                    (finally (suspend!))))
-     :take! (fn [ch c]
-              (loop []
-                (let [[v p] (async/alts! [ch (async/timeout stream-idle-check-ms)])]
-                  (cond
-                    (= p ch)              v
-                    (socket/peer-gone? c) http/peer-gone
-                    :else                 (recur)))))
+     ;; octets at a pointer, for TLS, whose reads write too: the deadline a read
+     ;; armed has to survive a write in the middle of it
+     :write-raw! (fn [c p n]
+                   (let [armed @deadline]
+                     (try (http/send-window! c p n (fn [] (arm-write!) (poller/wait-ready c :write)))
+                          (finally (reset! deadline armed)))))
+     :take-via! parking-take!
+     :take! (fn [ch c] (parking-take! ch c socket/peer-gone?))
      :run!  (fn [f] (async/<! (async/thread (f))))
      ;; the handler is already on a thread here, so the deadline is only an
      ;; alts! away — the fiber stops waiting, and the fd, the fiber and the
@@ -446,7 +463,7 @@
 ;; fourteen positional arguments on connection-loop, worker and fiber-serve,
 ;; which is why the last few options were miserable to add and why the call
 ;; sites were unreadable.
-(defn- connection-loop [conn conn-info cfg io deadline entry]
+(defn- serve-connection [conn conn-info cfg io deadline entry]
   (let [{:keys [handler-box ws-handler-box ws-guard on-failure ka-ms max-bytes
                 max-header-bytes request-timeout-ms write-timeout-ms
                 handler-timeout-ms stats]} cfg]
@@ -572,7 +589,8 @@
                      ;; the session carries the upgrade request, so the
                      ;; handler can read its path, query and headers (the
                      ;; vhost, a token, a filter) as the guard did
-                     ((:run! io) #(try (ws-handler (assoc (ws/make-session conn (:leftover r))
+                     ((:run! io) #(try (ws-handler (assoc (ws/make-session conn (:leftover r)
+                                                                            (when-let [f (:session-io io)] (f)))
                                                           :request request))
                                        (catch Throwable t
                                          (try (when on-failure
@@ -673,8 +691,8 @@
   then; :pending? is this conn's own membership in the threads strategy's
   accept-pressure count, so leaving that count is once-only per conn rather
   than a bare decrement at each exit (see pending-done!)."
-  [conns conn peer poller?]
-  (let [entry (cond-> {:conn conn :peer peer
+  [conns conn peer poller? tls?]
+  (let [entry (cond-> {:conn conn :peer peer :tls? tls?
                        :down?     (atom false)
                        :owned?    (atom false)
                        :released? (atom false)
@@ -788,6 +806,23 @@
     (swap! pool (fn [st] (cond-> (update st :idle inc)
                            spent? (update :retiring dec))))))
 
+;; A handshake is bounded as a whole, not just per read: a client feeding it a byte at
+;; a time would otherwise hold a worker for as long as it cared to.
+(def ^:private tls-handshake-max-ms 10000)
+
+(defn- connection-loop [conn conn-info cfg io deadline entry]
+  (if-let [serve-tls (:serve-tls cfg)]
+    (let [limit (min (:ka-ms cfg) tls-handshake-max-ms)
+          by (+ (System/currentTimeMillis) limit)]
+      (socket/set-rcvtimeo! conn limit)
+      (socket/set-sndtimeo! conn (:write-timeout-ms cfg))
+      ;; the conn has an owner from here, just as serve-connection would say; the
+      ;; sweeper's own deadline is what ends a fiber's stalled handshake
+      (reset! (:serving? entry) true)
+      (when deadline (reset! deadline by))
+      (serve-tls conn io by #(serve-connection conn conn-info cfg % deadline entry)))
+    (serve-connection conn conn-info cfg io deadline entry)))
+
 (defn- worker
   "Serve connections off the work channel until it closes.
 
@@ -872,8 +907,10 @@
   [entry]
   (try
     (let [conn (:conn entry)]
-      (when (pos? (bit-and (max 0 (native/poll-one conn native/pollout 0))
-                           native/pollout))
+      ;; plaintext on a TLS connection would just be a protocol error for the client
+      (when (and (not (:tls? entry))
+                 (pos? (bit-and (max 0 (native/poll-one conn native/pollout 0))
+                           native/pollout)))
         (http/send-all
               conn (.getBytes (str "HTTP/1.1 503 Service Unavailable\r\n"
                                    "Content-Type: text/plain\r\n"
@@ -1079,6 +1116,13 @@
      :reuse-port         (check-bool :reuse-port)
      :handler-on-fiber   (check-bool :handler-on-fiber)}))
 
+(defn- make-tls-context [tls]
+  (when-not (map? tls)
+    (throw (ex-info "run-server: :tls must be a map of :cert-file and :key-file"
+                    {:key :tls :given tls})))
+  (require 'ring-chez.tls)
+  ((resolve 'ring-chez.tls/make-context) tls))
+
 (defn run-server
   "Start the server; return a handle {:socket :port :host :running}. opts:
     :port                  listen port (default 3000); 0 for any free port,
@@ -1118,6 +1162,12 @@
                            wakes per request. A handler that blocks somewhere
                            the runtime cannot see holds its carrier and every
                            fiber on it: see the README
+    :tls                   {:cert-file :key-file}, both PEM paths, to serve HTTPS
+                           (and wss) on this port, with either strategy.
+                           :cert-file may hold the whole chain, leaf first.
+                           TLS 1.2 or newer. Throws here on a file that is
+                           missing or a key that does not match. Needs OpenSSL,
+                           loaded only when this is set
     :reuse-port            bind with SO_REUSEPORT (default false), so several
                            processes can share the port and the kernel spreads
                            connections over them (Linux)
@@ -1180,7 +1230,11 @@
           ;; and a version bump must not put a server that was private on the
           ;; network. Opt in with :host "0.0.0.0".
           host   (or (:host v) "127.0.0.1")
-          base-info {:server-port port :server-name host}
+          ;; loaded only on request, so a plain server never pulls in OpenSSL. Before
+          ;; the bind: a bad certificate should not leave a socket behind
+          tls-ctx (some-> (:tls opts) make-tls-context)
+          base-info (cond-> {:server-port port :server-name host}
+                      tls-ctx (assoc :scheme :https))
           ;; boxed so a running server can be re-pointed without a restart
           ;; (Igropyr http-swap! / http-set-ws!) — REPL work is the whole point
           handler-box (atom handler)
@@ -1200,8 +1254,14 @@
                :write-timeout-ms write-timeout-ms
                :handler-timeout-ms handler-timeout-ms
                :handler-on-fiber (boolean (:handler-on-fiber v))
+               :serve-tls (when tls-ctx
+                            (let [serve (resolve 'ring-chez.tls/serve)]
+                              (fn [conn io by f] (serve tls-ctx conn io by f))))
                :stats stats}
-          binds  (socket/listen-sockets host port {:reuse-port? (boolean (:reuse-port v))})
+          binds  (try (socket/listen-sockets host port {:reuse-port? (boolean (:reuse-port v))})
+                      (catch Throwable t
+                        (when tls-ctx ((resolve 'ring-chez.tls/free-context) tls-ctx))
+                        (throw t)))
           fds    (:fds binds)
           ;; port 0 asks the kernel for any free port — listen-sockets unifies
           ;; the choice across every family; the handle says which
@@ -1229,7 +1289,7 @@
                                                       ;; in `conns` AFTER the sweep had passed over it,
                                                       ;; with nobody left to take it down: a stopped
                                                       ;; server went on serving it, and its fd leaked.
-                                                      (let [entry (register-conn! conns conn peer true)]
+                                                      (let [entry (register-conn! conns conn peer true (some? tls-ctx))]
                                                         ;; the spawn below is the handoff, and from
                                                         ;; here the conn is somebody's: a go block
                                                         ;; that never runs leaves it registered,
@@ -1263,6 +1323,7 @@
                                                     fault!)))
                               fds)]
           {:sockets fds :socket (first fds) :port port :host host :running running?
+             :tls-ctx tls-ctx
            :conns conns :sweep sweep :acceptors acceptors :acceptor (first acceptors)
            :handler handler-box :ws-handler ws-handler-box :stats stats})
         (let [work  (async/chan)  ; unbuffered: acceptor parks when all workers busy
@@ -1314,7 +1375,7 @@
                         ;; decremented on the not-handed path only, and
                         ;; a throw out of the release cannot take the
                         ;; accept loop with it (see serve-loop).
-                        (let [entry (register-conn! conns conn peer false)
+                        (let [entry (register-conn! conns conn peer false (some? tls-ctx))
                               _ (do (reset! (:pending? entry) true)
                                     (swap! pending inc))
                               handed? (try (and @running? (async/>!! work entry))
@@ -1349,6 +1410,7 @@
                       fault!)))
                  fds)]
             {:sockets fds :socket (first fds) :port port :host host :running running?
+             :tls-ctx tls-ctx
              :work work :conns conns :sweep sweep :acceptors acceptors :acceptor (first acceptors)
              :handler handler-box :ws-handler ws-handler-box :stats stats}))))))
 
@@ -1482,4 +1544,8 @@
                        acceptors)]
       (when all-exited?
         (doseq [fd fds] (native/c-close fd)))))
+  ;; the connections hold their own references, so one that outlived the drain keeps
+  ;; working until it unwinds
+  (when-let [ctx (:tls-ctx server)]
+    ((resolve 'ring-chez.tls/free-context) ctx))
   nil))
