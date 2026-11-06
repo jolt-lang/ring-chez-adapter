@@ -11,6 +11,7 @@
             [jolt.http-client :as http]
             [clojure.string :as str]
             [clojure.core.async :as a]
+            [jolt.http.tls :as client-tls]
             [clojure.java.io :as io]
             [jolt.ffi :as ffi]
             [ring-chez.socket :as socket]
@@ -2823,6 +2824,278 @@
              (:status (http/get (str "http://127.0.0.1:" port "/"))))
       (finally (adapter/stop-server server)))))
 
+;; --- TLS ---------------------------------------------------------------------
+(def ^:private tls-opts {:cert-file "test/fixtures/tls/cert.pem"
+                         :key-file "test/fixtures/tls/key.pem"})
+(def ^:private tls-big (apply str (repeat (* 5 1024 1024) "b")))
+(def ^:private tls-stream-closed (atom nil))
+
+(defn- tls-handler [request]
+  (case (:uri request)
+    "/scheme" {:status 200 :body (name (:scheme request))}
+    "/echo"   {:status 200 :body (let [o (java.io.ByteArrayOutputStream.)]
+                                   (io/copy (:body request) o)
+                                   (.toByteArray o))}
+    "/big"    {:status 200 :body tls-big}
+    "/stream" (let [ch (a/chan)]
+                (a/go (a/>! ch "one") (a/>! ch "two") (a/close! ch))
+                {:status 200 :body ch})
+    "/quiet"  (let [ch (a/chan)]
+                (reset! tls-stream-closed ch)
+                (a/go (a/>! ch "first"))
+                {:status 200 :body ch})
+    {:status 200 :body "ok"}))
+
+(defn- tls-open [port] (client-tls/tls-connect "127.0.0.1" port true 5000))
+(defn- tls-write [st ^String s]
+  ((jolt.host/ref-get st :write) st (.getBytes s "UTF-8")))
+(defn- tls-write-frame [st frame]
+  ((jolt.host/ref-get st :write) st (byte-array (map unchecked-byte frame))))
+(defn- tls-close [st] ((jolt.host/ref-get st :close)))
+
+(defn- tls-read-until
+  "Bytes read from st as a latin-1 string, until pred holds or the stream ends."
+  [st pred]
+  (loop [acc ""]
+    (if (pred acc)
+      acc
+      (let [bs (try ((jolt.host/ref-get st :read) st nil) (catch Throwable _ nil))]
+        (if bs (recur (str acc (String. ^bytes bs "ISO-8859-1"))) acc)))))
+
+(defn- count-of [^String hay ^String needle]
+  (loop [i 0 n 0]
+    (let [j (.indexOf hay needle i)]
+      (if (neg? j) n (recur (+ j (count needle)) (inc n))))))
+
+(defn- tls-url [port path] (str "https://127.0.0.1:" port path))
+
+(defn- tls-serves [strategy]
+  (let [label (str "tls " (name strategy) ": ")
+        server (adapter/run-server tls-handler {:port 0 :strategy strategy :tls tls-opts})
+        port (:port server)]
+    (try
+      (let [r (http/get (tls-url port "/scheme") {:insecure? true})]
+        (check (str label "request sees :scheme :https") "https" (:body r)))
+      ;; one connection, two requests one after the other, then two in one write
+      (let [st (tls-open port)
+            req "GET /scheme HTTP/1.1\r\nHost: x\r\n\r\n"]
+        (try
+          (tls-write st req)
+          (check (str label "first keep-alive request") 1
+                 (count-of (tls-read-until st #(str/includes? % "https")) "https"))
+          (tls-write st req)
+          (check (str label "second keep-alive request") 1
+                 (count-of (tls-read-until st #(str/includes? % "https")) "https"))
+          (tls-write st (str req req))
+          (check (str label "pipelined requests both answered") 2
+                 (count-of (tls-read-until st #(= 2 (count-of % "https"))) "https"))
+          (finally (tls-close st))))
+      ;; every octet value, across many records
+      (let [bs (byte-array (map unchecked-byte (take (* 512 1024) (cycle (range 256)))))
+            r (http/post (tls-url port "/echo") {:body bs :as :byte-array :insecure? true})]
+        (check (str label "binary body round trip") (seq bs) (seq (:body r))))
+      (check (str label "5 MB response") (count tls-big)
+             (count (:body (http/get (tls-url port "/big") {:insecure? true}))))
+      (let [st (tls-open port)]
+        (try
+          (tls-write st "GET /stream HTTP/1.1\r\nHost: x\r\n\r\n")
+          (let [got (tls-read-until st #(str/includes? % "0\r\n\r\n"))]
+            (check-has (str label "chunked: first chunk") "3\r\none\r\n" got)
+            (check-has (str label "chunked: second chunk") "3\r\ntwo\r\n" got))
+          (finally (tls-close st))))
+      (finally (adapter/stop-server server)))))
+
+(defn test-tls-threads [] (tls-serves :threads))
+(defn test-tls-fibers [] (tls-serves :fibers))
+
+(defn- tls-refuses-plaintext [strategy]
+  (let [label (str "tls " (name strategy) ": ")
+        server (adapter/run-server tls-handler {:port 0 :strategy strategy :tls tls-opts})
+        port (:port server)]
+    (try
+      (let [fd (client-connect port)]
+        (t-send-bytes fd (utf8-bytes "GET / HTTP/1.1\r\nHost: x\r\n\r\n"))
+        (let [got (client-recv-all fd)]
+          (check (str label "plaintext gets no plaintext answer") false
+                 (str/includes? got "HTTP/1.1"))))
+      (check (str label "serves after plaintext") "https"
+             (:body (http/get (tls-url port "/scheme") {:insecure? true})))
+      (finally (adapter/stop-server server)))))
+
+(defn test-tls-refuses-plaintext-threads [] (tls-refuses-plaintext :threads))
+(defn test-tls-refuses-plaintext-fibers [] (tls-refuses-plaintext :fibers))
+
+;; one worker, so a silent peer in the handshake holds the whole server until the
+;; handshake's limit lets go of it
+(defn- tls-handshake-limit [strategy]
+  (let [label (str "tls " (name strategy) ": ")
+        server (adapter/run-server tls-handler {:port 0 :strategy strategy :worker-threads 1
+                                                :keep-alive-timeout-ms 400 :tls tls-opts})
+        port (:port server)]
+    (try
+      (let [fd (client-connect port 5000)
+            t0 (System/currentTimeMillis)
+            got (client-recv-all fd)]
+        (check (str label "silent handshake is dropped") "" got)
+        (check (str label "dropped near the limit") true
+               (< (- (System/currentTimeMillis) t0) 4000)))
+      ;; a byte at a time: each read is prompt, so only a limit on the whole handshake
+      ;; ends this. The start of a record that never completes.
+      (let [fd (client-connect port)
+            t0 (System/currentTimeMillis)
+            closed? (loop [bs (concat [0x16 0x03 0x01 0x20 0x00] (repeat 50 0x01))]
+                      (cond
+                        (pos? (native/poll-one fd native/pollin 0)) true
+                        (empty? bs) false
+                        :else (do (t-send-bytes fd [(first bs)])
+                                  (Thread/sleep 100)
+                                  (recur (rest bs)))))]
+        (client-close fd)
+        (check (str label "trickled handshake is cut") true closed?)
+        (check (str label "cut well before it finished") true
+               (< (- (System/currentTimeMillis) t0) 3000)))
+      ;; silent after the ClientHello, so the server has already written its half. The
+      ;; write must leave the handshake's deadline where it found it.
+      (let [fd (client-connect port 5000)
+            hello (with-open [in (java.io.FileInputStream. "test/fixtures/tls/client-hello.bin")
+                              o (java.io.ByteArrayOutputStream.)]
+                    (io/copy in o)
+                    (.toByteArray o))
+            t0 (System/currentTimeMillis)]
+        (t-send-bytes fd (mapv #(bit-and 0xff %) hello))
+        (let [got (client-recv-all fd)]
+          (check (str label "server answered the hello") true (pos? (count got)))
+          (check (str label "stalled after the hello is dropped") true
+                 (< (- (System/currentTimeMillis) t0) 3000))))
+      (check (str label "serves after a stalled handshake") "https"
+             (:body (http/get (tls-url port "/scheme") {:insecure? true})))
+      (finally (adapter/stop-server server)))))
+
+(defn test-tls-handshake-limit-threads [] (tls-handshake-limit :threads))
+(defn test-tls-handshake-limit-fibers [] (tls-handshake-limit :fibers))
+
+;; a client that says goodbye and keeps the socket open while the application is quiet.
+;; close_notify is ciphertext, so a peek at the socket sees bytes, not the end.
+(defn- tls-stream-notices-disconnect [strategy]
+  (let [label (str "tls " (name strategy) ": ")
+        server (adapter/run-server tls-handler {:port 0 :strategy strategy :tls tls-opts})
+        port (:port server)]
+    (try
+      (let [st (tls-open port)]
+        (tls-write st "GET /quiet HTTP/1.1\r\nHost: x\r\n\r\n")
+        (check-has (str label "stream started") "first"
+                   (tls-read-until st #(str/includes? % "first")))
+        (#'client-tls/c-SSL-shutdown (jolt.host/ref-get st :ssl))
+        (#'client-tls/flush-out st)
+        (Thread/sleep 2500)
+        (check (str label "adapter closed the body channel") false
+               (a/put! @tls-stream-closed "nobody is listening"))
+        (tls-close st))
+      (check (str label "serves after the stream") "https"
+             (:body (http/get (tls-url port "/scheme") {:insecure? true})))
+      (finally (adapter/stop-server server)))))
+
+(defn test-tls-stream-disconnect-threads [] (tls-stream-notices-disconnect :threads))
+(defn test-tls-stream-disconnect-fibers [] (tls-stream-notices-disconnect :fibers))
+
+(defn- tls-ws [strategy]
+  (let [label (str "tls " (name strategy) " ws: ")
+        server (adapter/run-server tls-handler
+                 {:port 0 :strategy strategy :tls tls-opts
+                  :ws-handler (fn [session]
+                                (loop []
+                                  (let [m (ws/recv! session)]
+                                    (when (= :text (:type m))
+                                      (ws/send! session (:data m))
+                                      (recur)))))})
+        port (:port server)
+        st (tls-open port)]
+    (try
+      (tls-write st (str "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+                         "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                         "Sec-WebSocket-Version: 13\r\n\r\n"))
+      (check-has (str label "101") "101 Switching"
+                 (tls-read-until st #(str/includes? % "\r\n\r\n")))
+      (tls-write-frame st (ws-client-frame 0x1 (utf8-bytes "hello")))
+      (check-has (str label "echo") "hello" (tls-read-until st #(str/includes? % "hello")))
+      ;; bigger than a TLS record, so the frame spans several
+      (let [big (apply str (repeat 100000 "w"))]
+        (tls-write-frame st (ws-client-frame 0x1 (utf8-bytes big)))
+        (check (str label "large echo") true
+               (<= 100000 (count-of (tls-read-until st #(<= 100000 (count-of % "w"))) "w"))))
+      (finally (tls-close st) (adapter/stop-server server)))))
+
+(defn test-tls-ws-threads [] (tls-ws :threads))
+(defn test-tls-ws-fibers [] (tls-ws :fibers))
+
+;; A TLS 1.3 client may rotate keys and ask the server to do the same, any time. The
+;; server answers from inside a read, on the same ciphertext path as everything else.
+(ffi/defcfn c-SSL-key-update "SSL_key_update" [:pointer :int] :int)
+
+(defn- tls-key-update [strategy]
+  (let [label (str "tls " (name strategy) ": ")
+        server (adapter/run-server tls-handler {:port 0 :strategy strategy :tls tls-opts})
+        st (tls-open (:port server))]
+    (try
+      (dotimes [_ 3]
+        (check (str label "KeyUpdate accepted") 1
+               (c-SSL-key-update (jolt.host/ref-get st :ssl) 1))
+        (tls-write st "GET /scheme HTTP/1.1\r\nHost: x\r\n\r\n")
+        (check-has (str label "served across a KeyUpdate") "https"
+                   (tls-read-until st #(str/includes? % "https"))))
+      (finally (tls-close st) (adapter/stop-server server)))))
+
+(defn test-tls-key-update-threads [] (tls-key-update :threads))
+(defn test-tls-key-update-fibers [] (tls-key-update :fibers))
+
+;; stop-server has to get through live connections and an idle handshake
+(defn test-tls-stop-with-live-connections []
+  (doseq [strategy [:threads :fibers]]
+    (let [server (adapter/run-server tls-handler {:port 0 :strategy strategy :tls tls-opts})
+          st (tls-open (:port server))
+          fd (client-connect (:port server))
+          t0 (System/currentTimeMillis)]
+      (tls-write st "GET /scheme HTTP/1.1\r\nHost: x\r\n\r\n")
+      (tls-read-until st #(str/includes? % "https"))
+      (adapter/stop-server server)
+      (check (str "tls " (name strategy) ": stop-server returns") true
+             (< (- (System/currentTimeMillis) t0) 8000))
+      (tls-close st))))
+
+(defn- tls-refused? [tls]
+  (try
+    (adapter/stop-server (adapter/run-server tls-handler {:port 0 :tls tls}))
+    false
+    (catch clojure.lang.ExceptionInfo e (= :tls (:key (ex-data e))))))
+
+(defn test-tls-options []
+  (check "tls: must be a map" true (tls-refused? "yes"))
+  (check "tls: needs a certificate" true (tls-refused? {:key-file (:key-file tls-opts)}))
+  (check "tls: needs a key" true (tls-refused? {:cert-file (:cert-file tls-opts)}))
+  (check "tls: a missing certificate file" true
+         (tls-refused? (assoc tls-opts :cert-file "test/fixtures/tls/nope.pem")))
+  (check "tls: a missing key file" true
+         (tls-refused? (assoc tls-opts :key-file "test/fixtures/tls/nope.pem")))
+  (check "tls: a key that does not match" true
+         (tls-refused? (assoc tls-opts :key-file "test/fixtures/tls/other-key.pem")))
+  (check "tls: a good pair is accepted" false (tls-refused? tls-opts)))
+
+;; the sweeper's 503 is plaintext, and on a TLS connection that is noise
+(defn test-tls-unclaimed-gets-no-plaintext []
+  (let [[a b] (native/loopback-pair)
+        buf (ffi/alloc 64)]
+    (try
+      (native/set-blocking! b false)
+      (#'adapter/answer-unclaimed! {:conn a :tls? true})
+      (Thread/sleep 50)
+      (let [[n _] (native/c-recv b buf 64 0)]
+        (check "tls: no plaintext 503 on an unclaimed conn" true (neg? n)))
+      (#'adapter/answer-unclaimed! {:conn a})
+      (Thread/sleep 50)
+      (let [[n _] (native/c-recv b buf 64 0)]
+        (check "plain: an unclaimed conn still gets its 503" true (pos? n)))
+      (finally (ffi/free buf) (native/c-close a) (native/c-close b)))))
+
 ;; :handler-on-fiber: no thread between the connection and the handler
 (defn- on-fiber-handler [request]
   (case (:uri request)
@@ -5321,6 +5594,21 @@
   (run-test "test-connection-tokens-match" test-connection-tokens-match)
   (run-test "test-response-head-is-unchanged" test-response-head-is-unchanged)
   (run-test "test-request-fields-match" test-request-fields-match)
+  (run-test "test-tls-threads" test-tls-threads)
+  (run-test "test-tls-fibers" test-tls-fibers)
+  (run-test "test-tls-refuses-plaintext-threads" test-tls-refuses-plaintext-threads)
+  (run-test "test-tls-refuses-plaintext-fibers" test-tls-refuses-plaintext-fibers)
+  (run-test "test-tls-handshake-limit-threads" test-tls-handshake-limit-threads)
+  (run-test "test-tls-handshake-limit-fibers" test-tls-handshake-limit-fibers)
+  (run-test "test-tls-stream-disconnect-threads" test-tls-stream-disconnect-threads)
+  (run-test "test-tls-stream-disconnect-fibers" test-tls-stream-disconnect-fibers)
+  (run-test "test-tls-key-update-threads" test-tls-key-update-threads)
+  (run-test "test-tls-key-update-fibers" test-tls-key-update-fibers)
+  (run-test "test-tls-ws-threads" test-tls-ws-threads)
+  (run-test "test-tls-ws-fibers" test-tls-ws-fibers)
+  (run-test "test-tls-stop-with-live-connections" test-tls-stop-with-live-connections)
+  (run-test "test-tls-options" test-tls-options)
+  (run-test "test-tls-unclaimed-gets-no-plaintext" test-tls-unclaimed-gets-no-plaintext)
   (run-test "test-handler-on-fiber" test-handler-on-fiber)
   (run-test "test-handler-on-fiber-options" test-handler-on-fiber-options)
 

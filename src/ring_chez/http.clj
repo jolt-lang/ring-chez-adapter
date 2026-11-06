@@ -553,7 +553,7 @@
                    ;; to see what the client actually asked for
                    :ring-chez/raw-uri raw-uri
                    :query-string   qs
-                   :scheme         :http
+                   :scheme         (or (:scheme conn-info) :http)
                    :request-method (keyword (str/lower-case (first parts)))
                    :protocol       (nth parts 2)
                    :headers        headers
@@ -733,7 +733,7 @@
 (defn- ^bytes part-bytes [p]
   (if (string? p) (.getBytes ^String p "UTF-8") p))
 
-(defn- send-window!
+(defn send-window!
   "Write n octets from buf; false when the peer is gone."
   [conn buf n wait-write!]
   (loop [off 0]
@@ -752,15 +752,18 @@
   of those written back to back. false when the peer is gone (caller closes).
   wait-write! parks the caller until the socket can take more bytes (fiber
   strategy, O_NONBLOCK sockets); nil leaves -1 meaning peer-gone (blocking
-  sockets block instead of returning EAGAIN)."
-  ([conn data] (send-all conn data nil))
-  ([conn data wait-write!]
+  sockets block instead of returning EAGAIN). write-window!, given n octets at a
+  pointer, replaces the socket write, which is how TLS encrypts on the way out."
+  ([conn data] (send-all conn data nil nil))
+  ([conn data wait-write!] (send-all conn data wait-write! nil))
+  ([conn data wait-write! write-window!]
    (let [parts (mapv part-bytes (if (vector? data) data [data]))
          total (reduce (fn [n ^bytes p] (+ n (alength p))) 0 parts)
          ;; never more than the payload: ffi/alloc zeroes what it hands out, and
          ;; a whole window of that was 6 us on every small response
          window (max 1 (min send-window total))
-         buf (ffi/alloc window)]
+         buf (ffi/alloc window)
+         flush! (or write-window! #(send-window! conn %1 %2 wait-write!))]
      ;; try/finally, not a free after the loop: a throw mid-write leaked the
      ;; buffer and nothing ever gave it back
      (try
@@ -768,12 +771,12 @@
        ;; octets packed into buf and not yet sent
        (loop [ps (seq parts), off 0, held 0]
          (cond
-           (nil? ps) (or (zero? held) (send-window! conn buf held wait-write!))
+           (nil? ps) (or (zero? held) (flush! buf held))
 
            (= off (alength ^bytes (first ps))) (recur (next ps) 0 held)
 
            (= held window)
-           (if (send-window! conn buf held wait-write!) (recur ps off 0) false)
+           (if (flush! buf held) (recur ps off 0) false)
 
            :else
            (let [^bytes p (first ps)
