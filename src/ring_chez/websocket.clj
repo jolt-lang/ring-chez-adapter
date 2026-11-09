@@ -14,7 +14,6 @@
    message too big) rather than handing a malformed message to the caller."
   (:require [jolt.ffi :as ffi]
             [jolt.socket.native :as native]
-            [jolt.crypto :as crypto]
             [ring-chez.cas :refer [cas!]]
             [ring-chez.socket :as socket]))
 
@@ -81,6 +80,52 @@
         (when (every? b64-value body)
           (- (* 3 (quot n 4)) pad))))))
 
+;; --- SHA-1 ---------------------------------------------------------------------
+;; RFC 3174, here and not through jolt.crypto: the handshake is its only use, on
+;; 60 bytes, and jolt.crypto is OpenSSL. Requiring it made every server open
+;; OpenSSL at startup, and fail to start on a host without it, TLS or not.
+
+(defn- rotl32 [x n]
+  (bit-and 0xffffffff (bit-or (bit-shift-left x n) (unsigned-bit-shift-right x (- 32 n)))))
+
+(defn- sha1-block
+  "Fold one 64-byte block, a vector of unsigned bytes, into state H."
+  [h blk]
+  (let [w (long-array 80)]
+    (dotimes [i 16]
+      (let [j (* 4 i)]
+        (aset w i (bit-or (bit-shift-left (nth blk j) 24) (bit-shift-left (nth blk (+ j 1)) 16)
+                          (bit-shift-left (nth blk (+ j 2)) 8) (nth blk (+ j 3))))))
+    (loop [i 16]
+      (when (< i 80)
+        (aset w i (rotl32 (bit-xor (aget w (- i 3)) (aget w (- i 8))
+                                   (aget w (- i 14)) (aget w (- i 16))) 1))
+        (recur (inc i))))
+    (loop [i 0, a (h 0), b (h 1), c (h 2), d (h 3), e (h 4)]
+      (if (< i 80)
+        (let [f (cond (< i 20) (bit-or (bit-and b c) (bit-and (bit-xor b 0xffffffff) d))
+                      (< i 40) (bit-xor b c d)
+                      (< i 60) (bit-or (bit-and b c) (bit-and b d) (bit-and c d))
+                      :else    (bit-xor b c d))
+              k (cond (< i 20) 0x5A827999 (< i 40) 0x6ED9EBA1 (< i 60) 0x8F1BBCDC :else 0xCA62C1D6)
+              t (bit-and 0xffffffff (+ (rotl32 a 5) f e k (aget w i)))]
+          (recur (inc i) t a (rotl32 b 30) c d))
+        (mapv #(bit-and 0xffffffff (+ %1 %2)) h [a b c d e])))))
+
+(defn- sha1
+  "SHA-1 of a byte array, as a seq of 20 unsigned bytes."
+  [^bytes bs]
+  (let [n (alength bs)
+        msg (-> (into [] (map #(bit-and 0xff (long %))) bs)
+                (conj 0x80)
+                (into (repeat (mod (- 55 n) 64) 0))
+                (into (map #(bit-and 0xff (unsigned-bit-shift-right (* 8 n) %)))
+                      [56 48 40 32 24 16 8 0]))
+        h (reduce (fn [h off] (sha1-block h (subvec msg off (+ off 64))))
+                  [0x67452301 0xEFCDAB89 0x98BADCFE 0x10325476 0xC3D2E1F0]
+                  (range 0 (count msg) 64))]
+    (mapcat (fn [x] (map #(bit-and 0xff (unsigned-bit-shift-right x %)) [24 16 8 0])) h)))
+
 ;; --- handshake ----------------------------------------------------------------
 
 (def ^:private guid "258EAFA5-E914-47DA-95CA-C5AB0DC85B11")
@@ -88,9 +133,7 @@
 (defn accept-token
   "RFC 6455 §4.2.2: base64(SHA1(key + GUID))."
   [ws-key]
-  (base64-encode
-    (map #(bit-and 0xff (long %))
-         (crypto/digest crypto/c-sha1 20 (str ws-key guid)))))
+  (base64-encode (vec (sha1 (.getBytes (str ws-key guid) "UTF-8")))))
 
 (defn valid-client-key?
   "RFC 6455 §4.1: Sec-WebSocket-Key is a base64-encoded 16-byte nonce.
