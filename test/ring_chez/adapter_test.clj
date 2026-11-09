@@ -393,6 +393,7 @@
 
 (def stream-abort-noticed (atom false))
 (def idle-stream-channel (atom nil))
+(def sse-quiet-channel (atom nil))
 
 (defn handler [{:keys [uri request-method query-string headers]}]
   (cond
@@ -436,6 +437,18 @@
         (sse/send! ch {:data "bye"})
         (a/close! ch))
       (sse/event-response ch))
+    ;; the README's shape: event maps put straight on the channel
+    (= uri "/sse-maps")
+    (let [events (a/chan)]
+      (a/go (a/>! events {:id 1 :event "greet" :data "hello\nworld"})
+            (a/>! events {:data "bye"})
+            (a/close! events))
+      (sse/event-response events))
+    (= uri "/sse-quiet")
+    (let [events (a/chan)]
+      (reset! sse-quiet-channel events)
+      (a/put! events {:data "first"})
+      (sse/event-response events))
     (= uri "/teapot") {:status 418 :headers {"Content-Type" "text/plain"} :body "teapot"}
     (= uri "/close-hdr") {:status 200 :headers {"Content-Type" "text/plain"
                                                 "Connection" "close"}
@@ -777,6 +790,49 @@
         (client-send fd "GET /echo?q=sse HTTP/1.1\r\nHost: t\r\n\r\n")
         (check-has "sse: conn reusable" "q=sse" (client-recv fd))
         (client-close fd))
+      ;; event maps put on the channel directly are formatted, not a dead stream
+      (let [fd (client-connect 8412 5000)]
+        (client-send fd "GET /sse-maps HTTP/1.1\r\nHost: t\r\n\r\n")
+        (let [r (client-recv-until fd "0\r\n\r\n")]
+          (check-has "sse maps: id field" "id: 1" r)
+          (check-has "sse maps: event field" "event: greet" r)
+          (check-has "sse maps: multi-line data split" "data: hello\r\ndata: world" r)
+          (check-has "sse maps: second event" "data: bye" r)
+          (check-has "sse maps: chunk terminator" "0\r\n\r\n" r))
+        (client-close fd))
+      ;; a client that leaves a quiet stream still closes the producer's channel:
+      ;; the next put is taken, the one after it finds the channel closed
+      (let [fd (client-connect 8412 5000)]
+        (client-send fd "GET /sse-quiet HTTP/1.1\r\nHost: t\r\n\r\n")
+        (check-has "sse quiet: first event arrived" "data: first" (client-recv-until fd "data: first"))
+        (client-close fd)
+        (Thread/sleep 2500)
+        (let [ch @sse-quiet-channel]
+          (a/>!! ch {:data "nobody"})
+          (Thread/sleep 200)
+          (check "sse quiet: producer's channel closed" false (a/>!! ch {:data "nobody"}))))
+      (finally (adapter/stop-server server)))))
+
+(defn test-stream-bad-chunk-reaches-on-failure []
+  ;; a chunk that is neither a string nor bytes cannot be framed once the head
+  ;; is out, so the connection closes; :on-failure is told why instead of the
+  ;; stream just stopping
+  (let [seen (promise)
+        server (adapter/run-server
+                (fn [_] {:status 200 :headers {"Content-Type" "text/plain"}
+                         :body (doto (a/chan 1) (a/put! {:not "a chunk"}))})
+                {:port 8599 :worker-threads 1
+                 :on-failure (fn [req t]
+                               (deliver seen [(:kind (:ring-chez/failure req)) (:type (ex-data t))])
+                               nil)})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8599 3000)]
+        (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+        (client-recv fd)
+        (client-close fd))
+      (check "bad chunk: on-failure saw a :stream failure"
+             [:stream :ring-chez/bad-chunk] (deref seen 3000 :never))
       (finally (adapter/stop-server server)))))
 
 ;; --- Phase 5: WebSocket ------------------------------------------------------
@@ -5404,6 +5460,7 @@
 
   ;; --- Phase 4 ---
   (run-test "test-sse" test-sse)
+  (run-test "test-stream-bad-chunk-reaches-on-failure" test-stream-bad-chunk-reaches-on-failure)
 
   ;; --- Phase 5 ---
   (run-test "test-websocket" test-websocket)

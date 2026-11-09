@@ -78,8 +78,10 @@ strategies run on macOS, Linux and Windows.
   arrives (below); the session's `:request` is that upgrade request
 - `:on-failure` — fn of `(request throwable)`, consulted for every abnormal
   handler completion: a handler throw, a `nil` response (which Ring defines
-  as an error), a `:ws-guard` throw, and post-101 websocket session throws
-  (observed after the handshake; the connection still closes). Return a
+  as an error), a `:ws-guard` throw, post-101 websocket session throws
+  (observed after the handshake; the connection still closes), and a stream
+  body that fails after the head is out, such as a channel chunk that is not
+  a string or byte array (observed; the connection closes). Return a
   response map (with `:status`) to serve it — keep-alive survives — or
   throw/return nil for the plain `500 Internal Server Error`. The hook gets
   one attempt and the worker always survives. `nil` responses arrive tagged
@@ -338,7 +340,7 @@ What went wrong is on the request the hook receives, under
 `:ring-chez/failure`:
 
 ```clojure
-{:kind :timeout        ; :crash :nil-response :timeout :ws-guard :ws-session
+{:kind :timeout        ; :crash :nil-response :timeout :ws-guard :ws-session :stream
  :elapsed-ms 60003}    ; :timeout only
 ```
 
@@ -547,17 +549,21 @@ next put return `false` instead of hanging.
 data splits on `\n`, `\r\n`, or `\r` into one `data:` line each:
 
 ```clojure
-(require '[ring-chez.sse :as sse])
+(require '[ring-chez.sse :as sse]
+         '[clojure.core.async :as async])
 (fn [req]
-  (sse/event-response
+  (let [events (async/chan)]
     (async/go (async/>! events {:id 1 :event "greet" :data "hello\nworld"})
               (async/>! events {:data "bye"})
-              (async/close! events))))
+              (async/close! events))
+    (sse/event-response events)))
 ```
 
-Each channel value is one event (`:id`, `:event`, `:retry` optional). Responses
-carry `Content-Type: text/event-stream` + `Cache-Control: no-cache`, chunked.
-`sse/send!` takes a channel and an event map directly for custom loops.
+Each channel value is one event: a map (`:data`, with `:id`, `:event`,
+`:retry` optional) or a string already formatted by `sse/format-event`.
+Responses carry `Content-Type: text/event-stream` + `Cache-Control: no-cache`,
+chunked. `sse/send!` formats an event map and puts it on a channel, blocking,
+for loops on a thread or future; it returns false once the client has gone.
 
 ## WebSocket
 

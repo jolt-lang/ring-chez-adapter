@@ -656,6 +656,19 @@
                            (update resp :headers #(assoc (or % {}) "Connection" "close"))
                            resp)]
                 (let [reusable (try (http/send-response conn request resp (:take! io) send!)
+                                    ;; a throw while the body goes out (a stream
+                                    ;; chunk that is not a string or bytes)
+                                    ;; comes after the head, so there is no
+                                    ;; response left to give and the connection
+                                    ;; closes; on-failure still observes it
+                                    ;; rather than the stream just stopping
+                                    (catch Throwable t
+                                      (try (when on-failure
+                                             (on-failure (assoc request :ring-chez/failure
+                                                                {:kind :stream})
+                                                         t))
+                                           (catch Throwable _ nil))
+                                      (throw t))
                                     (finally (swap! (:active stats) dec)))]
                   (when reusable (recur (:leftover r)))))))
           :else nil))))))
