@@ -20,19 +20,17 @@
  ;; jolt-crypto (AES/HMAC/SecureRandom over OpenSSL) rides along so an app that
  ;; wraps its handler with ring-defaults — whose session + CSRF middleware needs
  ;; javax.crypto — just has to (require 'jolt.crypto); no separate dep. Nothing
- ;; here requires it (the websocket handshake does its own SHA-1), but jolt
- ;; loads a dependency's :jolt/native at startup whether or not its namespaces
- ;; are required, and v0.2.0 declares OpenSSL as required: a server built on
- ;; this pin still opens OpenSSL at startup and won't start without it. That
- ;; goes once the pin moves to a release with jolt-lang/crypto#18 (:optional).
+ ;; here requires it (the websocket handshake does its own SHA-1), and since
+ ;; v0.2.1 its OpenSSL natives are :optional, so a plain server starts on a host
+ ;; without OpenSSL.
  ;;
  ;; jolt-lang/multipart is the RFC 7578 parser under ring-chez.middleware.multipart.
  :deps {jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/crypto"
-                               :git/tag "v0.2.0"
-                               :git/sha "e6981b853adc543120b785a0c29b6d7d6a10f0fe"}
+                               :git/tag "v0.2.1"
+                               :git/sha "b9c64853243750ee65815144adfb69cc7ccacfe8"}
         jolt-lang/multipart {:git/url "https://github.com/jolt-lang/multipart"
-                             :git/tag "v0.1.1"
-                             :git/sha "ca51dd47aff27dac3cc09557682e82ec63720310"}}
+                             :git/tag "v0.1.3"
+                             :git/sha "4c9326ab7a88d4551f20c77b4135bfde4d6308a5"}}
 
  ;; The test drives the server with the jolt-lang/http-client library (jolt no
  ;; longer ships a built-in HTTP client). v0.0.4 or newer matters here: earlier
