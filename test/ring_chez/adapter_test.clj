@@ -18,7 +18,8 @@
             [ring-chez.http]
             [jolt.socket.native :as native]
             [jolt.io-poller :as poller]
-            [jolt.process]))
+            [jolt.process]
+            [clojure.java.shell]))
 
 (defn- gunzip
   "Test oracle: the runtime's own java.util.zip, a separate implementation from
@@ -836,6 +837,29 @@
       (finally (adapter/stop-server server)))))
 
 ;; --- Phase 5: WebSocket ------------------------------------------------------
+
+;; The handshake's SHA-1 is computed here rather than by jolt.crypto, so a server
+;; never opens OpenSSL unless it serves :tls.
+(defn test-ws-sha1 []
+  (let [sha1 #'ring-chez.websocket/sha1
+        hex (fn [s] (apply str (map #(format "%02x" %) (sha1 (.getBytes ^String s "UTF-8")))))]
+    (check "sha1 of empty" "da39a3ee5e6b4b0d3255bfef95601890afd80709" (hex ""))
+    (check "sha1 of abc" "a9993e364706816aba3e25717850c26c9cd0d89d" (hex "abc"))
+    (check "sha1 of the two-block FIPS vector" "84983e441c3bd26ebaae4aa1f95129e5e54670f1"
+           (hex "abcdbcdecdefdefgefghfghighijhijkijkljklmklmnlmnomnopnopq"))
+    (check "sha1 of a million a's" "34aa973cd4c4daa4f61eeb2bdbad27316534016f"
+           (hex (apply str (repeat 1000000 \a))))
+    (check "RFC 6455 accept token" "s3pPLMBiTxaQ9kYGzzhZRbK+xOo="
+           (ws/accept-token "dGhlIHNhbXBsZSBub25jZQ=="))))
+
+(defn test-plain-server-does-not-load-crypto []
+  (let [{:keys [out err exit]}
+        (clojure.java.shell/sh
+          "jolt" "-M" "-e"
+          "(require 'ring-chez.adapter) (prn (some? (find-ns 'jolt.crypto)))"
+          :dir (or (System/getenv "JOLT_PWD") (System/getProperty "user.dir")))]
+    (check (str "requiring the adapter leaves jolt.crypto unloaded " (str/trim (str err)))
+           [0 "false"] [exit (str/trim out)])))
 
 (defn test-websocket []
   (let [server (adapter/run-server handler
@@ -5463,6 +5487,8 @@
   (run-test "test-stream-bad-chunk-reaches-on-failure" test-stream-bad-chunk-reaches-on-failure)
 
   ;; --- Phase 5 ---
+  (run-test "test-ws-sha1" test-ws-sha1)
+  (run-test "test-plain-server-does-not-load-crypto" test-plain-server-does-not-load-crypto)
   (run-test "test-websocket" test-websocket)
 
   ;; --- Phase 6 ---

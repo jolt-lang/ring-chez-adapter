@@ -19,8 +19,12 @@
 
  ;; jolt-crypto (AES/HMAC/SecureRandom over OpenSSL) rides along so an app that
  ;; wraps its handler with ring-defaults — whose session + CSRF middleware needs
- ;; javax.crypto — just has to (require 'jolt.crypto); no separate dep. It's not
- ;; required here, so a plain adapter server doesn't pull in OpenSSL.
+ ;; javax.crypto — just has to (require 'jolt.crypto); no separate dep. Nothing
+ ;; here requires it (the websocket handshake does its own SHA-1), but jolt
+ ;; loads a dependency's :jolt/native at startup whether or not its namespaces
+ ;; are required, and v0.2.0 declares OpenSSL as required: a server built on
+ ;; this pin still opens OpenSSL at startup and won't start without it. That
+ ;; goes once the pin moves to a release with jolt-lang/crypto#18 (:optional).
  ;;
  ;; jolt-lang/multipart is the RFC 7578 parser under ring-chez.middleware.multipart.
  :deps {jolt-lang/jolt-crypto {:git/url "https://github.com/jolt-lang/crypto"
