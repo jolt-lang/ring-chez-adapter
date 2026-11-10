@@ -30,7 +30,7 @@
 
    `:status` (default 503) sets the status. `:retryable?` is a predicate of
    the failure kind (`:crash`, `:nil-response`, `:timeout`, `:ws-guard`,
-   `:ws-session`); the default calls a timeout retryable and a crash not,
+   `:ws-session`, `:stream`); the default calls a timeout retryable and a crash not,
    since a handler that threw on this input will throw on it again.
 
    For anything richer, write your own `(fn [request throwable] ...)` — this
