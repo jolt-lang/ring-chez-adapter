@@ -5,6 +5,8 @@
             [ring-chez.middleware.multipart :as multipart]
             [ring-chez.multipart.core :as rc-mp]
             [ring-chez.middleware.gzip :as gzip]
+            [ring-chez.middleware.compress :as compress]
+            [ring-chez.zstd :as zstd]
             [ring-chez.middleware.static :as static]
             [ring-chez.middleware.proxy :as proxy]
             [ring-chez.websocket :as ws]
@@ -2120,6 +2122,132 @@
             [view _] (gzip-get fd "/etag" nil)]
         (check-has "gzip: plain etag unchanged" "ETag: \"abc123\"" view)
         (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+;; --- zstd ----------------------------------------------------------------------
+;; The oracle is the zstd command-line tool reading a whole frame, a separate
+;; program from ring-chez.zstd. It refuses to print anything from a truncated
+;; frame, so the "decodable on arrival" check uses ring-chez.zstd's own
+;; decoder over a prefix of the stream.
+
+(defn- unzstd
+  "Decode a complete zstd frame with the zstd CLI."
+  [^bytes bs]
+  (let [f (java.io.File/createTempFile "rc-zstd" ".zst")]
+    (try
+      (with-open [o (io/output-stream f)] (.write o bs))
+      (let [{:keys [exit out err]} (clojure.java.shell/sh "zstd" "-dc" (str f))]
+        (if (zero? exit) out (str "zstd failed: " err)))
+      (finally (.delete f)))))
+
+(def ^:private zstd-cli?
+  (delay (try (zero? (:exit (clojure.java.shell/sh "zstd" "--version")))
+              (catch Throwable _ false))))
+
+(defn test-zstd-library []
+  (check "zstd: library bound" true (zstd/available?))
+  (let [raw (.getBytes ^String gzip-text "UTF-8")
+        z   (zstd/compress raw)]
+    (check "zstd: compresses" true (< (alength z) (quot (alength raw) 10)))
+    (check "zstd: decompress round-trips" gzip-text
+           (String. ^bytes (zstd/decompress z) "UTF-8"))
+    (when @zstd-cli?
+      (check "zstd: CLI decodes it" gzip-text (unzstd z))))
+  ;; levels past 19 need windows beyond the 8 MB HTTP decoders must accept
+  (check "zstd: ultra levels refused" :threw
+         (try (zstd/compressor {:level 22}) (catch Throwable _ :threw)))
+  (check "zstd: window over 2^23 refused" :threw
+         (try (zstd/compressor {:window-log 24}) (catch Throwable _ :threw)))
+  ;; the reason for zstd on a stream: a re-render that repeats a page bigger
+  ;; than deflate's 32 KB window costs almost nothing
+  (let [page (apply str (for [i (range 1500)]
+                          (str "<li data-id=\"" (* i 7919) "\">row " i " " (hash i) "</li>")))
+        c    (zstd/compressor {})
+        a    (zstd/compress-chunk! c (.getBytes ^String page "UTF-8"))
+        b    (zstd/compress-chunk! c (.getBytes ^String (str page "x") "UTF-8"))
+        end  (zstd/compress-finish! c)]
+    (check "zstd stream: second render under 100 octets" true (< (alength ^bytes b) 100))
+    (check "zstd stream: first chunk decodable alone" page
+           (String. ^bytes (zstd/decompress a) "UTF-8"))
+    (check "zstd stream: whole stream round-trips" (str page page "x")
+           (String. ^bytes (zstd/decompress (byte-array (concat a b end))) "UTF-8"))
+    (check "zstd stream: finish released it" :threw
+           (try (zstd/compress-chunk! c (byte-array 1)) (catch Throwable _ :threw)))))
+
+(defn test-zstd-negotiation []
+  (let [server (adapter/run-server (compress/wrap-compress gzip-test-handler) {:port 8610})]
+    (try
+      (Thread/sleep 250)
+      (let [coding (fn [ae]
+                     (let [fd (client-connect 8610 5000)
+                           [view _] (gzip-get fd path-big ae)]
+                       (client-close fd)
+                       (second (re-find #"(?i)Content-Encoding: (\S+)" view))))]
+        (check "compress: none asked" nil (coding nil))
+        (check "compress: zstd" "zstd" (coding "zstd"))
+        (check "compress: gzip only" "gzip" (coding "gzip"))
+        ;; equal q: the server's preference, zstd first
+        (check "compress: browser list prefers zstd" "zstd" (coding "gzip, deflate, br, zstd"))
+        (check "compress: client q wins" "gzip" (coding "zstd;q=0.5, gzip"))
+        (check "compress: zstd;q=0 refused" "gzip" (coding "zstd;q=0, gzip"))
+        (check "compress: wildcard" "zstd" (coding "*"))
+        (check "compress: explicit q=0 beats wildcard" "gzip" (coding "*, zstd;q=0"))
+        (check "compress: nothing acceptable" nil (coding "br")))
+      (let [fd (client-connect 8610 5000)
+            [view body] (gzip-get fd "/etag" "zstd")]
+        (check-has "compress: zstd etag distinct" "ETag: \"abc123-zst\"" view)
+        (check-has "compress: zstd Vary" "Vary: Accept-Encoding" view)
+        (check "compress: zstd body round-trips" gzip-text
+               (String. ^bytes (zstd/decompress body) "UTF-8"))
+        (when @zstd-cli?
+          (check "compress: zstd body CLI-decodable" gzip-text (unzstd body)))
+        ;; framing still right on the next response of this connection
+        (let [[view2 body2] (gzip-get fd "/small" "zstd")]
+          (check-has "compress: connection still framed" "200 OK" view2)
+          (check "compress: next body intact" "tiny" (String. ^bytes body2 "UTF-8")))
+        (client-close fd))
+      (finally (adapter/stop-server server))))
+  ;; wrap-gzip stays gzip-only
+  (let [server (adapter/run-server (gzip/wrap-gzip gzip-test-handler) {:port 8611})]
+    (try
+      (Thread/sleep 250)
+      (let [fd (client-connect 8611 5000)
+            [view _] (gzip-get fd path-big "zstd")]
+        (check "wrap-gzip: never zstd" false (str/includes? view "Content-Encoding"))
+        (client-close fd))
+      (finally (adapter/stop-server server)))))
+
+(defn test-zstd-stream []
+  (let [server (adapter/run-server (compress/wrap-compress gzip-test-handler) {:port 8612})]
+    (try
+      (Thread/sleep 250)
+      (let [fd  (client-connect 8612 5000)
+            _   (client-send fd "GET /events HTTP/1.1\r\nHost: t\r\nAccept-Encoding: zstd\r\n\r\n")
+            raw (client-recv-until-bytes fd "\r\n0\r\n\r\n")
+            view (latin1 raw)
+            body (java.util.Arrays/copyOfRange raw (+ 4 (str/index-of view "\r\n\r\n")) (alength raw))
+            parts (chunk-parts body)
+            plain (apply str gzip-events)]
+        (check-has "zstd stream: Content-Encoding" "Content-Encoding: zstd" view)
+        (check-has "zstd stream: still chunked" "Transfer-Encoding: chunked" view)
+        (check "zstd stream: one chunk per event plus the epilogue" 4 (count parts))
+        ;; flushed: the first chunk alone decodes to the first event
+        (check "zstd stream: first event decodable on arrival" (first gzip-events)
+               (String. ^bytes (zstd/decompress (first parts)) "UTF-8"))
+        (check "zstd stream: repeats are cheap" true
+               (< (* 10 (alength ^bytes (nth parts 1))) (alength ^bytes (first parts))))
+        (check "zstd stream: round-trips" plain
+               (String. ^bytes (zstd/decompress (dechunk body)) "UTF-8"))
+        (when @zstd-cli?
+          (check "zstd stream: CLI-decodable" plain (unzstd (dechunk body))))
+        (client-close fd))
+      (reset! gzip-producer-stopped false)
+      (let [fd (client-connect 8612 5000)]
+        (client-send fd "GET /events-forever HTTP/1.1\r\nHost: t\r\nAccept-Encoding: zstd\r\n\r\n")
+        (client-recv-until-bytes fd "\r\n\r\n")
+        (client-close fd)
+        (Thread/sleep 1500)
+        (check "zstd stream: producer told the client left" true @gzip-producer-stopped))
       (finally (adapter/stop-server server)))))
 
 ;; --- Wave 2 round 3: multipart uploads -------------------------------------------
@@ -5543,6 +5671,9 @@
   (run-test "test-gzip-skips" test-gzip-skips)
   (run-test "test-gzip-etag" test-gzip-etag)
   (run-test "test-gzip-stream" test-gzip-stream)
+  (run-test "test-zstd-library" test-zstd-library)
+  (run-test "test-zstd-negotiation" test-zstd-negotiation)
+  (run-test "test-zstd-stream" test-zstd-stream)
 
   ;; --- Wave 2 round 3: multipart uploads ---
   (run-test "test-multipart-upload" test-multipart-upload)

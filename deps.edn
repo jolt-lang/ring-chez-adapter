@@ -15,7 +15,15 @@
  :jolt/native [{:name "z" :optional true
                 :darwin  ["libz.dylib" "/usr/lib/libz.dylib"]
                 :linux   ["libz.so.1" "libz.so"]
-                :windows ["zlib1.dll" "zlib.dll"]}]
+                :windows ["zlib1.dll" "zlib.dll"]}
+               ;; zstd backs ring-chez.zstd (zstd Content-Encoding). Optional
+               ;; the same way: without it wrap-compress just offers gzip.
+               ;; macOS ships none; Homebrew's lives outside dlopen's path.
+               {:name "zstd" :optional true
+                :darwin  ["libzstd.1.dylib" "/opt/homebrew/lib/libzstd.1.dylib"
+                          "/usr/local/lib/libzstd.1.dylib"]
+                :linux   ["libzstd.so.1" "libzstd.so"]
+                :windows ["libzstd.dll" "zstd.dll"]}]
 
  ;; jolt-crypto (AES/HMAC/SecureRandom over OpenSSL) rides along so an app that
  ;; wraps its handler with ring-defaults — whose session + CSRF middleware needs

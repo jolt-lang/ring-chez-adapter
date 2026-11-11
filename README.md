@@ -461,6 +461,56 @@ zlib is bound lazily, from the running process first (the Chez runtime links
 one) and only then from a shared object. Where it cannot be bound the
 middleware is a no-op: uncompressed is always a correct answer.
 
+### zstd
+
+`ring-chez.middleware.compress/wrap-compress` offers zstd (RFC 8878) and gzip,
+picking whichever the client weighs highest; on a tie zstd wins, so a browser
+sending `gzip, deflate, br, zstd` gets zstd. Everything above about gzip
+(`:min-size`, `:types`, `Vary`, ETags — `-zst` here — and flushed channel
+streams) applies to both.
+
+```clojure
+(require '[ring-chez.middleware.compress :as compress])
+(def app (compress/wrap-compress handler))
+(def app (compress/wrap-compress handler {:zstd {:level -1 :window-log 18}}))
+```
+
+zstd matters most on streams. deflate matches at most 258 octets at a time from
+at most 32 KB back, so once a re-rendered page outgrows that, each render costs
+nearly its full compressed size again. zstd's window reaches back as far as you
+let it. Measured re-sending a 98 KB page plus one changed octet on one stream:
+gzip 21,301 octets, zstd 25.
+
+Options, under `:zstd`:
+
+- `:level`: from zstd's minimum (negative is faster) up to 19. Default 1.
+  Levels 20 and up need windows larger than HTTP allows, so they are refused.
+- `:window-log`: 10..23, the window as a power of two. Default 19 (512 KB).
+  For streams, aim for 3-4x a typical uncompressed message, so the previous
+  message is still in reach. 23 (8 MB) is the most a browser accepts (RFC
+  9659). For a whole body the window shrinks to fit it anyway.
+
+Each open stream holds its compressor: ~1.4 MB of native memory at the
+defaults, ~1 MB at window-log 17. An invalid setting throws when the middleware
+is built. `:encodings` (default `["zstd" "gzip"]`) sets what is offered and in
+what order; `wrap-gzip` is `wrap-compress` with `["gzip"]`.
+
+zstd comes from the system libzstd (`libzstd1` on Debian/Ubuntu, `brew install
+zstd` on macOS), declared as an optional `:jolt/native`. Without it zstd is
+not offered and gzip still is. `ring-chez.zstd` has the compressor directly:
+
+```clojure
+(require '[ring-chez.zstd :as zstd])
+(when-let [c (zstd/compressor {:level 1 :window-log 19})]
+  (zstd/compress-chunk! c (.getBytes "first event" "UTF-8"))   ; flushed octets
+  (zstd/compress-finish! c))                                   ; epilogue; releases c
+(zstd/compress (.getBytes "whole body" "UTF-8"))               ; one frame, or nil
+(zstd/decompress frame-bytes)                                  ; also decodes a flushed prefix
+```
+
+Static files (`ring-chez.middleware.static`) still cache and serve only a gzip
+copy.
+
 ### Static files
 
 `ring.middleware.file` runs under jolt, but it stats and re-opens the file on
