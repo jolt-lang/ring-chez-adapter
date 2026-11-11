@@ -16,6 +16,7 @@
             [jolt.ffi :as ffi]
             [ring-chez.socket :as socket]
             [ring-chez.http]
+            [ring-chez.tls]
             [jolt.socket.native :as native]
             [jolt.io-poller :as poller]
             [jolt.process]
@@ -3293,6 +3294,40 @@
                    (tls-read-until st #(str/includes? % good-name)))
         (finally (tls-close st) (adapter/stop-server server))))))
 
+;; every request on a kept-alive connection carries the certificate, not just the first
+(defn test-tls-client-auth-keep-alive []
+  (doseq [strategy [:threads :fibers]]
+    (let [label (str "mtls " (name strategy) " keep-alive: ")
+          server (adapter/run-server mtls-handler {:port 0 :strategy strategy
+                                                   :tls (mtls-opts :need)})
+          st (client-tls/tls-connect "127.0.0.1" (:port server) true 5000 nil (:good @mtls-pki))]
+      (try
+        (tls-write st "GET /1 HTTP/1.1\r\nHost: x\r\n\r\n")
+        (check-has (str label "first request has the cert") good-name
+                   (tls-read-until st #(str/includes? % good-name)))
+        (tls-write st "GET /2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        (check-has (str label "second request has the cert") good-name
+                   (tls-read-until st (constantly false)))
+        (finally (tls-close st) (adapter/stop-server server))))))
+
+;; a certificate that verified but can't be handed on is a server fault, not silence
+(defn test-tls-client-auth-peer-cert-fault []
+  (doseq [strategy [:threads :fibers]]
+    (let [label (str "mtls " (name strategy) " peer-cert fault: ")
+          server (adapter/run-server mtls-handler {:port 0 :strategy strategy
+                                                   :tls (mtls-opts :need)})
+          port (:port server)]
+      (try
+        (with-redefs [ring-chez.tls/peer-certificate (fn [_] (throw (ex-info "no parse" {})))]
+          (check (str label "the client gets no answer") :failed (mtls-get port (:good @mtls-pki))))
+        (Thread/sleep 100)
+        (let [st (adapter/server-stats server)]
+          (check (str label "reported as a fault") :tls-peer-cert (:kind (:last-fault st)))
+          (check (str label "counted once") 1 (:faults st)))
+        (check (str label "serves afterwards") (str "cert:" good-name)
+               (mtls-body (mtls-get port (:good @mtls-pki))))
+        (finally (adapter/stop-server server))))))
+
 (defn- tls-refusal
   "The message run-server refused tls with, or :accepted."
   [tls]
@@ -3322,6 +3357,10 @@
              (assoc tls-opts :client-auth :need :client-ca-file "test/fixtures/tls/key.pem"))
     (refused ":client-ca-file alone" ":client-ca-file does nothing without :client-auth"
              (assoc tls-opts :client-ca-file ca))
+    (refused ":client-ca-file with :client-auth false" ":client-ca-file does nothing without :client-auth"
+             (assoc tls-opts :client-auth false :client-ca-file ca))
+    (check "mtls options: :client-auth false is off" :accepted
+           (tls-refusal (assoc tls-opts :client-auth false)))
     (check "mtls options: :need accepted" :accepted (tls-refusal (mtls-opts :need)))
     (check "mtls options: :want accepted" :accepted (tls-refusal (mtls-opts :want)))))
 
@@ -5859,6 +5898,8 @@
   (run-test "test-tls-client-auth-threads" test-tls-client-auth-threads)
   (run-test "test-tls-client-auth-fibers" test-tls-client-auth-fibers)
   (run-test "test-tls-client-auth-ws" test-tls-client-auth-ws)
+  (run-test "test-tls-client-auth-keep-alive" test-tls-client-auth-keep-alive)
+  (run-test "test-tls-client-auth-peer-cert-fault" test-tls-client-auth-peer-cert-fault)
   (run-test "test-tls-client-auth-options" test-tls-client-auth-options)
   (run-test "test-tls-unclaimed-gets-no-plaintext" test-tls-unclaimed-gets-no-plaintext)
   (run-test "test-handler-on-fiber" test-handler-on-fiber)

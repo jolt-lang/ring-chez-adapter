@@ -839,7 +839,11 @@
       (reset! (:serving? entry) true)
       (when deadline (reset! deadline by))
       (serve-tls conn io by (fn [io peer]
-                              (serve-connection conn (merge conn-info peer) cfg io deadline entry))))
+                              ;; a client that passed verification but whose certificate
+                              ;; can't be handed on gets no answer, and the operator a fault
+                              (if-let [t (:ring-chez.tls/peer-error peer)]
+                                ((:fault! cfg) :tls-peer-cert t)
+                                (serve-connection conn (merge conn-info peer) cfg io deadline entry)))))
     (serve-connection conn conn-info cfg io deadline entry)))
 
 (defn- worker

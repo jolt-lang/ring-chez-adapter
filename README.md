@@ -669,7 +669,8 @@ certificate request, so a client holding several certificates can pick the right
   none and still be served.
 
 A certificate that doesn't verify fails the handshake under either setting. Without
-`:client-auth` no certificate is asked for, which is how it was before. Either key on
+`:client-auth` (or with `nil` or `false`) no certificate is asked for, which is how it
+was before. Either key on
 its own throws at `run-server`, as do a `:client-auth` other than `:need` or `:want`
 and a CA file that is missing or that OpenSSL can't read. A `:client-ca-file` alone
 would look like it protects the server while asking no client for anything.
@@ -677,7 +678,9 @@ would look like it protects the server while asking no client for anything.
 When a client did present a verified certificate, the request carries it as
 `:ssl-client-cert`, a `java.security.cert.X509Certificate`, the key the Ring spec
 names. A websocket session gets it on its `:request` too. Without one the key is
-absent rather than nil.
+absent rather than nil. A certificate that verified but can't be turned into an
+`X509Certificate` gets the client no answer, and the server counts it as a
+`:tls-peer-cert` fault (see `:faults` above).
 
 ```clojure
 (defn handler [request]

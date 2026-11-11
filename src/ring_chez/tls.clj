@@ -134,7 +134,8 @@
   mean. A trust store alone asks no client for anything, so it is refused rather
   than read as :need: the config would otherwise look like it protects the server."
   [{:keys [client-auth client-ca-file]}]
-  (when (and (some? client-auth) (not (#{:need :want} client-auth)))
+  ;; nil and false both mean off, as a config layer may write either
+  (when (and client-auth (not (#{:need :want} client-auth)))
     (throw (refuse ":client-auth must be :need or :want" client-auth)))
   (when (and client-auth (nil? client-ca-file))
     (throw (refuse ":client-auth needs :client-ca-file, the PEM CAs client certificates must chain to"
@@ -154,6 +155,8 @@
   ;; resolves to the system LibreSSL's, which must never see an OpenSSL SSL
   (when-not (ffi/find-symbol "SSL_get1_peer_certificate")
     (throw (refuse ":client-auth needs OpenSSL 3 (no SSL_get1_peer_certificate)" client-auth)))
+  ;; so last-error reports this file's trouble, not something queued earlier
+  (c-ERR-clear-error)
   (when-not (= 1 (with-path client-ca-file #(c-SSL-CTX-load-verify-locations ctx % ffi/null)))
     (throw (refuse (str "cannot use client CA file " client-ca-file ": " (last-error)) client-ca-file)))
   (let [names (with-path client-ca-file c-SSL-load-client-CA-file)]
@@ -186,7 +189,11 @@
       (throw (refuse (str "file does not exist: " path) path))))
   ;; the peer certificate reaches the handler as a java.security.cert.X509Certificate,
   ;; which jolt-crypto provides; only a server that asks for one loads it
-  (when client-auth (require 'jolt.crypto))
+  (when client-auth
+    (try (require 'jolt.crypto)
+         (catch Throwable t
+           (throw (refuse (str ":client-auth needs jolt-crypto for :ssl-client-cert: " (ex-message t))
+                          client-auth)))))
   (let [ctx (c-SSL-CTX-new (c-TLS-server-method))]
     (when (ffi/null? ctx) (throw (refuse (str "SSL_CTX_new failed: " (last-error)) opts)))
     (try
@@ -403,7 +410,9 @@
   io is a strategy's: :recv!, :idle-recv! if it has one, :write-raw! for octets at a
   pointer, :take-via! for a channel take with a say on whether the peer is gone.
   serve-conn gets the plaintext io and what the handshake learned about the peer:
-  {:ssl-client-cert cert} when it presented a verified certificate, else {}."
+  {:ssl-client-cert cert} when it presented a verified certificate, else {}. If the
+  certificate can't be read, serve-conn gets {::peer-error throwable} instead and
+  decides what to do; the connection closes either way once it returns."
   [ctx conn io deadline-ms serve-conn]
   (let [st (open-conn ctx)
         raw-recv! (:recv! io)
@@ -437,7 +446,9 @@
                                                  #(blocking-recv conn %) send!))
                                  :write! (fn [p n] (write! st p n send!))})))
          ;; only a server that asked can have one, and only it needs OpenSSL 3
-         (if-let [cert (when (pos? (c-SSL-CTX-get-verify-mode ctx)) (peer-certificate st))]
-           {:ssl-client-cert cert}
-           {})))
+         (try
+           (if-let [cert (when (pos? (c-SSL-CTX-get-verify-mode ctx)) (peer-certificate st))]
+             {:ssl-client-cert cert}
+             {})
+           (catch Throwable t {::peer-error t}))))
       (finally (close! st conn)))))
