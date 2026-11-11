@@ -62,6 +62,15 @@
 ;; A client asking to renegotiate is CPU it can spend at will, and no HTTP client
 ;; needs to.
 (def ^:private OP-NO-RENEGOTIATION 0x40000000)
+;; ssl.h: SSL_VERIFY_PEER asks for a client certificate and verifies one that comes;
+;; SSL_VERIFY_FAIL_IF_NO_PEER_CERT makes not sending one fail the handshake too.
+(def ^:private VERIFY-PEER 0x01)
+(def ^:private VERIFY-FAIL-IF-NO-PEER-CERT 0x02)
+(def ^:private X509-V-OK 0)
+;; Once a server verifies its peers, OpenSSL refuses to resume a session that has no
+;; id context, so every client that came back would fail instead of resuming. Any
+;; constant names this server's sessions; at most SSL_MAX_SID_CTX_LENGTH (32) octets.
+(def ^:private SESSION-ID-CONTEXT "ring-chez")
 
 (ffi/defcfn c-TLS-server-method "TLS_server_method" [] :pointer)
 (ffi/defcfn c-SSL-CTX-new "SSL_CTX_new" [:pointer] :pointer)
@@ -71,6 +80,16 @@
 (ffi/defcfn c-SSL-CTX-use-chain "SSL_CTX_use_certificate_chain_file" [:pointer :pointer] :int)
 (ffi/defcfn c-SSL-CTX-use-key "SSL_CTX_use_PrivateKey_file" [:pointer :pointer :int] :int)
 (ffi/defcfn c-SSL-CTX-check-key "SSL_CTX_check_private_key" [:pointer] :int)
+(ffi/defcfn c-SSL-CTX-load-verify-locations "SSL_CTX_load_verify_locations" [:pointer :pointer :pointer] :int)
+(ffi/defcfn c-SSL-load-client-CA-file "SSL_load_client_CA_file" [:pointer] :pointer)
+(ffi/defcfn c-SSL-CTX-set-client-CA-list "SSL_CTX_set_client_CA_list" [:pointer :pointer] :void)
+(ffi/defcfn c-SSL-CTX-set-verify "SSL_CTX_set_verify" [:pointer :int :pointer] :void)
+(ffi/defcfn c-SSL-CTX-get-verify-mode "SSL_CTX_get_verify_mode" [:pointer] :int)
+(ffi/defcfn c-SSL-CTX-set-session-id-context "SSL_CTX_set_session_id_context" [:pointer :pointer :uint] :int)
+(ffi/defcfn c-SSL-get1-peer-certificate "SSL_get1_peer_certificate" [:pointer] :pointer)
+(ffi/defcfn c-SSL-get-verify-result "SSL_get_verify_result" [:pointer] :long)
+(ffi/defcfn c-i2d-X509 "i2d_X509" [:pointer :pointer] :int)
+(ffi/defcfn c-X509-free "X509_free" [:pointer] :void)
 (ffi/defcfn c-SSL-new "SSL_new" [:pointer] :pointer)
 (ffi/defcfn c-SSL-free "SSL_free" [:pointer] :void)
 (ffi/defcfn c-SSL-set-bio "SSL_set_bio" [:pointer :pointer :pointer] :void)
@@ -110,17 +129,64 @@
   (let [p (ffi/string->ptr path)]
     (try (f p) (finally (ffi/free p)))))
 
+(defn- check-client-auth
+  "Refuse a client-certificate setup that is incomplete or says something it can't
+  mean. A trust store alone asks no client for anything, so it is refused rather
+  than read as :need: the config would otherwise look like it protects the server."
+  [{:keys [client-auth client-ca-file]}]
+  (when (and (some? client-auth) (not (#{:need :want} client-auth)))
+    (throw (refuse ":client-auth must be :need or :want" client-auth)))
+  (when (and client-auth (nil? client-ca-file))
+    (throw (refuse ":client-auth needs :client-ca-file, the PEM CAs client certificates must chain to"
+                   client-auth)))
+  (when (some? client-ca-file)
+    (when-not (string? client-ca-file)
+      (throw (refuse ":client-ca-file must name a PEM file" client-ca-file)))
+    (when-not client-auth
+      (throw (refuse ":client-ca-file does nothing without :client-auth :need or :want"
+                     client-ca-file)))))
+
+(defn- use-client-auth!
+  "Ask every client for a certificate that chains to client-ca-file, naming those CAs
+  in the request. :need fails a handshake without one, :want lets it through."
+  [ctx {:keys [client-auth client-ca-file]}]
+  ;; OpenSSL 1.1 has only SSL_get_peer_certificate, and on macOS that name also
+  ;; resolves to the system LibreSSL's, which must never see an OpenSSL SSL
+  (when-not (ffi/find-symbol "SSL_get1_peer_certificate")
+    (throw (refuse ":client-auth needs OpenSSL 3 (no SSL_get1_peer_certificate)" client-auth)))
+  (when-not (= 1 (with-path client-ca-file #(c-SSL-CTX-load-verify-locations ctx % ffi/null)))
+    (throw (refuse (str "cannot use client CA file " client-ca-file ": " (last-error)) client-ca-file)))
+  (let [names (with-path client-ca-file c-SSL-load-client-CA-file)]
+    (when (ffi/null? names)
+      (throw (refuse (str "cannot read CA names from " client-ca-file ": " (last-error)) client-ca-file)))
+    ;; the ctx owns the list from here
+    (c-SSL-CTX-set-client-CA-list ctx names))
+  (when-not (= 1 (with-path SESSION-ID-CONTEXT
+                   #(c-SSL-CTX-set-session-id-context ctx % (count SESSION-ID-CONTEXT))))
+    (throw (refuse (str "SSL_CTX_set_session_id_context failed: " (last-error)) client-auth)))
+  (c-SSL-CTX-set-verify ctx (if (= :need client-auth)
+                              (bit-or VERIFY-PEER VERIFY-FAIL-IF-NO-PEER-CERT)
+                              VERIFY-PEER)
+                        ffi/null))
+
 (defn make-context
   "A server SSL_CTX from {:cert-file :key-file}, both PEM; :cert-file may hold the
   whole chain, leaf first. Throws, naming what is wrong, rather than let every
-  handshake fail later. TLS 1.2 is the floor. free-context releases it."
-  [{:keys [cert-file key-file] :as opts}]
+  handshake fail later. TLS 1.2 is the floor. free-context releases it.
+
+  :client-auth :need or :want, with :client-ca-file (PEM CAs), verifies client
+  certificates; serve then hands the verified one on as :ssl-client-cert."
+  [{:keys [cert-file key-file client-auth client-ca-file] :as opts}]
   (when-not (map? opts) (throw (refuse "must be a map of :cert-file and :key-file" opts)))
   (when-not (string? cert-file) (throw (refuse ":cert-file must name a PEM file" cert-file)))
   (when-not (string? key-file) (throw (refuse ":key-file must name a PEM file" key-file)))
-  (doseq [path [cert-file key-file]]
+  (check-client-auth opts)
+  (doseq [path (cond-> [cert-file key-file] client-ca-file (conj client-ca-file))]
     (when-not (.exists (java.io.File. ^String path))
       (throw (refuse (str "file does not exist: " path) path))))
+  ;; the peer certificate reaches the handler as a java.security.cert.X509Certificate,
+  ;; which jolt-crypto provides; only a server that asks for one loads it
+  (when client-auth (require 'jolt.crypto))
   (let [ctx (c-SSL-CTX-new (c-TLS-server-method))]
     (when (ffi/null? ctx) (throw (refuse (str "SSL_CTX_new failed: " (last-error)) opts)))
     (try
@@ -132,6 +198,7 @@
         (throw (refuse (str "cannot use key " key-file ": " (last-error)) key-file)))
       (when-not (= 1 (c-SSL-CTX-check-key ctx))
         (throw (refuse (str key-file " is not the key of " cert-file ": " (last-error)) key-file)))
+      (when client-auth (use-client-auth! ctx opts))
       ctx
       (catch Throwable t (c-SSL-CTX-free ctx) (throw t)))))
 
@@ -300,6 +367,33 @@
     (let [[n e] (native/c-recv conn buf socket/bufsize 0)]
       (if (and (neg? n) (native/eintr? e)) (recur) n))))
 
+(defn- peer-certificate
+  "The client certificate the handshake verified, as an X509Certificate; nil when the
+  client sent none, which is also every connection to a server that did not ask."
+  [st]
+  (let [x509 (c-SSL-get1-peer-certificate (:ssl st))]
+    (when-not (ffi/null? x509)
+      (try
+        ;; verification failing ends the handshake, so this holds whenever a
+        ;; certificate is here at all; checked anyway, since a handler trusts
+        ;; :ssl-client-cert as an identity
+        (let [v (c-SSL-get-verify-result (:ssl st))]
+          (when-not (= X509-V-OK v)
+            (throw (ex-info "client certificate did not verify" {:verify-result v}))))
+        (let [len (c-i2d-X509 x509 ffi/null)
+              _ (when-not (pos? len) (throw (ex-info "i2d_X509 failed" {:len len})))
+              buf (ffi/alloc len)
+              ;; i2d writes through and advances *out, so it gets a copy of buf
+              holder (ffi/alloc (ffi/sizeof :pointer))]
+          (try
+            (ffi/write holder :pointer buf 0)
+            (when-not (= len (c-i2d-X509 x509 holder))
+              (throw (ex-info "i2d_X509 failed" {:len len})))
+            (.generateCertificate (java.security.cert.CertificateFactory/getInstance "X.509")
+                                  (java.io.ByteArrayInputStream. (ffi/read-array buf len)))
+            (finally (ffi/free buf) (ffi/free holder))))
+        (finally (c-X509-free x509))))))
+
 (defn serve
   "Handshake on conn, then call serve-conn with an io that speaks plaintext over the
   given one, and free everything on the way out. A failed handshake never reaches
@@ -307,7 +401,9 @@
   handshake must finish by, however slowly its bytes trickle in.
 
   io is a strategy's: :recv!, :idle-recv! if it has one, :write-raw! for octets at a
-  pointer, :take-via! for a channel take with a say on whether the peer is gone."
+  pointer, :take-via! for a channel take with a say on whether the peer is gone.
+  serve-conn gets the plaintext io and what the handshake learned about the peer:
+  {:ssl-client-cert cert} when it presented a verified certificate, else {}."
   [ctx conn io deadline-ms serve-conn]
   (let [st (open-conn ctx)
         raw-recv! (:recv! io)
@@ -339,5 +435,9 @@
                                 {:read! (fn [buf]
                                           (read! st buf socket/bufsize
                                                  #(blocking-recv conn %) send!))
-                                 :write! (fn [p n] (write! st p n send!))})))))
+                                 :write! (fn [p n] (write! st p n send!))})))
+         ;; only a server that asked can have one, and only it needs OpenSSL 3
+         (if-let [cert (when (pos? (c-SSL-CTX-get-verify-mode ctx)) (peer-certificate st))]
+           {:ssl-client-cert cert}
+           {})))
       (finally (close! st conn)))))
