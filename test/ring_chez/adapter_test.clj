@@ -18,6 +18,7 @@
             [jolt.ffi :as ffi]
             [ring-chez.socket :as socket]
             [ring-chez.http]
+            [ring-chez.tls]
             [jolt.socket.native :as native]
             [jolt.io-poller :as poller]
             [jolt.process]
@@ -3288,6 +3289,209 @@
          (tls-refused? (assoc tls-opts :key-file "test/fixtures/tls/other-key.pem")))
   (check "tls: a good pair is accepted" false (tls-refused? tls-opts)))
 
+;; --- client certificates (mTLS) ------------------------------------------------
+;; A small PKI made fresh with the openssl CLI: a CA the server trusts, a client
+;; certificate it signed, and a second CA (with its own client) the server has never
+;; heard of. The server keeps the fixture certificate; the clients don't verify it.
+
+(def ^:private openssl-cli
+  (let [brew "/opt/homebrew/opt/openssl@3/bin/openssl"]
+    ;; /usr/bin/openssl on macOS is LibreSSL, whose PKCS#12 OpenSSL 3 may not read
+    (if (.exists (java.io.File. brew)) brew "openssl")))
+
+(defn- openssl! [dir & args]
+  (let [{:keys [exit err]} (apply clojure.java.shell/sh openssl-cli (concat args [:dir dir]))]
+    (when-not (zero? exit)
+      (throw (ex-info (str "openssl " (first args) " failed: " err) {:args args})))))
+
+(defn- file-bytes [path]
+  (with-open [in (java.io.FileInputStream. ^String path)
+              o (java.io.ByteArrayOutputStream.)]
+    (io/copy in o)
+    (.toByteArray o)))
+
+(defn- make-ca! [dir nm]
+  (openssl! dir "req" "-x509" "-newkey" "ec" "-pkeyopt" "ec_paramgen_curve:P-256" "-nodes"
+            "-keyout" (str nm ".key") "-out" (str nm ".pem") "-days" "2"
+            "-subj" (str "/CN=" nm)))
+
+(defn- make-client! [dir ca nm]
+  (openssl! dir "req" "-newkey" "ec" "-pkeyopt" "ec_paramgen_curve:P-256" "-nodes"
+            "-keyout" (str nm ".key") "-out" (str nm ".csr") "-subj" (str "/O=ring-chez/CN=" nm))
+  (openssl! dir "x509" "-req" "-in" (str nm ".csr") "-CA" (str ca ".pem") "-CAkey" (str ca ".key")
+            "-CAcreateserial" "-out" (str nm ".pem") "-days" "2")
+  (openssl! dir "pkcs12" "-export" "-in" (str nm ".pem") "-inkey" (str nm ".key")
+            "-passout" "pass:secret" "-out" (str nm ".p12"))
+  ;; one client ssl map per file, so http-client's context cache (keyed on the
+  ;; bytes' identity) builds one context for it and reuses it
+  {:key-store {:bytes (file-bytes (str dir "/" nm ".p12")) :pass "secret"}})
+
+(def ^:private mtls-pki
+  (delay
+    (let [dir (str/trim (:out (clojure.java.shell/sh "mktemp" "-d")))]
+      (make-ca! dir "trusted-ca")
+      (make-ca! dir "rogue-ca")
+      {:dir dir
+       :ca-file (str dir "/trusted-ca.pem")
+       :good (make-client! dir "trusted-ca" "good-client")
+       :rogue (make-client! dir "rogue-ca" "rogue-client")})))
+
+(defn- mtls-opts [client-auth]
+  (assoc tls-opts :client-auth client-auth :client-ca-file (:ca-file @mtls-pki)))
+
+(defn- mtls-handler [request]
+  {:status 200
+   :body (cond
+           (not (contains? request :ssl-client-cert)) "no-cert"
+           (nil? (:ssl-client-cert request)) "nil-cert"
+           :else (str "cert:" (.getName (.getSubjectX500Principal (:ssl-client-cert request)))))})
+
+(defn- mtls-get
+  "One request over a fresh TLS connection presenting ssl's certificate (nil: none).
+  The response text, or :failed if the handshake or the exchange did not complete. In
+  TLS 1.3 the client's handshake ends before the server has seen its certificate, so
+  a refusal may only show on the first read."
+  [port ssl]
+  (try
+    (let [st (client-tls/tls-connect "127.0.0.1" port true 5000 nil ssl)]
+      (try
+        (tls-write st "GET / HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        (let [got (tls-read-until st (constantly false))]
+          (if (str/includes? got "200 OK") got :failed))
+        (finally (try (tls-close st) (catch Throwable _ nil)))))
+    (catch Throwable _ :failed)))
+
+(defn- mtls-body [got]
+  (if (string? got) (subs got (+ 4 (str/index-of got "\r\n\r\n"))) got))
+
+(def ^:private good-name "CN=good-client,O=ring-chez")
+
+(defn- tls-client-auth [strategy]
+  (let [label (str "mtls " (name strategy) ": ")
+        {:keys [good rogue]} @mtls-pki]
+    (let [server (adapter/run-server mtls-handler {:port 0 :strategy strategy
+                                                   :tls (mtls-opts :need)})
+          port (:port server)]
+      (try
+        (check (str label ":need, trusted cert is served with :ssl-client-cert")
+               (str "cert:" good-name) (mtls-body (mtls-get port good)))
+        (check (str label ":need, no cert fails") :failed (mtls-get port nil))
+        (check (str label ":need, serves after a missing cert")
+               (str "cert:" good-name) (mtls-body (mtls-get port good)))
+        (check (str label ":need, untrusted CA fails") :failed (mtls-get port rogue))
+        (check (str label ":need, serves after an untrusted cert")
+               (str "cert:" good-name) (mtls-body (mtls-get port good)))
+        (finally (adapter/stop-server server))))
+    (let [server (adapter/run-server mtls-handler {:port 0 :strategy strategy
+                                                   :tls (mtls-opts :want)})
+          port (:port server)]
+      (try
+        (check (str label ":want, no cert is served without the key")
+               "no-cert" (mtls-body (mtls-get port nil)))
+        (check (str label ":want, trusted cert is served with :ssl-client-cert")
+               (str "cert:" good-name) (mtls-body (mtls-get port good)))
+        (check (str label ":want, an untrusted cert still fails") :failed (mtls-get port rogue))
+        (finally (adapter/stop-server server))))
+    (let [server (adapter/run-server mtls-handler {:port 0 :strategy strategy :tls tls-opts})
+          port (:port server)]
+      (try
+        (check (str label "no :client-auth, an offered cert is not asked for")
+               "no-cert" (mtls-body (mtls-get port good)))
+        (finally (adapter/stop-server server))))))
+
+(defn test-tls-client-auth-threads [] (tls-client-auth :threads))
+(defn test-tls-client-auth-fibers [] (tls-client-auth :fibers))
+
+;; the upgrade request a websocket session carries is the one the handler would see
+(defn test-tls-client-auth-ws []
+  (doseq [strategy [:threads :fibers]]
+    (let [label (str "mtls " (name strategy) " ws: ")
+          server (adapter/run-server mtls-handler
+                   {:port 0 :strategy strategy :tls (mtls-opts :need)
+                    :ws-handler (fn [session]
+                                  (let [c (get-in session [:request :ssl-client-cert])]
+                                    (ws/send! session (if c
+                                                        (.getName (.getSubjectX500Principal c))
+                                                        "no-cert"))))})
+          st (client-tls/tls-connect "127.0.0.1" (:port server) true 5000 nil (:good @mtls-pki))]
+      (try
+        (tls-write st (str "GET /ws HTTP/1.1\r\nHost: x\r\nUpgrade: websocket\r\n"
+                           "Connection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+                           "Sec-WebSocket-Version: 13\r\n\r\n"))
+        (check-has (str label "the session's request has the client cert") good-name
+                   (tls-read-until st #(str/includes? % good-name)))
+        (finally (tls-close st) (adapter/stop-server server))))))
+
+;; every request on a kept-alive connection carries the certificate, not just the first
+(defn test-tls-client-auth-keep-alive []
+  (doseq [strategy [:threads :fibers]]
+    (let [label (str "mtls " (name strategy) " keep-alive: ")
+          server (adapter/run-server mtls-handler {:port 0 :strategy strategy
+                                                   :tls (mtls-opts :need)})
+          st (client-tls/tls-connect "127.0.0.1" (:port server) true 5000 nil (:good @mtls-pki))]
+      (try
+        (tls-write st "GET /1 HTTP/1.1\r\nHost: x\r\n\r\n")
+        (check-has (str label "first request has the cert") good-name
+                   (tls-read-until st #(str/includes? % good-name)))
+        (tls-write st "GET /2 HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n")
+        (check-has (str label "second request has the cert") good-name
+                   (tls-read-until st (constantly false)))
+        (finally (tls-close st) (adapter/stop-server server))))))
+
+;; a certificate that verified but can't be handed on is a server fault, not silence
+(defn test-tls-client-auth-peer-cert-fault []
+  (doseq [strategy [:threads :fibers]]
+    (let [label (str "mtls " (name strategy) " peer-cert fault: ")
+          server (adapter/run-server mtls-handler {:port 0 :strategy strategy
+                                                   :tls (mtls-opts :need)})
+          port (:port server)]
+      (try
+        (with-redefs [ring-chez.tls/peer-certificate (fn [_] (throw (ex-info "no parse" {})))]
+          (check (str label "the client gets no answer") :failed (mtls-get port (:good @mtls-pki))))
+        (Thread/sleep 100)
+        (let [st (adapter/server-stats server)]
+          (check (str label "reported as a fault") :tls-peer-cert (:kind (:last-fault st)))
+          (check (str label "counted once") 1 (:faults st)))
+        (check (str label "serves afterwards") (str "cert:" good-name)
+               (mtls-body (mtls-get port (:good @mtls-pki))))
+        (finally (adapter/stop-server server))))))
+
+(defn- tls-refusal
+  "The message run-server refused tls with, or :accepted."
+  [tls]
+  (try
+    (adapter/stop-server (adapter/run-server mtls-handler {:port 0 :tls tls}))
+    :accepted
+    (catch clojure.lang.ExceptionInfo e
+      (if (= :tls (:key (ex-data e))) (ex-message e) (throw e)))))
+
+(defn test-tls-client-auth-options []
+  (let [ca (:ca-file @mtls-pki)
+        refused (fn [label needle tls]
+                  (let [r (tls-refusal tls)]
+                    (if (string? r)
+                      (check-has (str "mtls options: " label) needle r)
+                      (check (str "mtls options: " label) :refused r))))]
+    (refused ":client-auth must be :need or :want" ":client-auth must be :need or :want"
+             (assoc tls-opts :client-auth :maybe :client-ca-file ca))
+    (refused ":client-auth needs :client-ca-file" ":client-auth needs :client-ca-file"
+             (assoc tls-opts :client-auth :need))
+    (refused ":client-ca-file must be a string" ":client-ca-file must name a PEM file"
+             (assoc tls-opts :client-auth :need :client-ca-file 42))
+    (refused "a missing :client-ca-file" "file does not exist: test/fixtures/tls/nope.pem"
+             (assoc tls-opts :client-auth :need :client-ca-file "test/fixtures/tls/nope.pem"))
+    ;; a PEM that holds no certificate: the server key
+    (refused "a :client-ca-file OpenSSL cannot read" "cannot use client CA file test/fixtures/tls/key.pem"
+             (assoc tls-opts :client-auth :need :client-ca-file "test/fixtures/tls/key.pem"))
+    (refused ":client-ca-file alone" ":client-ca-file does nothing without :client-auth"
+             (assoc tls-opts :client-ca-file ca))
+    (refused ":client-ca-file with :client-auth false" ":client-ca-file does nothing without :client-auth"
+             (assoc tls-opts :client-auth false :client-ca-file ca))
+    (check "mtls options: :client-auth false is off" :accepted
+           (tls-refusal (assoc tls-opts :client-auth false)))
+    (check "mtls options: :need accepted" :accepted (tls-refusal (mtls-opts :need)))
+    (check "mtls options: :want accepted" :accepted (tls-refusal (mtls-opts :want)))))
+
 ;; the sweeper's 503 is plaintext, and on a TLS connection that is noise
 (defn test-tls-unclaimed-gets-no-plaintext []
   (let [[a b] (native/loopback-pair)
@@ -5822,6 +6026,12 @@
   (run-test "test-tls-ws-fibers" test-tls-ws-fibers)
   (run-test "test-tls-stop-with-live-connections" test-tls-stop-with-live-connections)
   (run-test "test-tls-options" test-tls-options)
+  (run-test "test-tls-client-auth-threads" test-tls-client-auth-threads)
+  (run-test "test-tls-client-auth-fibers" test-tls-client-auth-fibers)
+  (run-test "test-tls-client-auth-ws" test-tls-client-auth-ws)
+  (run-test "test-tls-client-auth-keep-alive" test-tls-client-auth-keep-alive)
+  (run-test "test-tls-client-auth-peer-cert-fault" test-tls-client-auth-peer-cert-fault)
+  (run-test "test-tls-client-auth-options" test-tls-client-auth-options)
   (run-test "test-tls-unclaimed-gets-no-plaintext" test-tls-unclaimed-gets-no-plaintext)
   (run-test "test-handler-on-fiber" test-handler-on-fiber)
   (run-test "test-handler-on-fiber-options" test-handler-on-fiber-options)

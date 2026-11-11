@@ -135,7 +135,8 @@ strategies run on macOS, Linux and Windows.
   `clojure.core.async/thread` and take the result, which parks. It cannot be combined with `:handler-timeout-ms`, which needs a
   thread to walk away from, and `run-server` refuses the combination.
 - `:tls` (default none) — `{:cert-file "cert.pem" :key-file "key.pem"}` serves HTTPS
-  and `wss` on this port, under either strategy. See [TLS](#tls).
+  and `wss` on this port, under either strategy. Add `:client-auth` and
+  `:client-ca-file` to require or accept client certificates. See [TLS](#tls).
 - `:reuse-port` (default false) — bind with `SO_REUSEPORT`, so several
   processes can listen on the same port and the kernel spreads new connections
   across them (Linux; the BSDs allow the bind without the balancing). Off by
@@ -697,8 +698,53 @@ went from 73k to 59k req/s on `:threads` and 19k to 18k on `:fibers`. New connec
 are where the cost is, at about 500 full handshakes a second, so keep keep-alive on. An
 idle TLS connection also holds more native memory than a plain one, for OpenSSL's state.
 
-Not included: client certificates, SNI with more than one certificate, and ALPN, so
-clients always get HTTP/1.1.
+### Client certificates
+
+```clojure
+(adapter/run-server handler {:port 8443
+                             :tls {:cert-file      "fullchain.pem"
+                                   :key-file       "privkey.pem"
+                                   :client-auth    :need
+                                   :client-ca-file "client-ca.pem"}})
+```
+
+`:client-ca-file` is a PEM file of one or more CA certificates, and a client
+certificate has to chain to one of them. Their names go out in the handshake's
+certificate request, so a client holding several certificates can pick the right one.
+`:client-auth` says what happens without one:
+
+- `:need`: the handshake fails unless the client presents a certificate that verifies.
+  The client gets a TLS alert and no HTTP answer.
+- `:want`: a certificate is asked for and verified if one comes, but a client may send
+  none and still be served.
+
+A certificate that doesn't verify fails the handshake under either setting. Without
+`:client-auth` (or with `nil` or `false`) no certificate is asked for, which is how it
+was before. Either key on
+its own throws at `run-server`, as do a `:client-auth` other than `:need` or `:want`
+and a CA file that is missing or that OpenSSL can't read. A `:client-ca-file` alone
+would look like it protects the server while asking no client for anything.
+
+When a client did present a verified certificate, the request carries it as
+`:ssl-client-cert`, a `java.security.cert.X509Certificate`, the key the Ring spec
+names. A websocket session gets it on its `:request` too. Without one the key is
+absent rather than nil. A certificate that verified but can't be turned into an
+`X509Certificate` gets the client no answer, and the server counts it as a
+`:tls-peer-cert` fault (see `:faults` above).
+
+```clojure
+(defn handler [request]
+  (if-let [cert (:ssl-client-cert request)]
+    {:status 200 :body (str "hello " (.getName (.getSubjectX500Principal cert)))}
+    {:status 401 :body "no certificate"}))
+```
+
+The certificate class comes from [jolt-crypto](https://github.com/jolt-lang/crypto),
+which this library already depends on. It is loaded only by a server that sets
+`:client-auth`. Revocation (CRLs, OCSP) is not checked.
+
+Not included: SNI with more than one certificate, and ALPN, so clients always get
+HTTP/1.1.
 
 ## Tuning `:fibers`
 

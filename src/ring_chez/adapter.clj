@@ -534,7 +534,12 @@
                                                                   "Connection" "close"}
                                             :body "Not Implemented"} false))
           (map? r)
-          (let [{:keys [request error]} (http/framed-request->ring (:head r) (:body r) conn-info)]
+          (let [{:keys [request error]} (http/framed-request->ring (:head r) (:body r) conn-info)
+                ;; Ring SPEC: the client certificate a :tls handshake verified, and
+                ;; the key only when there is one
+                request (if-let [cert (:ssl-client-cert conn-info)]
+                          (some-> request (assoc :ssl-client-cert cert))
+                          request)]
             (cond
               error (send! conn (http/response->parts error false))
                ;; A 101 ends HTTP framing: every byte after the head is read
@@ -833,7 +838,12 @@
       ;; sweeper's own deadline is what ends a fiber's stalled handshake
       (reset! (:serving? entry) true)
       (when deadline (reset! deadline by))
-      (serve-tls conn io by #(serve-connection conn conn-info cfg % deadline entry)))
+      (serve-tls conn io by (fn [io peer]
+                              ;; a client that passed verification but whose certificate
+                              ;; can't be handed on gets no answer, and the operator a fault
+                              (if-let [t (:ring-chez.tls/peer-error peer)]
+                                ((:fault! cfg) :tls-peer-cert t)
+                                (serve-connection conn (merge conn-info peer) cfg io deadline entry)))))
     (serve-connection conn conn-info cfg io deadline entry)))
 
 (defn- worker
@@ -1180,7 +1190,10 @@
                            :cert-file may hold the whole chain, leaf first.
                            TLS 1.2 or newer. Throws here on a file that is
                            missing or a key that does not match. Needs OpenSSL,
-                           loaded only when this is set
+                           loaded only when this is set. :client-auth :need or
+                           :want with :client-ca-file (PEM CAs) verifies client
+                           certificates; a verified one reaches the handler as
+                           :ssl-client-cert, an X509Certificate
     :reuse-port            bind with SO_REUSEPORT (default false), so several
                            processes can share the port and the kernel spreads
                            connections over them (Linux)
