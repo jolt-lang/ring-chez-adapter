@@ -674,7 +674,7 @@ at c=8 it cost 30-50% of throughput for about 20% at c=1.
 ## Test
 
 ```bash
-jolt -M:test   # 511 checks over raw sockets + http-client
+jolt -M:test   # over raw sockets + http-client
 ```
 
 ## License
