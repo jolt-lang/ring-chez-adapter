@@ -113,7 +113,7 @@ cell run straight after a `plain c=100` one measured 7.6k req/s with a 2018 ms
 max, against 31-35k with a 16-34 ms max in the same session, p99 unchanged in
 both. `run.sh` now lets the entries expire before each cell (`SETTLE`).
 
-## Findings (M-series Mac, jolt 0.8.30, colocated, `ab -n 20000`, 2026-11-24)
+## Findings (M-series Mac, jolt 0.8.30, colocated, `ab -n 20000`, 2026-11-25)
 
 Undertow and Jetty are the same server in all six runs (their behaviour does
 not depend on the adapter's strategy), so their cells span six samples; each
@@ -122,48 +122,42 @@ TIME_WAIT entries from the one before it had drained.
 
 | server | plain c=10 | ka c=10 | plain c=100 | ka c=100 |
 |---|---:|---:|---:|---:|
-| undertow | 20.1-24.1k | 59.6-75.1k | 22.4-25.2k | 90.6-109.3k |
-| jetty | 18.6-21.6k | 56.9-76.1k | 22.3-23.6k | 93.0-105.3k |
-| chez `:threads` | 21.6-23.4k | 75.8-101.9k | 22.8-26.4k | 2.2-3.2k |
-| chez `:fibers` | 18.4-19.3k | 23.7-24.6k | 21.1-22.2k | 22.3-23.1k |
+| undertow | 23.6-24.4k | 66.8-84.4k | 25.6-28.1k | 94.9-110.7k |
+| jetty | 21.5-23.1k | 56.2-77.5k | 23.5-24.4k | 103.7-104.7k |
+| chez `:threads` | 23.5-23.7k | 86.5-103.5k | 24.6-25.5k | 78.9-86.8k |
+| chez `:fibers` | 20.2-20.7k | 24.8-25.5k | 22.8-23.5k | 23.1-23.8k |
 
-The JVM servers are where they were on 0.8.13, within noise. Every chez cell but
-one got faster. The ten plain and `/json` cells gained 1.2-1.5x (by the
-midpoint of each range), chez `:fibers` `ka c=100` gained 1.1x, and chez
-`:threads` `ka c=10` nearly doubled, from 42.9-46.2k to 75.8-101.9k, ahead of
-both JVM servers on that cell (59.6-76.1k). chez `:threads` now leads both JVM
-servers on four of the six cells it shares with them.
+Every `ka` cell kept all 20000 requests on keep-alive, and no cell timed out
+or dropped a connection.
 
-The exception is the regression of this round. chez `:threads` `ka c=100` read
-40.8-43.5k on 0.8.13 and reads 2.2-3.2k here, in all three runs and again in
-two isolated runs on a fresh server, with a 6-8 s longest request and 15.6-16.0k
-of 20000 requests kept alive. The server logged no fault, and the cell is clean
-in the sense the rest of this file uses: no abort, no stall mid-run, no dropped
-connection.
+chez `:threads` `ka c=100` is the cell this round was about. The previous
+round, on the same jolt, read 2.2-3.2k there with a 6-8 s longest request and
+15.6-16.0k of 20000 requests kept alive. It now reads 78.9-86.8k with a 4 ms
+p99 and a 5-7 ms longest request. The cause was the threads strategy holding
+a worker on every idle keep-alive connection: with ab's 100 connections on the
+default pool of 10, the connections no worker was sitting on waited for one
+to give its own up. A worker now parks an idle plaintext connection on a set
+watched by a single poller thread and goes back to the pool (RFC-0017), so the
+pool bounds concurrent requests rather than open connections.
 
-The cause is worker starvation, and the pool size shows it. The same cell
-against the same server with `:worker-threads` 100 instead of the default 10
-measured 98.6k and 110.7k req/s with every request on keep-alive and a 7-10 ms
-longest request. With 10 workers, ab's 100 connections split so that some
-workers park on connections the client is not using while others sit idle and
-new connections wait in the backlog; the work channel is unbuffered, so a
-connection waiting there is never counted as pending and nothing retires the
-parked ones. `retire-for-pressure!` exists for exactly this and is no longer
-firing. It is not yet known whether the change is in the adapter (20 commits
-touch `src/ring_chez` since the last round) or in jolt (0.8.13 to 0.8.30);
-until it is found, a default-pool server under more keep-alive connections than
-workers should be read as degraded, and `:worker-threads` at or above the
-expected connection count avoids it.
+The same change costs nothing elsewhere. `ka c=10`, where every connection
+had a worker anyway, is 86.5-103.5k against 75.8-101.9k last round, because a
+worker that has just answered watches its own connection for up to 50 ms
+before parking it and only gives it up early when another connection is
+waiting. The plain cells are where they were. chez `:threads` leads both JVM
+servers on `ka c=10` and matches them on the plain cells; on `ka c=100` it is
+within 0.8x of them, the price of handing a connection between workers when
+there are ten times more of them than workers.
 
 `/json`, plain, all six runs — the body is 27 bytes instead of 13 and nothing
 else differs, so body size is again not a factor:
 
 | server | c=10 | c=100 |
 |---|---:|---:|
-| undertow | 18.8-24.9k | 24.0-24.6k |
-| jetty | 22.2-23.3k | 22.3-24.6k |
-| chez `:threads` | 20.9-24.4k | 25.1-26.1k |
-| chez `:fibers` | 18.9-19.2k | 22.1-22.4k |
+| undertow | 24.8-26.2k | 25.3-25.9k |
+| jetty | 23.3-24.9k | 23.5-25.5k |
+| chez `:threads` | 23.5-23.6k | 24.6-25.6k |
+| chez `:fibers` | 20.2-20.5k | 23.1-23.2k |
 
 The six matrices put 732,000 requests through the adapter (2000 warmup plus
 six 20000-request cells each) and it logged no drop.
