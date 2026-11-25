@@ -1,6 +1,6 @@
 # RFC-0017: idle keep-alive connections are parked without a worker (threads strategy)
 
-- Status: Proposed
+- Status: Implemented
 - Kind: design change (threads strategy)
 - Builds on: RFC-0014 (a conn's fd is released only by its owner)
 - Follow-up to: the `ka c=100` regression on branch `fix/ka-pressure-retires-everything`
@@ -178,6 +178,36 @@ park, TLS poll-and-retire. The branch is on `(:tls? entry)`.
   before the put, so a conn readable in two consecutive snapshots is put once.
 - A parked conn's fd number is never freed while parked (owner = parked set),
   so RFC-0014's fd-reuse hazard does not arise.
+
+## Implementation notes
+
+Where the code differs from the design above:
+
+- **The poller is woken, not slept.** A loopback pair's read end is pollfd 0
+  of every round, and a park writes one byte to it (coalesced by a
+  `:wake-pending` flag, so one byte per round). The first version slept a
+  slice when the set was empty and otherwise polled a snapshot, so a conn
+  parked mid-poll was not watched until the slice ended: a sequential
+  keep-alive client waited up to 250 ms on every request after its first.
+  `test-request-on-freshly-parked-conn-is-not-delayed` covers it.
+- **No retirement for plaintext at all.** The response path's `:retire?` now
+  answers false for a plaintext conn; only TLS conns still decline
+  keep-alive under pressure.
+- **Fresh conns park too.** A just-accepted plaintext conn gets up to 50 ms
+  (`fresh-conn-wait-ms`) for its first request, then parks. A served conn is
+  checked with a zero-timeout poll and parks if nothing is buffered. So a
+  client that connects and says nothing no longer holds a worker for the
+  keep-alive timeout.
+- **A park after stop takes its conn back.** `park!` reads `running?` after
+  the conn is in the set; on a stopped server it removes the conn again (if
+  the poller's final sweep has not) and answers 0, so the worker releases it
+  as owner. Without this a worker finishing its last response after the
+  poller's final sweep parked a conn nobody would close.
+- **Unpark is a `swap-vals!`.** The caller whose old value held the conn is
+  the one that removed it; no separate CAS on `:parked?`.
+- **A teardown fault is counted again.** `worker`'s new release rule had
+  moved `conn-release!` into the try body, where the conn's own catch re-ran
+  the (now no-op) release and swallowed the fault.
 
 ## Alternatives
 
