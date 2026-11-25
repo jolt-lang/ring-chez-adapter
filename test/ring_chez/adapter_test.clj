@@ -2885,6 +2885,101 @@
           (finally (client-close fd))))
       (finally (adapter/stop-server server)))))
 
+;; A worker that has answered watches its own conn a moment before parking it,
+;; which saves the poller round trip for a client that asks again at once.
+;; That wait must give way the moment a conn is waiting for a worker: with
+;; both workers lingering on their idle conns, a new conn is still answered
+;; at once rather than after the linger.
+(defn test-lingering-workers-give-way-to-a-queued-conn []
+  (let [server (adapter/run-server handler {:port 8617 :worker-threads 2})]
+    (try
+      (Thread/sleep 150)
+      (let [fds (mapv (fn [_] (client-connect 8617 3000)) (range 2))]
+        (try
+          (doseq [fd fds]
+            (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+            (client-recv-until fd "hello get"))
+          (dotimes [i 5]
+            (let [t0 (System/nanoTime)
+                  fd (client-connect 8617 3000)]
+              (try
+                (client-send fd "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                (client-recv-until fd "hello get")
+                (finally (client-close fd)))
+              (check (str "linger: queued conn " i " answered within 30ms")
+                     true (< (quot (- (System/nanoTime) t0) 1000000) 30)))
+            ;; the two conns ask again, so their workers linger again
+            (doseq [fd fds]
+              (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+              (client-recv-until fd "hello get")))
+          (finally (doseq [fd fds] (client-close fd)))))
+      (finally (adapter/stop-server server)))))
+
+;; A conn whose client keeps it busy is always readable, so a worker that only
+;; gave way when its conn went quiet never gave way at all: under ab -k -c 100
+;; the first 10 conns held all 10 workers and the other 90 waited ~240ms for
+;; their first answer. A worker must give a waiting conn its turn within a
+;; short quantum even while its own conn has more to read.
+(defn test-busy-conns-do-not-starve-a-queued-conn []
+  (let [server  (adapter/run-server handler {:port 8618 :worker-threads 2})
+        stop?   (atom false)
+        busy    (fn []
+                  (future
+                    (let [fd (client-connect 8618 3000)]
+                      (try
+                        (while (not @stop?)
+                          (client-send fd "GET / HTTP/1.1\r\nHost: t\r\n\r\n")
+                          (client-recv-until fd "hello get"))
+                        (finally (client-close fd))))))]
+    (try
+      (Thread/sleep 150)
+      (let [loops [(busy) (busy)]]
+        (try
+          (Thread/sleep 200)
+          (dotimes [i 5]
+            (let [t0 (System/nanoTime)
+                  fd (client-connect 8618 3000)]
+              (try
+                (client-send fd "GET / HTTP/1.1\r\nHost: t\r\nConnection: close\r\n\r\n")
+                (check-has (str "busy: queued conn " i " answered") "hello get"
+                           (client-recv-until fd "hello get"))
+                (finally (client-close fd)))
+              (check (str "busy: queued conn " i " answered within 50ms")
+                     true (< (quot (- (System/nanoTime) t0) 1000000) 50))))
+          (finally (reset! stop? true) (doseq [l loops] (deref l 3000 nil)))))
+      (finally (adapter/stop-server server)))))
+
+;; The wake flag must never be left up with no byte behind it: every later
+;; park would see the flag, skip its write, and the poller would only notice
+;; new parks at the end of each 250ms slice. Draining after lowering the flag
+;; did exactly that when a park wrote during the drain — the drain ate its
+;; byte. ab -k -c 10 stalled within ~4k requests on it.
+(defn test-wake-flag-is-not-left-up-without-a-byte []
+  (let [make-parked  @#'adapter/make-parked
+        wake!        @#'adapter/wake-poller!
+        drain!       @#'adapter/drain-wake!
+        close!       @#'adapter/close-parked!
+        parked       (make-parked)
+        real-recv    native/c-recv
+        armed        (atom true)]
+    (try
+      (wake!  parked)
+      ;; a park lands while the poller is draining
+      (with-redefs [native/c-recv (fn [fd buf n flags]
+                                    (when (and (= fd (:wake-r parked))
+                                               (compare-and-set! armed true false))
+                                      (wake! parked)
+                                      ;; let the byte cross loopback so this
+                                      ;; drain is the one that sees it
+                                      (Thread/sleep 20))
+                                    (real-recv fd buf n flags))]
+        (drain! parked))
+      (let [byte-pending? (pos? (bit-and (max 0 (native/poll-one (:wake-r parked) native/pollin 0))
+                                         native/poll-readable))]
+        (check "wake flag: up only with a byte for the poller to see"
+               true (or (not @(:wake-pending parked)) byte-pending?)))
+      (finally (close! parked)))))
+
 ;; The parked set owns its conns, so it is what enforces the keep-alive
 ;; timeout on them: an idle conn is closed at the deadline, once, and the
 ;; open count goes back to zero.
@@ -6070,6 +6165,12 @@
             test-idle-conns-beyond-worker-count-are-served-at-once)
   (run-test "test-request-on-freshly-parked-conn-is-not-delayed"
             test-request-on-freshly-parked-conn-is-not-delayed)
+  (run-test "test-lingering-workers-give-way-to-a-queued-conn"
+            test-lingering-workers-give-way-to-a-queued-conn)
+  (run-test "test-busy-conns-do-not-starve-a-queued-conn"
+            test-busy-conns-do-not-starve-a-queued-conn)
+  (run-test "test-wake-flag-is-not-left-up-without-a-byte"
+            test-wake-flag-is-not-left-up-without-a-byte)
   (run-test "test-parked-conn-keep-alive-timeout" test-parked-conn-keep-alive-timeout)
   (run-test "test-parked-conn-client-close" test-parked-conn-client-close)
   (run-test "test-stop-server-closes-parked-conns" test-stop-server-closes-parked-conns)

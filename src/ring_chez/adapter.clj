@@ -459,14 +459,20 @@
         (native/c-send (:wake-w parked) (:wake-buf parked) 1 0)))))
 
 (defn- drain-wake!
-  "Empty the wake socket. :wake-pending goes down first: a park after this
-  writes a new byte, and a byte drained here belongs to a park whose conn is
-  already in the set the next round snapshots."
+  "Empty the wake socket, then lower :wake-pending. In that order: the flag
+  is up only while exactly one byte is owed or in the socket, so a park that
+  finds it up skips its write, and its conn (already in the set) is seen by
+  the next round. Lowering it first let a park write during the drain, the
+  drain eat that byte, and the flag stay up with nothing behind it — after
+  which no park ever woke the poller again and every request on a parked conn
+  waited out a full slice (ab -k -c 10 stalled within ~4k requests). A byte
+  written after the drain but before the flag goes down stays in the socket
+  and costs one spurious round, nothing more."
   [parked]
-  (reset! (:wake-pending parked) false)
   (loop []
     (let [[n _] (native/c-recv (:wake-r parked) (:wake-buf parked) 64 0)]
-      (when (pos? n) (recur)))))
+      (when (pos? n) (recur))))
+  (reset! (:wake-pending parked) false))
 
 (defn- close-parked!
   "Free the wake socket and its buffer. Only the poller calls this, on exit."
@@ -490,6 +496,36 @@
   [conn ms]
   (let [revents (native/poll-one conn native/pollin ms)]
     (pos? (bit-and (max revents 0) native/poll-readable))))
+
+(def ^:private served-linger-ms
+  "How long a worker that has just answered keeps watching its own conn for
+  the next request before parking it, while no other conn is waiting for a
+  worker. A client that asks again at once (ab -k, a page's next asset) is
+  then read straight away, without the park, poll and hand-off: with the
+  park on every response, ab -k -c 10 against 10 workers read 43k req/s
+  against 76-102k when each worker kept its conn."
+  50)
+
+(defn- linger-readable?
+  "Should the worker read conn's next request itself (true) or park it
+  (false)? Watches conn for up to ms in 1ms poll slices, and parks at once
+  whenever a conn is waiting for a worker (waiting?) — even with the next
+  request already there. A worker that gave way only when its own conn went
+  quiet never gave way to a client that never paused: under ab -k -c 100 the
+  first 10 conns held all 10 workers and the other 90 waited ~240ms for their
+  first answer. Parking a readable conn costs it nothing but its turn: the
+  poller sees it readable at once and queues it behind the conn that was
+  waiting. Measured against letting a busy conn keep its worker for a 1ms or
+  5ms quantum first: p99 4ms against 17ms and 40ms at c=100, for ~5% of
+  throughput."
+  [conn ms waiting?]
+  (let [until (+ (System/currentTimeMillis) ms)]
+    (loop []
+      (cond
+        (waiting?) false
+        (readable-within? conn 1) true
+        (>= (System/currentTimeMillis) until) false
+        :else (recur)))))
 
 (defn- unpark!
   "Take one conn off the parked set, once only, and with it the parked set's
@@ -1704,9 +1740,10 @@
                                       (if (:tls? entry)
                                         (idle-poll-recv! conn buf ka-ms
                                                          #(retire-for-pressure! pending pool conns entry))
-                                        (if (readable-within? conn (if @(:served? entry)
-                                                                     0
-                                                                     fresh-conn-wait-ms))
+                                        (if (if @(:served? entry)
+                                              (linger-readable? conn served-linger-ms
+                                                                #(pos? @pending))
+                                              (readable-within? conn fresh-conn-wait-ms))
                                           (blocking-recv! conn buf)
                                           (park! parked entry ka-ms running?)))))]
           (dotimes [_ n] (start-worker! base-info cfg io work conns running?))
