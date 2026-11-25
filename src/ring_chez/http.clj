@@ -418,6 +418,12 @@
                             (when arm-read! (arm-read! (deadline)))
                             (let [n ((if (zero? have) idle-recv! recv!) conn buf)]
                               (cond
+                                ;; a keyword from the read is a status in its own right
+                                ;; (RFC-0017: the threads strategy's idle-recv! answers
+                                ;; :parked for an idle keep-alive it moved off the worker).
+                                ;; Without this it fell through to :closed below, and the
+                                ;; worker released a conn the parked set now owned.
+                                (keyword? n) n
                                 (pos? n) (let [acc (ensure-capacity acc have n limit)]
                                            (fill! acc have buf n)
                                            (when-not @started
