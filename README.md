@@ -47,8 +47,12 @@ strategies run on macOS, Linux and Windows.
   should not put a server that was private on the network.
 - `:strategy` (default `:threads`) — concurrency backend for connections:
   - `:threads` — fixed worker pool, one worker thread per busy connection
-    (`:worker-threads`, default core count); idle keep-alive connections
-    occupy a worker each until they time out
+    (`:worker-threads`, default core count); an idle plaintext keep-alive
+    connection is parked on a set watched by one `poll(2)` thread and holds
+    no worker, so the pool size bounds concurrent requests, not open
+    connections (RFC-0017). `poll(2)` is linear in the parked set, so tens of
+    thousands of idle connections are what `:fibers` is for. A TLS
+    connection still holds its worker while idle
   - `:fibers` — one core.async go block per connection, parked on a single
     shared `poll(2)` io-poller thread; idle keep-alive connections pin no
     thread, so thousands can sit open without extra threads. Blocking work —
@@ -62,7 +66,7 @@ strategies run on macOS, Linux and Windows.
   loop; when all are busy the acceptor parks and the kernel backlog queues
   (`:threads` strategy only)
 - `:keep-alive-timeout-ms` (default 30000) — idle keep-alive connections are
-  dropped via `SO_RCVTIMEO`
+  closed after this long without a request
 - `:max-request-bytes` (default 1048576) — headers + body combined; over the
   cap the server answers 413 and closes instead of buffering without bound
 - `:max-header-bytes` (default 8192) — the head on its own, capped separately

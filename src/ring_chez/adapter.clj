@@ -405,6 +405,165 @@
               :else (recur)))))
       (finally (ffi/free pfds)))))
 
+;; --- threads strategy: idle keep-alive conns parked without a worker ----------
+;; (RFC-0017) A worker whose conn goes idle puts it here and returns to the pool;
+;; one poller per server watches the set and hands a readable conn back to the
+;; workers. Until this, a worker held its idle conn and watched only that one,
+;; so the strategy served as many idle keep-alives as it had workers: with 2
+;; workers and 6 idle conns, a request on 4 of the 6 read EOF (the conns the
+;; workers were not sitting on were given up unread), and ab -k -c 100 against
+;; the default pool of 10 read 1505 req/s where one worker per conn read 103k.
+;;
+;; The parked set OWNS the conns in it (RFC-0014: exactly one owner releases
+;; an fd). The worker that parks keeps :owned? set and must not release; the
+;; worker that later takes the conn off the channel re-adopts it. The poller
+;; never closes a conn a worker owns, and a worker never closes a parked one.
+
+(def ^:private park-poll-slice-ms
+  "Longest one poll(2) over the parked set may block. Parks wake the poller
+  through its wake socket, so this only bounds how late the poller notices
+  running? going false when nothing wakes it."
+  250)
+
+(defn- make-parked
+  "The parked set: entries keyed by conn fd, each with the ms at which its
+  keep-alive expires, plus the poller's wake socket.
+
+  The wake socket is a loopback pair whose read end sits at index 0 of every
+  poll. A park writes one byte to it, so the poller re-reads the set at once
+  rather than at the end of its slice: without it a conn parked while the
+  poller was in poll(2) was not watched until the slice ran out, and a client
+  that answered quickly waited up to 250ms for every request after its first.
+  :wake-pending coalesces the writes — one byte per poller round, not one per
+  park."
+  []
+  (let [[r w] (native/loopback-pair)]
+    (native/set-blocking! r false)
+    {:entries      (atom {})               ; fd -> {:entry e :deadline ms}
+     :wake-r       r
+     :wake-w       w
+     :wake-buf     (ffi/alloc 64)
+     :wake-pending (atom false)
+     ;; the wake fds are closed by the poller on exit, and a worker can still
+     ;; be about to write to them; the lock and flag keep a write off an fd
+     ;; number that may already belong to another socket
+     :wake-lock    (Object.)
+     :wake-closed? (atom false)}))
+
+(defn- wake-poller!
+  "Make the poller's current poll(2) return, at most one byte per round."
+  [parked]
+  (when (cas! (:wake-pending parked) false true)
+    (locking (:wake-lock parked)
+      (when-not @(:wake-closed? parked)
+        (native/c-send (:wake-w parked) (:wake-buf parked) 1 0)))))
+
+(defn- drain-wake!
+  "Empty the wake socket, then lower :wake-pending. In that order: the flag
+  is up only while exactly one byte is owed or in the socket, so a park that
+  finds it up skips its write, and its conn (already in the set) is seen by
+  the next round. Lowering it first let a park write during the drain, the
+  drain eat that byte, and the flag stay up with nothing behind it — after
+  which no park ever woke the poller again and every request on a parked conn
+  waited out a full slice (ab -k -c 10 stalled within ~4k requests). A byte
+  written after the drain but before the flag goes down stays in the socket
+  and costs one spurious round, nothing more."
+  [parked]
+  (loop []
+    (let [[n _] (native/c-recv (:wake-r parked) (:wake-buf parked) 64 0)]
+      (when (pos? n) (recur))))
+  (reset! (:wake-pending parked) false))
+
+(defn- close-parked!
+  "Free the wake socket and its buffer. Only the poller calls this, on exit."
+  [parked]
+  (locking (:wake-lock parked)
+    (reset! (:wake-closed? parked) true)
+    (native/c-close (:wake-r parked))
+    (native/c-close (:wake-w parked))
+    (ffi/free (:wake-buf parked))))
+
+(def ^:private fresh-conn-wait-ms
+  "How long a worker waits on a just-accepted plaintext conn for its first
+  request before parking it. Long enough to cover a client's connect-then-send
+  on any sane network, so the ordinary conn is read straight away instead of
+  taking a poller round trip; short enough that a conn that connects and says
+  nothing holds a worker for no time worth counting."
+  50)
+
+(defn- readable-within?
+  "True when conn has something to read (data, EOF or an error) within ms."
+  [conn ms]
+  (let [revents (native/poll-one conn native/pollin ms)]
+    (pos? (bit-and (max revents 0) native/poll-readable))))
+
+(def ^:private served-linger-ms
+  "How long a worker that has just answered keeps watching its own conn for
+  the next request before parking it, while no other conn is waiting for a
+  worker. A client that asks again at once (ab -k, a page's next asset) is
+  then read straight away, without the park, poll and hand-off: with the
+  park on every response, ab -k -c 10 against 10 workers read 43k req/s
+  against 76-102k when each worker kept its conn."
+  50)
+
+(defn- linger-readable?
+  "Should the worker read conn's next request itself (true) or park it
+  (false)? Watches conn for up to ms in 1ms poll slices, and parks at once
+  whenever a conn is waiting for a worker (waiting?) — even with the next
+  request already there. A worker that gave way only when its own conn went
+  quiet never gave way to a client that never paused: under ab -k -c 100 the
+  first 10 conns held all 10 workers and the other 90 waited ~240ms for their
+  first answer. Parking a readable conn costs it nothing but its turn: the
+  poller sees it readable at once and queues it behind the conn that was
+  waiting. Measured against letting a busy conn keep its worker for a 1ms or
+  5ms quantum first: p99 4ms against 17ms and 40ms at c=100, for ~5% of
+  throughput."
+  [conn ms waiting?]
+  (let [until (+ (System/currentTimeMillis) ms)]
+    (loop []
+      (cond
+        (waiting?) false
+        (readable-within? conn 1) true
+        (>= (System/currentTimeMillis) until) false
+        :else (recur)))))
+
+(defn- unpark!
+  "Take one conn off the parked set, once only, and with it the parked set's
+  ownership. Returns its entry if this call is what removed it, nil if it was
+  already gone (handed on, expired, or taken back by its parker on a stop).
+  A conn readable in two consecutive poll snapshots is handed on once.
+
+  The removal is the swap that saw the conn in the set: of any number of
+  callers racing on one conn, exactly one gets an old value holding it."
+  [parked conn]
+  (let [[old _] (swap-vals! (:entries parked) dissoc conn)]
+    (when-let [{:keys [entry]} (get old conn)]
+      (reset! (:parked? entry) false)
+      entry)))
+
+(defn- park!
+  "Put an idle conn on the parked set, taking over its ownership from the
+  worker that served it. Returns :parked, which read-request passes through
+  unchanged (a keyword from idle-recv! is returned as the status), so
+  serve-connection leaves its loop without releasing the conn. Only for a
+  plaintext conn: a TLS session lives inside the worker's serve-tls call and
+  cannot be handed to another worker — the caller decides.
+
+  A park that lands after the server stopped could otherwise outlive the
+  poller: the poller sweeps the set once running? is false and exits, and a
+  worker finishing its last response a moment later would park a conn nobody
+  watches or closes. So running? is read after the conn is in the set, and a
+  stopped server's parker takes its conn back off — if the poller's final
+  sweep has not already taken it — and answers 0, which read-request reads
+  as the peer gone and the worker releases as the conn's owner again."
+  [parked entry ka-ms running?]
+  (reset! (:parked? entry) true)
+  (swap! (:entries parked) assoc (:conn entry)
+         {:entry entry :deadline (+ (System/currentTimeMillis) ka-ms)})
+  (if (and (not @running?) (unpark! parked (:conn entry)))
+    0
+    (do (wake-poller! parked) :parked)))
+
 (defn- failure-kind
   "What went wrong, when the call site did not say: an ex-data tag we set
   ourselves, or a plain crash — which is any throwable the handler raised."
@@ -473,8 +632,23 @@
   ;; an owner that is provably running its serving loop, and only the loop's
   ;; own deadlines (ka-ms per read, write-timeout-ms per write) govern it
   (reset! (:serving? entry) true)
+  ;; a conn taken off the channel starts unserved, whoever parked it before:
+  ;; its next idle read is a first request to READ, not a conn to park
+  (reset! (:served? entry) false)
   (let [recv!      (:recv! io)
-        idle-recv! (if-let [f (:idle-recv! io)] #(f %1 %2 entry) recv!)
+        ;; RFC-0017: the idle read means two different things. On the first
+        ;; pass of the loop it is a conn just taken off the channel, which
+        ;; must be READ (its first request is in the socket or on its way).
+        ;; Every later pass follows a response, and on the threads strategy
+        ;; that idle conn is PARKED and the worker goes back to the pool. The
+        ;; strategy's idle-recv! tells them apart by the entry's :served?,
+        ;; which this loop raises after the first answer. Not an argument:
+        ;; http/read-request calls (idle-recv! conn buf), this wrapper adds the
+        ;; entry, and serve-tls's wrapper passes (conn buf entry) on — so the
+        ;; strategy's closure always sees all three and nothing else.
+        idle-recv! (if-let [f (:idle-recv! io)]
+                     (fn [conn buf] (f conn buf entry))
+                     recv!)
         send!      (or (:send! io) http/send-all)]
     (loop [acc http/no-bytes]
       ;; deadline: the read of this request (idle wait or mid-request trickle)
@@ -574,6 +748,7 @@
                    ;; goes through the normal send path, so the connection
                    ;; stays keep-alive-usable and no session ever runs
                    (when (http/send-response conn request decision (:take! io) send!)
+                     (reset! (:served? entry) true)
                      (recur (:leftover r)))
                    (when (send! conn (str "HTTP/1.1 101 Switching Protocols\r\n"
                                           "Upgrade: websocket\r\n"
@@ -675,7 +850,13 @@
                                            (catch Throwable _ nil))
                                       (throw t))
                                     (finally (swap! (:active stats) dec)))]
-                  (when reusable (recur (:leftover r)))))))
+                  (when reusable
+                    (reset! (:served? entry) true)
+                    (recur (:leftover r)))))))
+          ;; idle-recv! parked this conn (RFC-0017): the parked set owns it now
+          ;; and a worker will pick it up when it is readable. The worker must
+          ;; not release it — see worker.
+          (identical? :parked r) :parked
           :else nil))))))
 
 (def ^:private sweep-deadline-ms
@@ -717,7 +898,21 @@
                        :claim-by  (atom no-deadline)
                        :serving?  (atom false)
                        :pending?  (atom false)
-                       :retiring? (atom false)}
+                       :retiring? (atom false)
+                       ;; threads strategy: when this conn entered the work
+                       ;; queue (acceptor stamps it; see retire-for-pressure!)
+                       :queued-at (atom 0)
+                       ;; threads strategy, plaintext: false while a worker
+                       ;; serves this conn's first request, true once it has
+                       ;; answered one — the next idle read parks it (RFC-0017)
+                       :served?   (atom false)
+                       ;; threads strategy, plaintext: true while this conn
+                       ;; sits in the parked set (RFC-0017) — see claim-close!
+                       :parked?   (atom false)
+                       ;; true on a conn the poller has handed back to the
+                       ;; workers and no worker has taken yet: the take is a
+                       ;; re-adopt of ownership the parked set already held
+                       :adopt?    (atom false)}
                 poller? (assoc :poller? true
                                ;; the sweeper's deadline; armed by fiber-io
                                :deadline (atom Long/MAX_VALUE)))]
@@ -751,9 +946,18 @@
   "Take responsibility for releasing this conn's fd. Exactly one caller wins:
   the worker or fiber that serves it, or stop-server for a conn that no worker
   ever claimed. A caller that LOSES must not touch the fd again — the winner
-  may already have released the number to another socket."
+  may already have released the number to another socket.
+
+  A conn arriving from the poller (RFC-0017) is the one case where ownership
+  changes hands while the conn lives. The worker that parked it left :owned?
+  set and gave the conn to the parked set; unpark! then handed it on. For
+  that conn :owned? is already true and the claim is a re-adopt, marked by
+  :adopt? — set by the hand-off, lowered here. It is not inferred from
+  :owned?: stop-server's own pass releases the conns nobody owns by LOSING
+  this claim, and a conn a worker is serving must keep making it lose."
   [entry]
-  (cas! (:owned? entry) false true))
+  (or (cas! (:adopt? entry) true false)
+      (cas! (:owned? entry) false true)))
 
 (defn- pending-done!
   "Take one conn out of the threads strategy's accept-pressure count, exactly
@@ -789,12 +993,115 @@
     (swap! (:open stats) dec))
   (swap! conns disj entry))
 
+(defn- release-expired!
+  "Close every parked conn past its keep-alive deadline, as the parked set's
+  owner: shutdown first, then close, once (conn-down! + conn-release!)."
+  [parked conns stats now fault!]
+  (doseq [[conn {:keys [deadline]}] @(:entries parked)]
+    (when (>= now deadline)
+      (when-let [entry (unpark! parked conn)]
+        ;; the poller must survive a throwing close, and the fault must still
+        ;; be seen: a release that fails here is a server fault like any other
+        ;; teardown fault, not something to tidy away
+        (try (conn-release! conns entry stats)
+             (catch Throwable t (fault! :poller t)))))))
+
+(defn- start-poller!
+  "The thread that watches the parked set. Each round: rebuild pollfds over
+  the set, poll until the earliest deadline (bounded to one slice), hand every
+  readable conn to the workers, and release the ones past their deadline.
+
+  Handing on is a rendezvous with a worker, so it is done after the poll
+  returns and one conn at a time: a full pool makes this thread wait on the
+  channel, and every other parked conn waits behind it, in queue order — the
+  same order the acceptor's conns are in. Nothing is read here; a worker
+  reads the conn once it owns it.
+
+  A client closing a parked conn reads as POLLIN on EOF: it is handed on, and
+  the worker's first recv answers :closed and releases it. One wasted take per
+  client close, no fault.
+
+  The wake socket is pollfd 0 of every round, so a park (or stop-server)
+  ends the current poll at once and the next round sees the new set.
+
+  Exits when running? goes false. On the way out it releases whatever is
+  still parked, as the parked set's owner (conn-release!: shutdown first,
+  then close, once). A worker that parks after that sweep takes its conn back
+  itself (see park!). stop-server waits for this thread."
+  [parked conns stats running? hand-off! fault!]
+  (async/thread
+    (try
+      (loop []
+        (when @running?
+          (let [snapshot @(:entries parked)
+                conns-v  (vec (keys snapshot))
+                n        (count conns-v)
+                pfds     (native/alloc-pollfds (inc n))
+                now      (System/currentTimeMillis)
+                wait     (if (zero? n)
+                           park-poll-slice-ms
+                           (let [earliest (reduce min (map :deadline (vals snapshot)))]
+                             (max 0 (min park-poll-slice-ms (- earliest now)))))]
+            (try
+              (native/init-pollfd! pfds 0 (:wake-r parked) native/pollin)
+              (dotimes [i n]
+                (native/init-pollfd! pfds (inc i) (nth conns-v i) native/pollin))
+              (let [[rc e] (native/c-poll pfds (inc n) wait)]
+                (cond
+                  (pos? rc)
+                  (do
+                    (when (pos? (bit-and (native/pollfd-revents pfds 0) native/poll-readable))
+                      (drain-wake! parked))
+                    (dotimes [i n]
+                      (when (pos? (bit-and (native/pollfd-revents pfds (inc i))
+                                           native/poll-readable))
+                        (when-let [entry (unpark! parked (nth conns-v i))]
+                          (hand-off! entry)))))
+                  ;; a failing poll is a server fault, and must not become a
+                  ;; spin: back off one slice and rebuild the set
+                  (and (neg? rc) (not (native/eintr? e)))
+                  (do (fault! :poller (ex-info "parked-conn poll failed"
+                                               {:type :ring-chez/poll-failed :errno e}))
+                      (Thread/sleep park-poll-slice-ms))))
+              (release-expired! parked conns stats (System/currentTimeMillis) fault!)
+              (catch Throwable t (fault! :poller t))
+              (finally (ffi/free pfds))))
+          (recur)))
+      (finally
+        (release-expired! parked conns stats Long/MAX_VALUE fault!)
+        (close-parked! parked)))))
+
+(def ^:private pressure-grace-ms
+  "How long the conn at the head of the queue must have waited before a busy
+  worker gives up its keep-alive for it. Retiring costs the retired conn a
+  reconnect, and the worker that just answered is itself about to park and
+  take that conn — within microseconds. Retiring on that read as pressure and
+  fed itself: each retirement was a reconnect, the reconnect queued, and one
+  queued conn cost a live client its keep-alive every time (measured on jolt
+  0.8.30: 497 retirements in a 2000-request burst, every one at pending=1
+  idle=0 retiring=0, every one spent by the same worker parking right after).
+  The idle path keeps its own, longer grace (2000ms, in idle-poll-recv!); this
+  one bounds the first byte of a conn that is genuinely stuck behind a full
+  pool, so it is short — far under the reconnect it replaces."
+  100)
+
+(defn- oldest-wait
+  "Milliseconds the longest-waiting still-queued conn has been waiting; 0 when
+  none is queued. The queue is the conns whose :pending? flag is still set."
+  [conns]
+  (let [now (System/currentTimeMillis)]
+    (->> (seq @conns)
+         (filter #(and @(:pending? %) (pos? @(:queued-at %))))
+         (map #(- now @(:queued-at %)))
+         (reduce max 0))))
+
 (defn- retire-for-pressure!
   "Decide whether this conn's worker should give it up for a conn queued
   behind the pool, and if so reserve that retirement. True only while more
   conns are waiting than there are workers already free or on their way to
   being free — idle ones parked on the channel, and ones that already retired
-  a conn and have not parked yet.
+  a conn and have not parked yet — AND the longest-waiting of them has been
+  waiting past pressure-grace-ms.
 
   Both halves were missing. A conn counts as pending from accept until the
   rendezvous answers, so with idle workers every handoff still read as
@@ -803,16 +1110,19 @@
   it was claimed. Each retirement is a reconnect, and each reconnect is a new
   pending conn, so under load the two fed each other: ab -k -c 100 against a
   pool of 10 opened a new connection for ~40% of its requests, and a pool of
-  128, where no conn ever waits, still did for ~25%."
-  [pending pool entry]
-  (loop []
-    (let [p @pending
-          {:keys [idle retiring] :as st} @pool]
-      (cond
-        (<= p (+ idle retiring)) false
-        (compare-and-set! pool st (update st :retiring inc))
-        (do (reset! (:retiring? entry) true) true)
-        :else (recur)))))
+  128, where no conn ever waits, still did for ~25%.
+
+  The grace is the third thing. The two counts above still retired on the
+  microseconds between a worker's answer and its park, so one queued conn cost
+  a live client its keep-alive on every answer until the run's keep-alives ran
+  out: the ka c=100 cell of benchmark/README.md, 2-3k req/s against 40k."
+  [pending pool conns entry]
+  (let [p @pending
+        {:keys [idle retiring] :as st} @pool]
+    (and (> p (+ idle retiring))
+         (>= (oldest-wait conns) pressure-grace-ms)
+         (compare-and-set! pool st (update st :retiring inc))
+         (do (reset! (:retiring? entry) true) true))))
 
 (defn- worker-parking!
   "A worker is about to wait on the work channel: it counts as idle, and the
@@ -878,12 +1188,21 @@
           ;; first, the fd number may already belong to another socket, so losing
           ;; the claim means leaving the fd alone entirely.
           (when (claim-close! entry)
-            (try
-              (connection-loop (:conn entry) (assoc base-info :remote-addr (:peer entry)) cfg io nil entry)
-              ;; an escaping throwable must not kill the worker: a dead worker
-              ;; shrinks the pool permanently and starves later connections
-              (catch Throwable _)
-              (finally (conn-release! conns entry (:stats cfg)))))
+            ;; An escaping throwable from the conn must not kill the worker: a
+            ;; dead worker shrinks the pool permanently and starves later
+            ;; connections. It ends the conn like any other finish.
+            (let [outcome (try
+                            (connection-loop (:conn entry) (assoc base-info :remote-addr (:peer entry)) cfg io nil entry)
+                            (catch Throwable _ nil))]
+              ;; RFC-0017: the loop parked this conn and the parked set owns
+              ;; it from here — :owned? stays set, and a worker re-adopts it
+              ;; when the poller hands it back. Release only when the loop
+              ;; finished the conn. A throw out of the release itself reaches
+              ;; the catch below and is counted as a :worker fault; it used to
+              ;; be caught by the conn's own catch, which ran the (now no-op)
+              ;; release again and lost the fault.
+              (when-not (identical? :parked outcome)
+                (conn-release! conns entry (:stats cfg)))))
           (catch Throwable t (fault! :worker t)))
         (recur entry)))))
 
@@ -1359,25 +1678,74 @@
               ;; conn under pressure and have not parked yet (see
               ;; retire-for-pressure!)
               pool (atom {:idle 0 :retiring 0})
+              ;; RFC-0017: idle plaintext keep-alive conns wait here, owned
+              ;; by the set, watched by one poller instead of a worker each
+              parked (make-parked)
               ;; the claim backstop runs here too: >!! answers only once a
               ;; worker has the conn, so a conn still unclaimed after that is
               ;; one the take/claim hop lost, not one queued behind a busy pool
               sweep (start-sweeper! conns stats fault! #(pending-done! pending %))
+              ;; a parked conn the poller found readable goes back on the work
+              ;; channel as if freshly accepted: pending and queued-at say so,
+              ;; so the pressure count and its grace see it
+              hand-off! (fn [entry]
+                          (if-not @running?
+                            ;; stopped between unpark! and here: the poller is
+                            ;; still the owner, so it releases — nobody else
+                            ;; will, stop-server never saw this conn as its own
+                            (conn-release! conns entry stats)
+                            (do
+                              (reset! (:adopt? entry) true)
+                              (reset! (:pending? entry) true)
+                              (reset! (:queued-at entry) (System/currentTimeMillis))
+                              (swap! pending inc)
+                              (let [handed? (try (async/>!! work entry)
+                                                 (catch Throwable t
+                                                   (fault! :handoff t)
+                                                   false))]
+                                ;; the rendezvous answering is the take, as on
+                                ;; the acceptor's path; once-only either way
+                                (pending-done! pending entry)
+                                (when-not handed?
+                                  ;; nobody will take it: stopped while we held
+                                  ;; it. The parked set was its owner, so it is
+                                  ;; released here — unless stop-server's sweep
+                                  ;; took the re-adopt first; conn-release! is
+                                  ;; once-only, so the loser's call is a no-op
+                                  (conn-release! conns entry stats))))))
               io (assoc threads-io
-                        :retire? #(retire-for-pressure! pending pool %)
+                        ;; a plaintext conn is never retired: it parks
+                        ;; instead (RFC-0017). Only a TLS conn, which cannot
+                        ;; leave its worker, still declines keep-alive under
+                        ;; pressure.
+                        :retire? #(and (:tls? %) (retire-for-pressure! pending pool conns %))
                         :parking! #(worker-parking! pool %)
                         :unparked! #(swap! pool update :idle dec)
                         :claim! #(pending-done! pending %)
-                        ;; idle keep-alive first read: wait in poll(2) slices
-                        ;; instead of parking a full ka-timeout recv. Enforces
-                        ;; the ka deadline itself (poll has no timeout), and
-                        ;; under accept pressure retires a connection only
-                        ;; after a grace period of quiet — never instantly,
-                        ;; or a client mid-reuse would race a reset. Returns
-                        ;; the recv contract (n>0 data, 0 closed/retire).
+                        ;; idle first read of a request. A plaintext conn with
+                        ;; nothing to read is parked on the set (RFC-0017) and
+                        ;; this worker goes back to the pool; the poller hands
+                        ;; the conn on when it is readable, and closes it at
+                        ;; the keep-alive deadline. A fresh conn gets a short
+                        ;; wait first, since its request is usually a moment
+                        ;; behind the connect; a served one is only checked.
+                        ;; A TLS conn cannot change workers (its session lives
+                        ;; in this worker's serve-tls call), so it keeps the
+                        ;; worker-bound path: wait in poll(2) slices, enforcing
+                        ;; the ka deadline here, and under accept pressure
+                        ;; retire only after a grace of quiet. Both return the
+                        ;; recv contract — n>0 data, 0 gone — or :parked, which
+                        ;; read-request passes through.
                         :idle-recv! (fn [conn buf entry]
-                                      (idle-poll-recv! conn buf ka-ms
-                                                       #(retire-for-pressure! pending pool entry))))]
+                                      (if (:tls? entry)
+                                        (idle-poll-recv! conn buf ka-ms
+                                                         #(retire-for-pressure! pending pool conns entry))
+                                        (if (if @(:served? entry)
+                                              (linger-readable? conn served-linger-ms
+                                                                #(pos? @pending))
+                                              (readable-within? conn fresh-conn-wait-ms))
+                                          (blocking-recv! conn buf)
+                                          (park! parked entry ka-ms running?)))))]
           (dotimes [_ n] (start-worker! base-info cfg io work conns running?))
           ;; one accept loop per listen fd (RFC-0016) — same shape as the
           ;; fibers arm: shared serve! path and registry, per-fd loop
@@ -1403,6 +1771,7 @@
                         ;; accept loop with it (see serve-loop).
                         (let [entry (register-conn! conns conn peer false (some? tls-ctx))
                               _ (do (reset! (:pending? entry) true)
+                                    (reset! (:queued-at entry) (System/currentTimeMillis))
                                     (swap! pending inc))
                               handed? (try (and @running? (async/>!! work entry))
                                            (catch Throwable t
@@ -1438,6 +1807,8 @@
             {:sockets fds :socket (first fds) :port port :host host :running running?
              :tls-ctx tls-ctx
              :work work :conns conns :sweep sweep :acceptors acceptors :acceptor (first acceptors)
+             :parked parked
+             :poller (start-poller! parked conns stats running? hand-off! fault!)
              :handler handler-box :ws-handler ws-handler-box :stats stats}))))))
 
 (defn swap-handler!
@@ -1547,6 +1918,19 @@
     ;; a worker that took the same conn.
     (doseq [entry @conns]
       (when (claim-close! entry) (conn-release! conns entry (:stats server)))))
+  ;; the parked-conn poller (RFC-0017) owns whatever is still parked and
+  ;; releases it on its way out, now that running? is false and every conn is
+  ;; shut down. Wait for it before anything below frees an fd number: a poller
+  ;; still in poll(2) over a closed number is a read on somebody else's
+  ;; socket. Bounded like the acceptor wait below; on timeout the thread is
+  ;; left running rather than interrupted — it holds conns, and only it can
+  ;; release them correctly.
+  (when-let [poller (:poller server)]
+    (wake-poller! (:parked server))
+    ;; the poller is an async/thread, so its channel closes when its body
+    ;; returns; a take against a timeout is the bounded wait (deref with a
+    ;; timeout needs a Future, which this is not)
+    (async/alts!! [poller (async/timeout drain-timeout-ms)] nil))
   ;; every listen fd (RFC-0016: one per family) is shut down first, so on
   ;; Linux every acceptor wakes at once
   (let [fds (or (:sockets server)
