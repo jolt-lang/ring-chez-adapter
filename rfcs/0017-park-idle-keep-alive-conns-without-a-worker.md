@@ -190,12 +190,28 @@ Where the code differs from the design above:
   parked mid-poll was not watched until the slice ended: a sequential
   keep-alive client waited up to 250 ms on every request after its first.
   `test-request-on-freshly-parked-conn-is-not-delayed` covers it.
+- **The wake flag is lowered after the drain, not before.** Lowering it
+  first let a park write during the drain, the drain eat that byte, and the
+  flag stay up with nothing behind it; no park woke the poller after that,
+  and ab -k -c 10 stalled within ~4k requests. Covered by
+  `test-wake-flag-is-not-left-up-without-a-byte`.
+- **A worker lingers before parking, and gives way at once.** After a
+  response the worker watches its own conn for up to 50 ms
+  (`served-linger-ms`) in 1 ms poll slices, so a client that asks again at
+  once skips the park/poll/hand-off. Parking on every response measured 43k
+  req/s on ab -k -c 10 against 76-102k for the worker-bound model; lingering
+  brings it back to ~90k. The worker parks the moment any conn is waiting
+  for a worker (`pending` > 0), even if its own conn already has the next
+  request: checking readability first meant a client that never paused never
+  gave its worker up, and under ab -k -c 100 90 conns waited ~240 ms for
+  their first answer (`test-busy-conns-do-not-starve-a-queued-conn`). A
+  1 ms or 5 ms quantum before giving way bought ~5% throughput for a p99 of
+  17 ms or 40 ms against 4 ms, so there is none.
 - **No retirement for plaintext at all.** The response path's `:retire?` now
   answers false for a plaintext conn; only TLS conns still decline
   keep-alive under pressure.
 - **Fresh conns park too.** A just-accepted plaintext conn gets up to 50 ms
-  (`fresh-conn-wait-ms`) for its first request, then parks. A served conn is
-  checked with a zero-timeout poll and parks if nothing is buffered. So a
+  (`fresh-conn-wait-ms`) for its first request, then parks. So a
   client that connects and says nothing no longer holds a worker for the
   keep-alive timeout.
 - **A park after stop takes its conn back.** `park!` reads `running?` after
